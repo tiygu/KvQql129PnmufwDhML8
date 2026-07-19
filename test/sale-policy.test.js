@@ -71,6 +71,34 @@ test("item, chain, and level sale rules support never, surplus, and preferred di
   assert.equal(suggestions[0].policyDisposition, "preferred-surplus");
 });
 
+test("chain and level surplus allowances are counted across their whole scope", () => {
+  const state = fixtureState();
+  state.board.grids.push(
+    { index: 6, itemId: "cheap-2", empty: false, executable: true, protected: false, produceCount: null },
+    { index: 7, itemId: "cheap-3", empty: false, executable: true, protected: false, produceCount: null },
+  );
+  state.catalog.items.push(
+    { id: "cheap-2", chainId: "c", level: 1, baseUnits: 1, saleValue: 3, evidenceSufficient: true },
+    { id: "cheap-3", chainId: "c", level: 1, baseUnits: 1, saleValue: 2, evidenceSufficient: true },
+  );
+  const chainSuggestions = buildSaleSuggestions(state, { policy: { rules: [{ scope: "chain", value: "c", disposition: "surplus", keep: 2 }] } });
+  const levelSuggestions = buildSaleSuggestions(state, { policy: { rules: [{ scope: "level", value: 1, disposition: "surplus", keep: 2 }] } });
+  assert.equal(chainSuggestions.filter((suggestion) => suggestion.chainId === "c").length, 1);
+  assert.equal(levelSuggestions.filter((suggestion) => Number(suggestion.level) === 1).length, 1);
+});
+
+test("scoped surplus keeps the lowest-opportunity sale regardless of board order", () => {
+  const state = fixtureState();
+  state.board.grids.push({ index: 6, itemId: "cheap-2", empty: false, executable: true, protected: false, produceCount: null });
+  state.catalog.items.push({ id: "cheap-2", chainId: "c", level: 1, baseUnits: 1, saleValue: 3, evidenceSufficient: true });
+  const policy = { rules: [{ scope: "chain", value: "c", disposition: "surplus", keep: 1 }] };
+  const first = buildSaleSuggestions(state, { policy }).filter((suggestion) => suggestion.chainId === "c");
+  state.board.grids.reverse();
+  const reversed = buildSaleSuggestions(state, { policy }).filter((suggestion) => suggestion.chainId === "c");
+  assert.deepEqual(first.map((suggestion) => suggestion.itemId), reversed.map((suggestion) => suggestion.itemId));
+  assert.equal(first.length, 1);
+});
+
 test("sale ranking compares rebuild cost, scarcity, sale return, and space value", () => {
   const suggestions = buildSaleSuggestions(fixtureState(), { spacePressureUnresolved: true, safeMergeAvailable: false, warehouseBufferAvailable: false });
   assert.equal(suggestions[0].itemId, "cheap");

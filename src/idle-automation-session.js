@@ -6,6 +6,13 @@ const DEFAULT_CONNECTION_BACKOFF_MS = 30_000;
 const MAX_CONNECTION_BACKOFF_MS = 5 * 60_000;
 const DEFAULT_RECOVERY_POLL_MS = 60_000;
 
+function isConnectionFailure(error) {
+  let detail;
+  try { detail = typeof error === "string" ? error : JSON.stringify(error); } catch (_) { detail = String(error); }
+  detail = `${error?.message || ""} ${error?.code || ""} ${detail || ""}`;
+  return /cdp|websocket|econn|enotconn|epipe|etimedout|socket (?:closed|hang up)|connection (?:closed|lost|refused|reset)|disconnect(?:ed|ion)?|offline|target (?:closed|detached|crashed)|execution context (?:was )?destroyed|cannot find context/i.test(detail);
+}
+
 function timestampMs(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) return null;
@@ -52,12 +59,14 @@ class IdleAutomationSession {
     this.connectionBackoffMs = Math.max(5_000, Number(connectionBackoffMs) || DEFAULT_CONNECTION_BACKOFF_MS);
     this.running = false;
     this.waitController = null;
+    this.cycleController = null;
     this.waitReason = null;
   }
 
   interruptWait(reason = "interrupted") {
     this.waitReason = String(reason);
     this.waitController?.abort();
+    this.cycleController?.abort();
   }
 
   async sleep(ms, externalSignal, detail) {
@@ -88,16 +97,25 @@ class IdleAutomationSession {
         await this.waitIfPaused?.(signal);
         if (signal?.aborted) break;
         let state, plan;
+        const preparationController = new AbortController();
+        this.cycleController = preparationController;
+        const abortPreparation = () => preparationController.abort();
+        signal?.addEventListener("abort", abortPreparation, { once: true });
         try {
-          await this.ensureConnection();
-          state = await this.collectState();
+          await this.ensureConnection(preparationController.signal);
+          state = await this.collectState(preparationController.signal);
           plan = await this.planState(state);
           backoff = this.connectionBackoffMs;
         } catch (error) {
+          if (error?.name === "AbortError" && preparationController.signal.aborted) continue;
+          if (!isConnectionFailure(error)) throw error;
           this.onEvent?.({ type: "idle-connection-backoff", error: error.message, delayMs: backoff });
           await this.sleep(backoff, signal, { reason: "connection-backoff" });
           backoff = Math.min(MAX_CONNECTION_BACKOFF_MS, backoff * 2);
           continue;
+        } finally {
+          signal?.removeEventListener("abort", abortPreparation);
+          if (this.cycleController === preparationController) this.cycleController = null;
         }
         const requiredEnergy = requiredEnergyFromPlan(plan, state);
         const wakeDelay = computeEnergyWakeDelay(state, { requiredEnergy, now: this.clock.now() });
@@ -105,19 +123,46 @@ class IdleAutomationSession {
           await this.sleep(wakeDelay, signal, { reason: "energy-recovery", energy: Number(state.energy?.amount ?? state.resources?.energy), requiredEnergy, recoverAt: this.clock.now() + wakeDelay });
           continue;
         }
-        const result = await this.runBoundedSession({ signal, freshState: state, freshPlan: plan });
+        let result;
+        const cycleController = new AbortController();
+        this.cycleController = cycleController;
+        const abortCycle = () => cycleController.abort();
+        signal?.addEventListener("abort", abortCycle, { once: true });
+        try {
+          result = await this.runBoundedSession({ signal: cycleController.signal, freshState: state, freshPlan: plan });
+        } catch (error) {
+          if (error?.name === "AbortError" && cycleController.signal.aborted) result = { ok: false, reason: "aborted" };
+          else {
+            if (!isConnectionFailure(error)) throw error;
+            this.onEvent?.({ type: "idle-connection-backoff", error: error.message, delayMs: backoff });
+            await this.sleep(backoff, signal, { reason: "connection-backoff" });
+            backoff = Math.min(MAX_CONNECTION_BACKOFF_MS, backoff * 2);
+            continue;
+          }
+        } finally {
+          signal?.removeEventListener("abort", abortCycle);
+          if (this.cycleController === cycleController) this.cycleController = null;
+        }
+        if (cycleController.signal.aborted && !signal?.aborted) result = { ok: false, reason: "aborted" };
+        if (!result?.ok && isConnectionFailure(result)) {
+          this.onEvent?.({ type: "idle-connection-backoff", error: result.error || result.reason, delayMs: backoff });
+          await this.sleep(backoff, signal, { reason: "connection-backoff" });
+          backoff = Math.min(MAX_CONNECTION_BACKOFF_MS, backoff * 2);
+          continue;
+        }
         cycles += 1;
         this.onEvent?.({ type: "idle-cycle-complete", cycle: cycles, reason: result.reason, ok: result.ok });
         if (signal?.aborted) break;
-        if (result.reason === "order-completed" || result.reason === "energy-depleted" || result.reason === "waiting-insufficient-energy") continue;
+        if (result.reason === "order-completed" || result.reason === "energy-depleted" || result.reason === "waiting-insufficient-energy" || result.reason === "aborted" && !signal?.aborted) continue;
         return { ...result, idle: true, cycles };
       }
       return { ok: true, idle: true, reason: "aborted", cycles };
     } finally {
       this.running = false;
       this.waitController = null;
+      this.cycleController = null;
     }
   }
 }
 
-module.exports = { IdleAutomationSession, computeEnergyWakeDelay, requiredEnergyFromPlan };
+module.exports = { IdleAutomationSession, computeEnergyWakeDelay, requiredEnergyFromPlan, isConnectionFailure };

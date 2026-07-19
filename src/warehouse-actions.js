@@ -1,6 +1,6 @@
 "use strict";
 
-const { setTimeout: delay } = require("node:timers/promises");
+const { waitForDelay } = require("./abortable-delay");
 const { WAREHOUSE_REASONS, unknownWarehouseInventoryKnowledge, warehouseGridEligibility, warehouseInventoryKnowledgeFromNative } = require("./warehouse-domain");
 
 function warehouseRuntimePrelude() {
@@ -87,26 +87,26 @@ class WarehouseActionExecutor {
     this.onInventoryKnowledgeInvalidated = onInventoryKnowledgeInvalidated;
   }
 
-  evaluate(expression) { return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs }); }
+  evaluate(expression, signal = null) { return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs, signal }); }
 
   invalidate(reason) { this.onInventoryKnowledgeInvalidated?.(reason); }
 
   async open({ execute = false, signal = null } = {}) {
-    const before = await this.collectState();
+    const before = await this.collectState(signal);
     if (before.scene === "warehouse" || before.warehouse?.visible) return { ok: true, executed: false, reason: "warehouse-already-open", before };
     if (before.scene !== "board") return { ok: false, executed: false, reason: "board-not-visible", before };
     if (!execute) return { ok: true, executed: false, reason: "ready-to-open-warehouse", before };
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before };
-    const acknowledgement = await this.evaluate(OPEN_WAREHOUSE_EXPRESSION);
+    const acknowledgement = await this.evaluate(OPEN_WAREHOUSE_EXPRESSION, signal);
     if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-open-failed", acknowledgement, before };
-    await delay(this.settleMs);
-    const after = await this.collectState();
+    if (!await waitForDelay(this.settleMs, signal)) return { ok: false, executed: true, reason: "aborted", acknowledgement, before };
+    const after = await this.collectState(signal);
     const ok = after.scene === "warehouse" || !!after.warehouse?.visible;
     return { ok, executed: true, reason: ok ? "warehouse-opened" : "warehouse-open-not-observed", acknowledgement, before, after };
   }
 
   async loadInventory({ execute = false, signal = null } = {}) {
-    const before = await this.collectState();
+    const before = await this.collectState(signal);
     let visibleState = before;
     if (before.scene !== "warehouse" && !before.warehouse?.visible) {
       if (!execute) return { ok: true, executed: false, reason: "warehouse-inventory-load-required", before, nextAction: { type: "load-warehouse-inventory" } };
@@ -115,7 +115,7 @@ class WarehouseActionExecutor {
       visibleState = opened.after || before;
     }
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before };
-    const acknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION);
+    const acknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION, signal);
     if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-inventory-load-failed", acknowledgement, before, after: visibleState };
     const inventoryKnowledge = warehouseInventoryKnowledgeFromNative(acknowledgement);
     const state = JSON.parse(JSON.stringify(visibleState));
@@ -128,7 +128,7 @@ class WarehouseActionExecutor {
   }
 
   async retrieve(action, { execute = false, signal = null, inventory = null, before = null } = {}) {
-    const checkedBefore = before || await this.collectState();
+    const checkedBefore = before || await this.collectState(signal);
     const knowledge = inventory?.status === "loaded" ? inventory : warehouseInventoryKnowledgeFromNative(inventory);
     if (knowledge.status !== "loaded" || knowledge.retrievalPath?.status !== "trusted") return { ok: false, executed: false, reason: "warehouse-retrieval-path-untrusted", before: checkedBefore };
     if (String(knowledge.revision) !== String(action.inventoryRevision)) return { ok: false, executed: false, reason: "warehouse-revision-changed", before: checkedBefore, inventoryKnowledge: knowledge };
@@ -136,15 +136,24 @@ class WarehouseActionExecutor {
     if (!target?.occupied || String(target.itemId) !== String(action.itemId)) return { ok: false, executed: false, reason: "warehouse-slot-item-changed", before: checkedBefore, inventoryKnowledge: knowledge };
     if (!execute) return { ok: true, executed: false, reason: "ready-to-retrieve-warehouse-item", before: checkedBefore, inventoryKnowledge: knowledge, nextAction: action };
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before: checkedBefore };
-    const acknowledgement = await this.evaluate(buildWarehouseRetrieveExpression(action.warehouseSlotId, action.itemId, action.inventoryRevision));
+    let acknowledgement;
+    try {
+      acknowledgement = await this.evaluate(buildWarehouseRetrieveExpression(action.warehouseSlotId, action.itemId, action.inventoryRevision), signal);
+    } catch (error) {
+      this.invalidate("warehouse-retrieval-outcome-unknown");
+      return { ok: false, executed: true, reason: "warehouse-retrieval-outcome-unknown", error: error.message, before: checkedBefore, uncertainAction: true, resyncRequired: true, inventoryKnowledge: unknownWarehouseInventoryKnowledge("warehouse-retrieval-outcome-unknown") };
+    }
     if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-retrieval-failed", acknowledgement, before: checkedBefore };
-    await delay(this.settleMs);
-    const after = await this.collectState();
+    if (!await waitForDelay(this.settleMs, signal)) {
+      this.invalidate("warehouse-retrieval-pending-resynchronization");
+      return { ok: false, executed: true, reason: "aborted", acknowledgement, before: checkedBefore, uncertainAction: true, resyncRequired: true, inventoryKnowledge: unknownWarehouseInventoryKnowledge("warehouse-retrieval-aborted-after-acknowledgement") };
+    }
+    const after = await this.collectState(signal);
     if (!(after.board?.grids || []).length && (checkedBefore.board?.grids || []).length) {
-      const boardAcknowledgement = await this.evaluate(BOARD_AFTER_RETRIEVAL_EXPRESSION);
+      const boardAcknowledgement = await this.evaluate(BOARD_AFTER_RETRIEVAL_EXPRESSION, signal);
       if (boardAcknowledgement?.ok) after.board = { ...(after.board || {}), ...boardAcknowledgement };
     }
-    const inventoryAcknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION);
+    const inventoryAcknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION, signal);
     const afterKnowledge = warehouseInventoryKnowledgeFromNative(inventoryAcknowledgement);
     const beforeItemCount = (checkedBefore.board?.grids || []).filter((grid) => String(grid.itemId) === String(action.itemId) && !grid.empty).length;
     const afterItems = (after.board?.grids || []).filter((grid) => String(grid.itemId) === String(action.itemId) && !grid.empty);
@@ -171,11 +180,11 @@ class WarehouseActionExecutor {
   async preflight(index, { signal = null } = {}) {
     const gridIndex = Number(index);
     if (!Number.isInteger(gridIndex)) return { ok: false, executed: false, reason: "warehouse-index-invalid" };
-    const before = await this.collectState();
+    const before = await this.collectState(signal);
     const validation = sourcePreflightFailure(before, gridIndex);
     if (validation.reason) return { ok: false, executed: false, reason: validation.reason, unavailable: validation.unavailable, source: validation.source, before, storeAvailability: { status: "unavailable", reason: validation.reason } };
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before };
-    const acknowledgement = await this.evaluate(buildWarehouseStorePreflightExpression(gridIndex));
+    const acknowledgement = await this.evaluate(buildWarehouseStorePreflightExpression(gridIndex), signal);
     if (!acknowledgement?.ok) return { ok: false, executed: false, reason: acknowledgement?.reason || "warehouse-store-preflight-failed", acknowledgement, source: validation.source, before, storeAvailability: { status: "unavailable", reason: acknowledgement?.reason || "warehouse-store-preflight-failed" } };
     return {
       ok: true, executed: false, reason: "warehouse-store-available", acknowledgement, source: validation.source, before,
@@ -189,13 +198,22 @@ class WarehouseActionExecutor {
     if (!checked.ok) return checked;
     if (!execute) return { ...checked, reason: "ready-to-move-to-warehouse", nextAction: { type: "store-to-warehouse", sourceIndex: gridIndex, itemId: checked.source.itemId, storeAvailability: checked.storeAvailability } };
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before: checked.before };
-    const acknowledgement = await this.evaluate(buildMoveToWarehouseExpression(gridIndex, checked.storeAvailability.targetSlotId, checked.storeAvailability.itemId, checked.storeAvailability.boardSignature));
+    let acknowledgement;
+    try {
+      acknowledgement = await this.evaluate(buildMoveToWarehouseExpression(gridIndex, checked.storeAvailability.targetSlotId, checked.storeAvailability.itemId, checked.storeAvailability.boardSignature), signal);
+    } catch (error) {
+      this.invalidate("warehouse-store-outcome-unknown");
+      return { ok: false, executed: true, reason: "warehouse-store-outcome-unknown", error: error.message, before: checked.before, uncertainAction: true, resyncRequired: true, warehouseInventoryKnowledge: unknownWarehouseInventoryKnowledge("warehouse-store-outcome-unknown") };
+    }
     if (!acknowledgement?.ok) {
       this.invalidate("warehouse-store-failed");
       return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-store-failed", acknowledgement, before: checked.before, storeAvailability: checked.storeAvailability, warehouseInventoryKnowledge: unknownWarehouseInventoryKnowledge("warehouse-store-failed") };
     }
-    await delay(this.settleMs);
-    const after = await this.collectState();
+    if (!await waitForDelay(this.settleMs, signal)) {
+      this.invalidate("warehouse-store-pending-resynchronization");
+      return { ok: false, executed: true, reason: "aborted", acknowledgement, before: checked.before, uncertainAction: true, resyncRequired: true, warehouseInventoryKnowledge: unknownWarehouseInventoryKnowledge("warehouse-store-aborted-after-acknowledgement") };
+    }
+    const after = await this.collectState(signal);
     const before = checked.before;
     const next = after.board?.grids?.find((grid) => Number(grid.index) === gridIndex);
     const sourceCleared = !!next?.empty;

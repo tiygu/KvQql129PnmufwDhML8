@@ -138,7 +138,7 @@ class OrderCoinLoop {
     const actions = [];
     for (let step = 0; step < limit; step += 1) {
       if (signal?.aborted) return { ok: false, executed: execute, reason: "aborted", targetSlot: this.targetSlot, actions };
-      const state = await this.collectState();
+      const state = await this.collectState(signal);
       const energy = Number(state.resources?.energy);
       if (Number.isFinite(energy) && energy <= this.minEnergy) {
         return { ok: true, executed: execute, reason: "energy-depleted", targetSlot: this.targetSlot, actions, state };

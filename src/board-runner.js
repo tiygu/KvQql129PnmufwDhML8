@@ -1,6 +1,6 @@
 "use strict";
 
-const { setTimeout: delay } = require("node:timers/promises");
+const { waitForDelay } = require("./abortable-delay");
 const { productionModeRuntimeHelpersPrelude } = require("./production-mode-runtime");
 
 const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
@@ -155,29 +155,29 @@ class BoardAutomationRunner {
     this.evaluateTimeoutMs = Math.max(5000, Number(options.evaluateTimeoutMs ?? 10000));
   }
 
-  evaluate(expression) {
-    return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs });
+  evaluate(expression, signal = null) {
+    return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs, signal });
   }
 
-  readState() {
-    return this.evaluate(BOARD_CONTROL_STATE_EXPRESSION);
+  readState(signal = null) {
+    return this.evaluate(BOARD_CONTROL_STATE_EXPRESSION, signal);
   }
 
-  async waitForSettle() {
-    await delay(this.delayMs);
+  async waitForSettle(signal = null) {
+    return waitForDelay(this.delayMs, signal);
   }
 
-  async executeAtomicAndRead(expression, uncertainAction, rejectedReason) {
+  async executeAtomicAndRead(expression, uncertainAction, rejectedReason, signal = null) {
     let acknowledgement;
     try {
-      acknowledgement = await this.evaluate(expression);
+      acknowledgement = await this.evaluate(expression, signal);
     } catch (error) {
       return { ok: false, failure: { ok: false, executed: true, reason: "atomic_action_error", error: error.message, uncertainAction } };
     }
     if (!acknowledgement?.ok) return { ok: false, failure: { ok: false, executed: true, reason: acknowledgement?.reason || rejectedReason, failedAction: acknowledgement } };
-    await this.waitForSettle();
+    if (await this.waitForSettle(signal) === false) return { ok: false, failure: { ok: false, executed: true, reason: "aborted", uncertainAction } };
     try {
-      return { ok: true, acknowledgement, state: await this.readState() };
+      return { ok: true, acknowledgement, state: await this.readState(signal) };
     } catch (error) {
       return { ok: false, failure: { ok: false, executed: true, reason: "verification_read_error", error: error.message, uncertainAction } };
     }
@@ -192,7 +192,7 @@ class BoardAutomationRunner {
     const execute = !!options.execute;
     let state;
     try {
-      state = await this.readState();
+      state = await this.readState(options.signal);
     } catch (error) {
       return { ok: false, executed: false, reason: "state_read_error", error: error.message };
     }
@@ -215,7 +215,7 @@ class BoardAutomationRunner {
         const candidate = requestedMerge
           ? state.mergeCandidates.find((entry) => Number(entry.from) === requestedMerge.from && Number(entry.to) === requestedMerge.to)
           : state.mergeCandidates[0];
-        const execution = await this.executeAtomicAndRead(buildAtomicMergeExpression(candidate.from, candidate.to), { type: "merge", from: candidate.from, to: candidate.to }, "merge_rejected");
+        const execution = await this.executeAtomicAndRead(buildAtomicMergeExpression(candidate.from, candidate.to), { type: "merge", from: candidate.from, to: candidate.to }, "merge_rejected", options.signal);
         if (!execution.ok) return { ...execution.failure, actions };
         state = execution.state;
         const source = state.grids.find((grid) => grid.index === candidate.from), target = state.grids.find((grid) => grid.index === candidate.to);
@@ -229,12 +229,12 @@ class BoardAutomationRunner {
         const expectedModeId = options.plannedAction?.productionModeId ?? null;
         const uncertainAction = { type: "producer-touch", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, productionModeId: expectedModeId ?? selectedProducer.currentProductionModeId ?? null, attributable: false, uncertain: true };
         if (expectedModeId != null && String(selectedProducer.currentProductionModeId) !== String(expectedModeId)) return { ok: false, executed: false, reason: "production_mode_mismatch", expectedModeId: String(expectedModeId), currentModeId: selectedProducer.currentProductionModeId, actions };
-        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected");
+        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal);
         if (!firstExecution.ok) return { ...firstExecution.failure, actions };
         state = firstExecution.state;
         if (state.signature === before.signature) {
           touches = 2;
-          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected");
+          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal);
           if (!secondExecution.ok) return { ...secondExecution.failure, actions };
           state = secondExecution.state;
         }

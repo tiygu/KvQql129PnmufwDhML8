@@ -20,7 +20,7 @@ class FullAutomationLoop {
     for (let index = 0; index < limit; index += 1) {
       if (signal?.aborted) return { ok: false, executed: execute, reason: "aborted", actions };
       await this.waitIfPaused?.(signal);
-      const state = await this.collectState();
+      const state = await this.collectState(signal);
       if (state.mapMission?.canComplete) {
         if (!this.autoMapUpgrade) return { ok: true, executed: execute, reason: "map-upgrade-awaiting-confirmation", nextAction: { type: "complete-map-mission", missionId: state.mapMission.id }, state, actions };
         if (state.scene === "board") {

@@ -37,20 +37,20 @@ function buildSaleSuggestions(state, { policy = DEFAULT_SALE_POLICY, spacePressu
   }).map((grid) => ({ grid, item: { ...itemById.get(String(grid.itemId)), saleValue: Number(grid.saleValue ?? itemById.get(String(grid.itemId))?.saleValue ?? 0) } }));
   const counts = new Map();
   const chainCounts = new Map();
+  const levelCounts = new Map();
   for (const { item } of eligible) {
     counts.set(item.id, (counts.get(item.id) || 0) + 1);
     chainCounts.set(String(item.chainId), (chainCounts.get(String(item.chainId)) || 0) + 1);
+    levelCounts.set(Number(item.level), (levelCounts.get(Number(item.level)) || 0) + 1);
   }
-  const emittedByItem = new Map();
-  const candidates = [];
+  const scopeCount = (rule) => rule.scope === "item" ? counts.get(String(rule.value)) || 0
+    : rule.scope === "chain" ? chainCounts.get(String(rule.value)) || 0
+      : levelCounts.get(Number(rule.value)) || 0;
+  const ranked = [];
   for (const { grid, item } of eligible) {
     const rules = matchingRules(item, normalizedPolicy);
     if (rules.some((rule) => rule.disposition === "never")) continue;
-    const surplusRule = rules.find((rule) => rule.disposition === "surplus");
-    if (surplusRule) {
-      const allowed = Math.max(0, (counts.get(item.id) || 0) - surplusRule.keep);
-      if ((emittedByItem.get(item.id) || 0) >= allowed) continue;
-    }
+    const surplusRules = rules.filter((rule) => rule.disposition === "surplus");
     const preferred = rules.some((rule) => rule.disposition === "preferred");
     const producerCosts = (state.catalog?.producers || []).flatMap((producer) => (producer.drops || []).filter((drop) => String(drop.itemId) === item.id).map((drop) => Number(producer.energyCost || 0) / Math.max(0.001, Number(drop.probability || 0) * Number(drop.count || 1))));
     const rebuildCost = (producerCosts.length ? Math.min(...producerCosts) : Number(item.baseUnits || 1)) * Math.max(1, Number(item.baseUnits || 1));
@@ -59,17 +59,26 @@ function buildSaleSuggestions(state, { policy = DEFAULT_SALE_POLICY, spacePressu
     const spaceValue = pressureTrigger ? 20 : 0;
     const mapProgress = Math.min(saleReturn, mapCoinDeficit);
     const opportunityValue = rebuildCost * 4 + chainScarcity * 6 - saleReturn * 0.15 - spaceValue - mapProgress * 0.2 - (preferred ? 25 : 0);
-    emittedByItem.set(item.id, (emittedByItem.get(item.id) || 0) + 1);
-    candidates.push({
+    ranked.push({
       type: "sell-item", sourceIndex: Number(grid.index), itemId: item.id, chainId: item.chainId, level: item.level,
       expectedCoins: saleReturn, mapProgressCoins: mapProgress, opportunityValue,
-      policyDisposition: preferred && surplusRule ? "preferred-surplus" : preferred ? "preferred" : surplusRule ? "surplus" : "allowed",
+      policyDisposition: preferred && surplusRules.length ? "preferred-surplus" : preferred ? "preferred" : surplusRules.length ? "surplus" : "allowed",
       reason: mapCoinDeficit > 0 && pressureTrigger ? "map-coin-deficit-and-space-pressure" : mapCoinDeficit > 0 ? "map-coin-deficit" : "unresolved-space-pressure",
       requiresConfirmation: true, automaticExecutionEnabled: false,
       valueBreakdown: { rebuildCost, chainScarcity, saleReturn, spaceValue, mapProgress },
+      surplusRules,
     });
   }
-  return candidates.sort((left, right) => left.opportunityValue - right.opportunityValue || right.expectedCoins - left.expectedCoins || left.sourceIndex - right.sourceIndex);
+  ranked.sort((left, right) => left.opportunityValue - right.opportunityValue || right.expectedCoins - left.expectedCoins || left.sourceIndex - right.sourceIndex);
+  const emittedByRule = new Map();
+  const selected = [];
+  for (const candidate of ranked) {
+    if (candidate.surplusRules.some((rule) => (emittedByRule.get(rule) || 0) >= Math.max(0, scopeCount(rule) - rule.keep))) continue;
+    for (const rule of candidate.surplusRules) emittedByRule.set(rule, (emittedByRule.get(rule) || 0) + 1);
+    const { surplusRules, ...suggestion } = candidate;
+    selected.push(suggestion);
+  }
+  return selected;
 }
 
 module.exports = { DEFAULT_SALE_POLICY, normalizeSalePolicy, buildSaleSuggestions };

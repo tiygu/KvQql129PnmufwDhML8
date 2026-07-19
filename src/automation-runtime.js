@@ -48,6 +48,17 @@ function mergeCatalogs(base, update) {
   };
 }
 
+function waitForPromiseOrAbort(promise, signal = null) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(Object.assign(new Error("operation aborted"), { name: "AbortError" }));
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(Object.assign(new Error("operation aborted"), { name: "AbortError" })); };
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then((value) => { cleanup(); resolve(value); }, (error) => { cleanup(); reject(error); });
+  });
+}
+
 class AutomationRuntime {
   constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true } = {}) {
     this.rootDir = rootDir;
@@ -58,6 +69,7 @@ class AutomationRuntime {
     this.lab = null;
     this.selection = null;
     this.connectPromise = null;
+    this.connectController = null;
     this.lastState = buildGameState();
     this.running = false;
     this.abortController = null;
@@ -366,20 +378,27 @@ class AutomationRuntime {
   }
   async stopConnectionRoute() {
     this.connectionAutoStartEnabled = false;
+    this.connectController?.abort();
     await this.lab?.close().catch(() => {});
     this.lab = null;
     this.selection = null;
     return this.connectionService.stop();
   }
 
-  connect() {
+  connect(signal = null) {
     if (this.lab && this.selection?.probe) return this.selection;
-    if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.connectOnce().finally(() => { this.connectPromise = null; });
-    return this.connectPromise;
+    if (signal?.aborted) return Promise.reject(Object.assign(new Error("operation aborted"), { name: "AbortError" }));
+    if (this.connectPromise) return waitForPromiseOrAbort(this.connectPromise, signal);
+    const controller = new AbortController();
+    this.connectController = controller;
+    this.connectPromise = this.connectOnce(controller.signal).finally(() => {
+      this.connectPromise = null;
+      if (this.connectController === controller) this.connectController = null;
+    });
+    return waitForPromiseOrAbort(this.connectPromise, signal);
   }
 
-  async connectOnce() {
+  async connectOnce(signal = null) {
     const previous = this.lab;
     if (previous) {
       this.lab = null;
@@ -388,7 +407,7 @@ class AutomationRuntime {
     }
     const lab = new AdapterLab(getConfig({ url: this.url || undefined }));
     this.lab = lab;
-    const probes = await lab.connectAndDiscover();
+    const probes = await lab.connectAndDiscover(signal);
     const selection = lab.select(probes);
     if (!selection.probe || selection.adapter?.id !== "target-game") {
       await lab.close();
@@ -406,11 +425,12 @@ class AutomationRuntime {
     return selection;
   }
 
-  async collectState() {
-    const selection = await this.connect();
+  async collectState(signal = null) {
+    const selection = await this.connect(signal);
     let snapshot;
-    try { snapshot = await this.lab.snapshot(selection); }
+    try { snapshot = await this.lab.snapshot(selection, { signal }); }
     catch (error) {
+      if (error?.name === "AbortError") throw error;
       const failedLab = this.lab;
       this.selection = null;
       this.lab = null;
@@ -418,7 +438,7 @@ class AutomationRuntime {
       throw error;
     }
     let boardState = null;
-    try { boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, selection.probe.context.id); } catch (_) {}
+    try { boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, selection.probe.context.id, { signal }); } catch (error) { if (error?.name === "AbortError") throw error; }
     const state = buildGameState({ state: summarizeSnapshot(snapshot), boardState });
     if (this.warehouseInventoryKnowledgeInvalidated) {
       if (state.scene === "warehouse" && state.warehouse?.visible && state.warehouse?.inventoryKnowledge?.status === "loaded") {
@@ -566,9 +586,9 @@ class AutomationRuntime {
     return { ok: true, path: destination, bytes: (await fsp.stat(destination)).size };
   }
 
-  createRuntime(options, sessionId = null) {
+  createRuntime(options, sessionId = null, nextSequence = null) {
     const contextId = this.selection.probe.context.id;
-    const collectState = () => this.collectState();
+    const collectState = (signal = null) => this.collectState(signal);
     const runner = new BoardAutomationRunner({ client: this.lab.client, contextId, delayMs: options.delayMs, evaluateTimeoutMs: options.timeoutMs });
     const submitter = new OrderSubmitter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const navigator = new SceneNavigator({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
@@ -584,7 +604,7 @@ class AutomationRuntime {
       runOrderCycle: (runOptions) => orderLoop.run(runOptions),
       completeMapMission: ({ signal }) => mapCompleter.complete({ execute: true, signal }),
       onEvent: (event) => {
-        const actionSequence = ++sequence;
+        const actionSequence = nextSequence ? nextSequence() : ++sequence;
         if (sessionId) this.database.logAction({ sessionId, sequence: actionSequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
         this.queuePassiveCatalogEvidence({ actionDiff: { ...(event.diff || event), actionId: `${sessionId || "runtime"}:${actionSequence}`, reason: event.reason } });
         this.emit("automation-action", { action: event });
@@ -654,6 +674,13 @@ class AutomationRuntime {
   }
 
   async start(options = {}) {
+    const persisted = this.getSettings();
+    const requestedMode = options.mode;
+    options = {
+      ...persisted,
+      ...options,
+      mode: requestedMode == null ? "observation" : ["observation", "assisted", "automatic"].includes(requestedMode) ? requestedMode : "observation",
+    };
     if (this.running || this.actionBoundaryPending) throw new Error("自动化任务已在运行");
     this.actionBoundaryPending = true;
     try {
@@ -665,13 +692,13 @@ class AutomationRuntime {
     }
     this.pauseGate.reset();
     this.abortController = new AbortController();
-    const sessionId = this.database.startSession("automatic", options);
+    const sessionId = this.database.startSession(options.mode === "observation" ? "observation" : "automatic", options);
     this.sessionKind = "bounded";
     this.activeSessionId = sessionId;
     this.emit("automation-status", { running: true, paused: false, sessionId });
     try {
       const loop = this.createRuntime(options, sessionId);
-      const result = await loop.run({ execute: true, maxActions: options.maxActions ?? null, signal: this.abortController.signal });
+      const result = await loop.run({ execute: options.mode !== "observation", maxActions: options.maxActions ?? null, signal: this.abortController.signal });
       this.database.endSession(sessionId, result.ok ? "complete" : "failed");
       return result;
     } catch (error) {
@@ -717,10 +744,10 @@ class AutomationRuntime {
     this.activeSessionId = sessionId;
     let idleSequence = 0;
     this.idleSession = new IdleAutomationSession({
-      ensureConnection: () => this.connect(),
-      collectState: () => this.collectState(),
+      ensureConnection: (signal) => this.connect(signal),
+      collectState: (signal) => this.collectState(signal),
       planState: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }),
-      runBoundedSession: ({ signal }) => this.createRuntime(settings, sessionId).run({ execute: true, maxActions: null, signal }),
+      runBoundedSession: ({ signal }) => this.createRuntime(settings, sessionId, () => ++idleSequence).run({ execute: true, maxActions: null, signal }),
       waitIfPaused: (signal) => this.pauseGate.wait(signal),
       onEvent: (event) => {
         this.database.logAction({ sessionId, sequence: ++idleSequence, type: event.type, reason: event.reason, ok: event.ok, details: event });
@@ -781,6 +808,7 @@ class AutomationRuntime {
 
   async close() {
     this.stop();
+    this.connectController?.abort();
     await this.activeRunPromise?.catch(() => {});
     this.closing = true;
     await this.passiveCatalogDrainPromise?.catch(() => {});
@@ -791,4 +819,4 @@ class AutomationRuntime {
   }
 }
 
-module.exports = { AutomationRuntime, mergeCatalogs };
+module.exports = { AutomationRuntime, mergeCatalogs, waitForPromiseOrAbort };

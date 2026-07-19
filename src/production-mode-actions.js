@@ -1,6 +1,6 @@
 "use strict";
 
-const { setTimeout: delay } = require("node:timers/promises");
+const { waitForDelay } = require("./abortable-delay");
 const { productionModeRuntimeHelpersPrelude } = require("./production-mode-runtime");
 
 function productionModePrelude(index) {
@@ -29,12 +29,12 @@ class ProductionModeExecutor {
     this.evaluateTimeoutMs = Math.max(5000, Number(evaluateTimeoutMs));
   }
 
-  evaluate(expression) { return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs }); }
+  evaluate(expression, signal = null) { return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs, signal }); }
 
-  read(index) { return this.evaluate(buildProductionModeReadExpression(index)); }
+  read(index, signal = null) { return this.evaluate(buildProductionModeReadExpression(index), signal); }
 
   async switch(index, modeId, { execute = false, expectedCurrentModeId = null, signal = null } = {}) {
-    const before = await this.read(index);
+    const before = await this.read(index, signal);
     if (!before?.ok) return { ok: false, executed: false, reason: before?.reason || "production-mode-read-failed", before };
     const expected = expectedCurrentModeId == null ? before.currentModeId : String(expectedCurrentModeId);
     if (String(before.currentModeId) !== expected) return { ok: false, executed: false, reason: "production-mode-current-changed", before };
@@ -42,10 +42,10 @@ class ProductionModeExecutor {
     if (!available || before.switchEntry?.status !== "available") return { ok: false, executed: false, reason: "production-mode-unavailable", before };
     if (!execute) return { ok: true, executed: false, reason: "ready-to-switch-production-mode", before, nextAction: { type: "switch-production-mode", producer: Number(index), currentModeId: expected, productionModeId: String(modeId) } };
     if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before };
-    const acknowledgement = await this.evaluate(buildProductionModeSwitchExpression(index, modeId, expected));
+    const acknowledgement = await this.evaluate(buildProductionModeSwitchExpression(index, modeId, expected), signal);
     if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "production-mode-switch-failed", acknowledgement, before };
-    await delay(this.settleMs);
-    const after = await this.read(index);
+    if (!await waitForDelay(this.settleMs, signal)) return { ok: false, executed: true, reason: "aborted", acknowledgement, before };
+    const after = await this.read(index, signal);
     const ok = !!after?.ok && String(after.currentModeId) === String(modeId);
     return { ok, executed: true, reason: ok ? "production-mode-switched" : "production-mode-switch-not-observed", acknowledgement, before, after };
   }
