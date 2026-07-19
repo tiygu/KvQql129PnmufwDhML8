@@ -80,8 +80,9 @@ class OrderCoinLoop {
   async tryWarehouseStore({ plan, state, execute, signal, actions }) {
     const fallback = this.storeBoardItem ? selectWarehouseCandidate(state) : null;
     const plannerOwnsCandidates = Array.isArray(plan.warehouseStoreCandidates);
+    const selectedStoreAction = plan.recommended?.nextAction?.type === "store-to-warehouse" ? plan.recommended.nextAction : null;
     const candidates = plannerOwnsCandidates
-      ? plan.warehouseStoreCandidates
+      ? [selectedStoreAction, ...plan.warehouseStoreCandidates].filter((candidate, index, values) => candidate && values.findIndex((entry) => Number(entry?.sourceIndex) === Number(candidate.sourceIndex)) === index)
       : fallback ? [{ type: "store-to-warehouse", sourceIndex: fallback.index, itemId: fallback.itemId, opportunityCost: null, storeAvailability: { status: "native-preflight-required" } }] : [];
     if (!candidates.length) return null;
     let warehouseCandidate = null, checked = null;
@@ -166,6 +167,11 @@ class OrderCoinLoop {
         const reason = String(boundary).startsWith("waiting-") ? boundary : `waiting-${boundary}`;
         return { ok: true, executed: execute, reason, actions, state, plan };
       }
+      if (target.nextAction?.type === "store-to-warehouse") {
+        const warehouse = await this.tryWarehouseStore({ plan, state, execute, signal, actions });
+        if (warehouse?.continue) continue;
+        if (warehouse?.result) return warehouse.result;
+      }
       const modeSwitch = await this.tryProductionModeSwitch({ target, state, plan, execute, signal, actions });
       if (modeSwitch?.continue) continue;
       if (modeSwitch?.result) return modeSwitch.result;
@@ -195,7 +201,12 @@ class OrderCoinLoop {
       if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: plannedAction || { type: state.board.mergeCandidates.length ? "merge" : "produce", producer }, actions, state, plan };
       const boardResult = await this.runBoardAction({ producer, merge: plannedAction?.type === "merge" ? plannedAction : null, plannedAction, signal });
       const verified = boardResult.ok && (boardResult.actions?.length > 0 || boardResult.stopReason === "order_ready");
-      actions.push({ step: actions.length + 1, type: boardResult.actions?.[0]?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff: boardResult.actions?.[0] || boardResult.uncertainAction || null });
+      const diff = boardResult.actions?.[0] || boardResult.uncertainAction || null;
+      const actualOutputs = (diff?.actualOutputItemIds || []).map(String).sort();
+      const predictedBranches = plannedAction?.predictedBranches || [];
+      const predictionDiverged = plannedAction?.type === "produce" && actualOutputs.length > 0 && predictedBranches.length > 0
+        && !predictedBranches.some((branch) => JSON.stringify((branch.outcomeItemIds || []).map(String).sort()) === JSON.stringify(actualOutputs));
+      actions.push({ step: actions.length + 1, type: diff?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff, predictionDiverged, ...(predictionDiverged ? { replanReason: "actual-production-outside-predicted-branches" } : {}) });
       this.onEvent?.(actions.at(-1));
       if (!verified) return { ok: false, executed: true, reason: boardResult.reason || boardResult.stopReason || "board-action-failed", targetSlot: this.targetSlot, actions, boardResult };
     }

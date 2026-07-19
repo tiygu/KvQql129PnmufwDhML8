@@ -55,6 +55,18 @@ function hasMaterialSwitchBenefit(current, selected) {
     || current.metrics.overshootUnits - selected.metrics.overshootUnits >= 1;
 }
 
+function selectableProductionModes({ modes = [], currentModeId = null, availableModes = [], switchEntry = null }) {
+  const availableModeIds = new Set((availableModes || []).filter((mode) => mode.unlocked !== false).map((mode) => String(mode.modeId)));
+  const switchTrusted = switchEntry?.status === "available";
+  const locked = modes.filter((mode) => mode.humanLocked);
+  const selectable = (locked.length ? locked : modes).map((mode) => {
+    const current = String(mode.modeId) === String(currentModeId);
+    const runtimeSelectable = current || (switchTrusted && availableModeIds.has(String(mode.modeId)));
+    return { ...mode, unlocked: mode.unlocked !== false && runtimeSelectable, current, requiresSwitch: !current && runtimeSelectable };
+  });
+  return locked.length ? selectable : selectable.filter((mode) => mode.unlocked !== false);
+}
+
 function selectProductionMode({ producer, currentModeId = null, demands = [], board = {} }) {
   const modes = (producer?.modes || []).filter((mode) => !mode.inferred);
   const locked = modes.filter((mode) => mode.humanLocked);
@@ -84,4 +96,4 @@ function selectProductionMode({ producer, currentModeId = null, demands = [], bo
   };
 }
 
-module.exports = { MODE_SCORE_DIMENSIONS, modeMetrics, compareModeMetrics, compareModeScores, hasMaterialSwitchBenefit, selectProductionMode };
+module.exports = { MODE_SCORE_DIMENSIONS, modeMetrics, compareModeMetrics, compareModeScores, hasMaterialSwitchBenefit, selectableProductionModes, selectProductionMode };

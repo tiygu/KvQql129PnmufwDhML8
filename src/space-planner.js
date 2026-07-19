@@ -93,6 +93,12 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
         modes: (producer.modes || []).map((mode) => ({
           modeId: String(mode.modeId), energyCost: Number(mode.energyCost || 0), unlocked: mode.unlocked !== false,
           humanLocked: !!mode.humanLocked, inferred: !!mode.inferred,
+          planningDistribution: mode.planningDistribution ? {
+            sampleSize: Number(mode.planningDistribution.sampleSize || 0),
+            uncertaintyMass: Number(mode.planningDistribution.uncertaintyMass || 0),
+            expectedOutcomesPerAction: Number(mode.planningDistribution.expectedOutcomesPerAction || 1),
+            feasibilityOutcomesPerAction: Number(mode.planningDistribution.feasibilityOutcomesPerAction || mode.planningDistribution.expectedOutcomesPerAction || 1),
+          } : null,
           drops: (mode.drops || []).map((drop) => ({ itemId: String(drop.itemId), chainId: drop.chainId == null ? null : String(drop.chainId), level: Number(drop.level || 0), probability: Number(drop.probability), count: Number(drop.count ?? 1), baseUnits: Number(drop.baseUnits || 0) })),
         })),
       })),
@@ -238,6 +244,46 @@ function simulateProduce(state, action) {
   return { ok: true, state: deepFreeze(next) };
 }
 
+function simulateProductionOutcome(state, action, outcomeItemIds) {
+  const producerGrid = gridAt(state, action.producer);
+  const profile = state.catalog.producers.find((producer) => producer.itemId === producerGrid?.itemId);
+  const mode = (profile?.modes || []).find((candidate) => String(candidate.modeId) === String(action.productionModeId));
+  const energyCost = Number(action.energyCost ?? mode?.energyCost ?? profile?.energyCost);
+  const outputs = (outcomeItemIds || []).map(String).filter(Boolean);
+  if (!producerGrid?.executable || producerGrid?.produceCount === 0) return { ok: false, reason: "unsafe-production" };
+  if (!outputs.length) return { ok: false, reason: "production-outcome-required" };
+  if (producerGrid.currentProductionModeId != null && action.productionModeId != null && String(producerGrid.currentProductionModeId) !== String(action.productionModeId)) return { ok: false, reason: "production-mode-mismatch" };
+  if (state.board.empty < outputs.length) return { ok: false, reason: "board-space-required" };
+  if (!Number.isFinite(energyCost) || state.energy < energyCost) return { ok: false, reason: "insufficient-energy" };
+  const next = mutableCopy(state);
+  for (const outputItemId of outputs) {
+    const resultItem = catalogItem(next, outputItemId);
+    const target = next.board.grids.find((grid) => grid.empty);
+    if (!target) return { ok: false, reason: "board-space-required" };
+    Object.assign(target, {
+      itemId: outputItemId, empty: false, level: resultItem?.level ?? null, mergeTarget: resultItem?.mergeTarget ?? null,
+      executable: !!resultItem?.evidenceSufficient, unavailableReasons: resultItem ? [] : ["unknown-production-outcome"],
+      protected: false, produceCount: null, energyCost: null,
+    });
+    next.board.occupied += 1;
+    next.board.empty -= 1;
+  }
+  next.energy -= energyCost;
+  const nextProducer = gridAt(next, action.producer);
+  if (nextProducer.produceCount != null) nextProducer.produceCount -= 1;
+  updateOrderReadiness(next);
+  return { ok: true, state: deepFreeze(next), energyCost, outcomeItemIds: outputs };
+}
+
+function simulateProductionModeSwitch(state, action) {
+  const producer = gridAt(state, action.producer);
+  const available = producer?.availableProductionModes?.some((mode) => String(mode.modeId) === String(action.productionModeId) && mode.unlocked !== false);
+  if (!producer?.executable || !available || producer.productionModeSwitchEntry?.status !== "available") return { ok: false, reason: "production-mode-switch-unavailable" };
+  const next = mutableCopy(state);
+  gridAt(next, action.producer).currentProductionModeId = String(action.productionModeId);
+  return { ok: true, state: deepFreeze(next) };
+}
+
 function simulateSubmit(state, action) {
   const order = state.orders.find((candidate) => candidate.slot === String(action.slot));
   if (!order || !order.ready) return { ok: false, reason: "order-not-ready" };
@@ -259,8 +305,9 @@ function simulateSubmit(state, action) {
   return { ok: true, state: deepFreeze(next) };
 }
 
-function simulateWarehouseStore(state, action) {
-  if (action.storeAvailability?.status !== "available" || !action.storeAvailability.targetSlotId) return { ok: false, reason: "warehouse-native-preflight-required" };
+function simulateWarehouseStoreTransition(state, action, { requireVerifiedAvailability }) {
+  const verified = action.storeAvailability?.status === "available" && !!action.storeAvailability.targetSlotId;
+  if (requireVerifiedAvailability && !verified) return { ok: false, reason: "warehouse-native-preflight-required" };
   const source = gridAt(state, action.sourceIndex);
   const sourceItem = catalogItem(state, source.itemId);
   const eligibility = warehouseGridEligibility(source, { catalogItemKnown: !!sourceItem?.evidenceSufficient });
@@ -281,8 +328,33 @@ function simulateWarehouseStore(state, action) {
     ok: true,
     state: deepFreeze(next),
     opportunityCost: Number(action.opportunityCost || 0),
-    warehouseExchange: { beforeCapacity, afterCapacity, targetSlotId: String(action.storeAvailability.targetSlotId) },
+    warehouseExchange: { beforeCapacity, afterCapacity, targetSlotId: verified ? String(action.storeAvailability.targetSlotId) : null, ...(!verified ? { hypotheticalPreflight: true } : {}) },
   };
+}
+
+function simulateWarehouseStore(state, action) {
+  return simulateWarehouseStoreTransition(state, action, { requireVerifiedAvailability: true });
+}
+
+function simulateWarehouseStoreProposal(state, action) {
+  return simulateWarehouseStoreTransition(state, action, { requireVerifiedAvailability: false });
+}
+
+function simulateWarehouseRetrieve(state, action) {
+  const knowledge = state.warehouse.inventoryKnowledge;
+  if (knowledge.status !== "loaded" || knowledge.retrievalPath?.status !== "trusted" || String(knowledge.revision) !== String(action.inventoryRevision)) return { ok: false, reason: "warehouse-revision-mismatch" };
+  if (state.board.empty <= 0) return { ok: false, reason: "board-space-required" };
+  const slot = (knowledge.slots || []).find((candidate) => String(candidate.slotId) === String(action.warehouseSlotId) && candidate.occupied && String(candidate.itemId) === String(action.itemId));
+  const item = catalogItem(state, action.itemId);
+  if (!slot || !item?.evidenceSufficient) return { ok: false, reason: "warehouse-slot-unavailable" };
+  const next = mutableCopy(state);
+  const target = next.board.grids.find((grid) => grid.empty);
+  Object.assign(target, { itemId: item.id, empty: false, level: item.level, mergeTarget: item.mergeTarget, executable: true, unavailableReasons: [], protected: false, produceCount: null, energyCost: null });
+  next.board.occupied += 1;
+  next.board.empty -= 1;
+  next.warehouse.inventoryKnowledge = unknownWarehouseInventoryKnowledge("warehouse-retrieval-invalidated");
+  updateOrderReadiness(next);
+  return { ok: true, state: deepFreeze(next) };
 }
 
 function simulateDeterministicTransition(state, action) {
@@ -290,6 +362,8 @@ function simulateDeterministicTransition(state, action) {
   if (action?.type === "produce") return simulateProduce(state, action);
   if (action?.type === "submit-order") return simulateSubmit(state, action);
   if (action?.type === "store-to-warehouse") return simulateWarehouseStore(state, action);
+  if (action?.type === "retrieve-from-warehouse") return simulateWarehouseRetrieve(state, action);
+  if (action?.type === "switch-production-mode") return simulateProductionModeSwitch(state, action);
   return { ok: false, reason: "unsupported-deterministic-transition" };
 }
 
@@ -391,7 +465,7 @@ function stateKey(state) {
   return `${state.energy}|${grids.join("|")}`;
 }
 
-function candidateActions(state, pruned) {
+function buildMergeCandidates(state, onPruned = null) {
   const actions = [];
   const groups = new Map();
   for (const grid of state.board.grids.filter((entry) => entry.itemId && !entry.empty)) {
@@ -403,9 +477,14 @@ function candidateActions(state, pruned) {
       const action = { type: "merge", from: grids[left].index, to: grids[right].index, itemId, resultItemId: catalogItem(state, itemId)?.mergeTarget || null };
       const simulated = simulateMerge(state, action);
       if (simulated.ok) actions.push(action);
-      else pruned[simulated.reason] = (pruned[simulated.reason] || 0) + 1;
+      else onPruned?.(simulated.reason);
     }
   }
+  return actions;
+}
+
+function candidateActions(state, pruned) {
+  const actions = buildMergeCandidates(state, (reason) => { pruned[reason] = (pruned[reason] || 0) + 1; });
   for (const profile of state.catalog.producers) {
     if (profile.drops.length !== 1 || profile.drops[0].probability !== 1) continue;
     for (const grid of state.board.grids.filter((entry) => entry.itemId === profile.itemId)) {
@@ -488,4 +567,14 @@ function planDeterministicOrder(state, orderSlot, { maxStates = 768, maxDepth = 
   };
 }
 
-module.exports = { normalizePlannerState, simulateDeterministicTransition, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates };
+module.exports = {
+  normalizePlannerState,
+  simulateDeterministicTransition,
+  simulateProductionOutcome,
+  simulateWarehouseStoreProposal,
+  planDeterministicOrder,
+  comparePathScores,
+  buildWarehouseStoreCandidates,
+  buildWarehouseRetrieveCandidates,
+  buildMergeCandidates,
+};

@@ -2,7 +2,8 @@
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
 const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates } = require("./space-planner");
-const { selectProductionMode } = require("./production-modes");
+const { selectProductionMode, selectableProductionModes } = require("./production-modes");
+const { planStochasticOrder } = require("./stochastic-beam-search");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -187,16 +188,9 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       let best = null;
       for (const producer of boardProducers) {
         const availableModeIds = new Set((producer.grid.availableProductionModes || []).filter((mode) => mode.unlocked !== false).map((mode) => String(mode.modeId)));
-        const switchTrusted = producer.grid.productionModeSwitchEntry?.status === "available";
         const modeAwareRuntime = producer.grid.currentProductionModeId != null && availableModeIds.size > 0;
         const configuredModes = producer.config.modes || [];
-        const hasHumanLock = configuredModes.some((mode) => mode.humanLocked);
-        const selectableModes = configuredModes
-          .filter((mode) => hasHumanLock ? mode.humanLocked : String(mode.modeId) === String(producer.grid.currentProductionModeId) || (switchTrusted && availableModeIds.has(String(mode.modeId))))
-          .map((mode) => {
-            const runtimeSelectable = String(mode.modeId) === String(producer.grid.currentProductionModeId) || (switchTrusted && availableModeIds.has(String(mode.modeId)));
-            return { ...mode, unlocked: mode.unlocked !== false && runtimeSelectable };
-          });
+        const selectableModes = selectableProductionModes({ modes: configuredModes, currentModeId: producer.grid.currentProductionModeId, availableModes: producer.grid.availableProductionModes, switchEntry: producer.grid.productionModeSwitchEntry });
         const modeDecision = selectProductionMode({
           producer: { ...producer.config, modes: selectableModes }, currentModeId: producer.grid.currentProductionModeId,
           demands: [...demands.values()].map((demand) => ({ ...demand, deficitUnits: remaining.get(demand.chainId) || 0 })),
@@ -278,9 +272,15 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
   let warehouseRetrieveCandidates = [];
   if (gameState) {
     warehouseStoreCandidates = buildWarehouseStoreCandidates(normalizedState);
-    const hasStochasticProduction = (catalog.producers || []).some((producer) => producer.drops?.length !== 1 || Number(producer.drops?.[0]?.probability) !== 1);
+    const hasStochasticProduction = (catalog.producers || []).some((producer) => {
+      const distributions = producer.modes?.length ? producer.modes.map((mode) => mode.drops || []) : [producer.drops || []];
+      return distributions.some((drops) => drops.length !== 1 || Number(drops[0]?.probability) !== 1);
+    });
     for (const plan of plans) {
-      const spacePlan = planDeterministicOrder(normalizedState, plan.slot);
+      const stateRevision = state.board?.signature || state.collectedAt || `${normalizedState.board.occupied}:${normalizedState.energy}:${normalizedState.warehouse.inventoryKnowledge.revision || "warehouse-unknown"}`;
+      const spacePlan = hasStochasticProduction && normalizedState.board.spaceKnown
+        ? planStochasticOrder(normalizedState, plan.slot, { catalogRevision: catalog.revision, stateRevision })
+        : planDeterministicOrder(normalizedState, plan.slot);
       plan.nextAction = spacePlan.nextAction;
       plan.boardSpaceFeasibility = spacePlan.boardSpaceFeasibility;
       plan.explanation = spacePlan.explanation;
@@ -308,6 +308,10 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
         plan.feasible = false;
         plan.actionable = false;
         plan.blockingReason = "insufficient-energy";
+      } else if (spacePlan.reason === "stochastic-space-risk") {
+        plan.feasible = false;
+        plan.actionable = false;
+        plan.blockingReason = "stochastic-space-risk";
       } else if (!hasStochasticProduction && spacePlan.reason === "deterministic-path-not-found" && plan.supplyFeasible) {
         plan.feasible = false;
         plan.actionable = false;
