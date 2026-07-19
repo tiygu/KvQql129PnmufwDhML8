@@ -131,6 +131,10 @@ test("证据冲突只比较不同来源的当前候选并在冲突证据失效�
   gate.evaluateObject("item-identity", "i1");
   let object = database.getCatalogObject("item-identity", "i1");
   assert.equal(database.listCatalogConflicts().length, 1);
+  const conflictRevision = database.getCatalogRevision();
+  gate.evaluateObject("item-identity", "i1");
+  assert.equal(database.listCatalogConflicts().length, 1);
+  assert.equal(database.getCatalogRevision(), conflictRevision);
   const conflictingEvidence = object.evidence.find((evidence) => evidence.sourceType === "structured-runtime");
   gate.setEvidenceDisposition("item-identity", "i1", conflictingEvidence.id, "rejected", "invalid-config", object.revision);
   assert.equal(database.listCatalogConflicts().length, 0);

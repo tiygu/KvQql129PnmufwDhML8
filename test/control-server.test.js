@@ -11,7 +11,9 @@ const { createControlServer } = require("../src/control-server");
 function createRuntime() {
   return {
     dashboard: async () => ({ connected: false, running: false }),
-    getCatalogView: () => ({ stats: { items: 3 }, repository: { summary: { states: { observed: 1, provisional: 1, active: 1 } }, objects: [{ objectType: "item-identity", objectId: "i", status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }] } }),
+    getCatalogView: () => ({ revision: "db-revision-3", stats: { items: 3 }, repository: { summary: { states: { observed: 1, provisional: 1, active: 1 } }, objects: [{ objectType: "item-identity", objectId: "i", status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }] } }),
+    exportCatalog: () => ({ schemaVersion: 1, source: { type: "sqlite-catalog-repository", revision: "db-revision-3" }, objects: [] }),
+    importCatalog: (snapshot, options) => ({ imported: snapshot.objects.length, preserved: 0, sourceFile: options.sourceFile, revision: "db-revision-4" }),
     getCatalogObject: (type, id) => ({ objectType: type, objectId: id, status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }),
     setCatalogObjectDisposition: (type, id, disposition, reason, expectedRevision) => {
       if (expectedRevision !== 3) throw Object.assign(new Error("catalog revision conflict"), { statusCode: 409 });
@@ -66,6 +68,7 @@ test("control server hosts the console and accepts background automation", async
 
     const catalogResponse = await fetch(`http://127.0.0.1:${port}/api/catalog`);
     const catalog = await catalogResponse.json();
+    assert.equal(catalog.revision, "db-revision-3");
     assert.equal(catalog.repository.objects[0].status, "active");
     assert.equal(catalog.repository.objects[0].revision, 3);
     assert.equal(catalog.repository.objects[0].evidenceSummary.evidenceCount, 2);
@@ -84,6 +87,29 @@ test("control server hosts the console and accepts background automation", async
       body: JSON.stringify({ objectType: "item-identity", objectId: "i", disposition: "paused", reason: "stale", expectedRevision: 2 }),
     });
     assert.equal(staleDispositionResponse.status, 409);
+  } finally {
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("control server 从同一 SQLite revision 导出并导入 Catalog JSON", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-catalog-json-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const server = createControlServer({ runtime: createRuntime(), publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  try {
+    const exported = await fetch(`http://127.0.0.1:${port}/api/catalog/export`);
+    assert.equal(exported.status, 200);
+    assert.match(exported.headers.get("content-disposition"), /catalog-repository-/);
+    const snapshot = await exported.json();
+    assert.equal(snapshot.source.revision, "db-revision-3");
+
+    const imported = await fetch(`http://127.0.0.1:${port}/api/catalog/import`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(snapshot),
+    });
+    assert.deepEqual(await imported.json(), { imported: 0, preserved: 0, sourceFile: "control-api", revision: "db-revision-4" });
   } finally {
     await server.close();
     fs.rmSync(root, { recursive: true, force: true });

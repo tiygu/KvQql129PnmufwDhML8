@@ -541,7 +541,7 @@ class AutomationDatabase {
       const value = revoke ? null : input.value;
       const newValue = revoke ? fieldValue(algorithmCandidate, fieldPath) : input.value;
       const nextRevision = Number(before.revision) + 1;
-      const now = new Date().toISOString();
+      const now = input.createdAt || new Date().toISOString();
       const json = (candidate) => JSON.stringify(candidate === undefined ? null : candidate);
       this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)`).run(before.id, fieldPath, decision, revoke ? null : json(value), actor, note, json(oldValue), json(newValue), nextRevision, now);
@@ -613,6 +613,181 @@ class AutomationDatabase {
       .filter((entry) => entry.reasons.length > 0);
   }
 
+  getCatalogRevision() {
+    const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,revision FROM catalog_repository_objects ORDER BY object_type,object_id").all();
+    const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
+    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts })).digest("hex");
+  }
+
+  getCatalogProjection({ includeProvisional = false } = {}) {
+    const objects = this.listCatalogObjects();
+    const byType = (objectType) => objects.filter((object) => object.objectType === objectType);
+    const planningPayload = (summary) => {
+      const object = this.getCatalogObject(summary.objectType, summary.objectId);
+      if (!object || object.disposition !== "enabled") return null;
+      if (object.status === "active" || (includeProvisional && object.status === "provisional")) return object.effectiveValue;
+      return null;
+    };
+    const relations = new Map(byType("merge-relation").map((summary) => [summary.objectId, planningPayload(summary)]));
+    let items = byType("item-identity").map((summary) => {
+      const identity = planningPayload(summary);
+      const relation = relations.get(summary.objectId);
+      if (!identity || !relation) return null;
+      return {
+        id: String(identity.itemId ?? summary.objectId),
+        chainId: identity.chainId == null ? null : String(identity.chainId),
+        level: Number(identity.level),
+        baseUnits: Number(identity.baseUnits),
+        mergeTarget: relation.mergeTarget == null || relation.mergeTarget === "" ? null : String(relation.mergeTarget),
+        iconResource: identity.iconResourceIdentifier ?? identity.iconResource ?? null,
+        descriptionKey: identity.descriptionKey ?? null,
+        itemType: identity.itemType ?? null,
+        inferred: summary.status === "provisional",
+        repositoryRevision: summary.revision,
+      };
+    }).filter(Boolean);
+    for (;;) {
+      const ids = new Set(items.map((item) => item.id));
+      const filtered = items.filter((item) => item.mergeTarget == null || ids.has(item.mergeTarget));
+      if (filtered.length === items.length) break;
+      items = filtered;
+    }
+    const itemById = new Map(items.map((item) => [item.id, item]));
+    const producers = byType("production-profile").map((summary) => {
+      const profile = planningPayload(summary);
+      const planningDistribution = profile?.planningDistribution || profile?.theoreticalDistribution;
+      const outcomes = planningDistribution?.outcomes;
+      if (!profile || !Array.isArray(outcomes) || !itemById.has(String(profile.producerItemId)) || !outcomes.every((outcome) => itemById.has(String(outcome.itemId)))) return null;
+      return {
+        itemId: String(profile.producerItemId),
+        chainId: profile.chainId == null ? null : String(profile.chainId),
+        level: profile.level ?? null,
+        energyCost: Number(profile.energyCost),
+        sampleSize: Number(planningDistribution.sampleSpaceSize ?? planningDistribution.sampleSize),
+        drops: outcomes.map((outcome) => {
+          const item = itemById.get(String(outcome.itemId));
+          return { itemId: String(outcome.itemId), count: Number(outcome.weight ?? outcome.count), probability: Number(outcome.probability), chainId: item.chainId, level: item.level, baseUnits: item.baseUnits };
+        }),
+        inferred: summary.status === "provisional",
+        repositoryRevision: summary.revision,
+      };
+    }).filter(Boolean);
+    const chains = [...new Set(items.map((item) => item.chainId).filter(Boolean))].sort().map((chainId) => {
+      const members = items.filter((item) => item.chainId === chainId).sort((left, right) => left.level - right.level || left.id.localeCompare(right.id));
+      const levels = members.map((item) => item.level);
+      const contiguous = levels.every((level, index) => index === 0 || level === levels[index - 1] + 1);
+      return { id: chainId, minLevel: Math.min(...levels), maxLevel: Math.max(...levels), observedMaxLevel: Math.max(...levels), complete: contiguous && members.at(-1)?.mergeTarget == null, itemIds: members.map((item) => item.id) };
+    });
+    const coverage = { completeChains: chains.filter((chain) => chain.complete).map((chain) => chain.id), incompleteChains: chains.filter((chain) => !chain.complete).map((chain) => chain.id), producerConfigurations: producers.length };
+    return { revision: this.getCatalogRevision(), coverage, chains, items, producers, stats: { chains: chains.length, items: items.length, producers: producers.length, drops: producers.reduce((sum, producer) => sum + producer.drops.length, 0), observations: this.getCatalogRepositorySummary().observations } };
+  }
+
+  exportCatalogSnapshot() {
+    return {
+      schemaVersion: 1,
+      exportedAt: new Date().toISOString(),
+      source: { type: "sqlite-catalog-repository", revision: this.getCatalogRevision() },
+      projection: this.getCatalogProjection({ includeProvisional: true }),
+      repository: this.getCatalogRepositorySummary(),
+      objects: this.listCatalogObjects().map((summary) => this.getCatalogObject(summary.objectType, summary.objectId)),
+      conflicts: this.listCatalogConflicts({ status: null }),
+    };
+  }
+
+  _restoreCatalogObjectSnapshot(exported) {
+    const identity = validateCatalogIdentity(exported.objectType, exported.objectId);
+    if (!CATALOG_VERSION_STATES.has(exported.status) || !CATALOG_DISPOSITIONS.has(exported.disposition)) throw new TypeError(`invalid catalog snapshot state: ${identity.objectType}/${identity.objectId}`);
+    const createdAt = exported.createdAt || new Date().toISOString();
+    const updatedAt = exported.updatedAt || createdAt;
+    const inserted = this.db.prepare(`INSERT INTO catalog_repository_objects(object_type,object_id,status,disposition,revision,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?)`).run(identity.objectType, identity.objectId, exported.status, exported.disposition, Number(exported.revision), createdAt, updatedAt);
+    const repositoryObjectId = Number(inserted.lastInsertRowid);
+    for (const evidence of exported.evidence || []) {
+      const payloadJson = canonicalJson(evidence.payload || {});
+      const fingerprint = evidence.fingerprint || crypto.createHash("sha256").update(payloadJson).digest("hex");
+      this.db.prepare(`INSERT INTO catalog_repository_evidence(object_id,fingerprint,source_type,source_ref,payload_json,disposition,observation_count,first_observed_at,last_observed_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, fingerprint, evidence.sourceType, evidence.sourceRef || "", payloadJson, evidence.disposition || "eligible", Number(evidence.observationCount || 1), evidence.firstObservedAt || evidence.lastObservedAt || createdAt, evidence.lastObservedAt || evidence.firstObservedAt || createdAt);
+    }
+    const versionIds = new Map();
+    for (const version of exported.versions || []) {
+      const restored = this.db.prepare(`INSERT INTO catalog_repository_versions(object_id,version,status,origin,payload_json,evidence_summary_json,created_at)
+        VALUES(?,?,?,?,?,?,?)`).run(repositoryObjectId, Number(version.version), version.status, version.origin || "unspecified", canonicalJson(version.payload || {}), canonicalJson(version.evidenceSummary || {}), version.createdAt || createdAt);
+      versionIds.set(Number(version.id), Number(restored.lastInsertRowid));
+    }
+    this.db.prepare("UPDATE catalog_repository_objects SET candidate_version_id=?,active_version_id=? WHERE id=?")
+      .run(versionIds.get(Number(exported.candidateVersion?.id)) ?? null, versionIds.get(Number(exported.activeVersion?.id)) ?? null, repositoryObjectId);
+    const json = (value) => JSON.stringify(value === undefined ? null : value);
+    for (const ruling of exported.rulingHistory || []) {
+      this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, ruling.fieldPath, ruling.decision, ruling.decision === "revoke" ? null : json(ruling.value), ruling.actor, ruling.note, json(ruling.oldValue), json(ruling.newValue), Number(ruling.objectRevision), ruling.createdAt || createdAt);
+    }
+    for (const transition of exported.transitions || []) {
+      this.db.prepare(`INSERT INTO catalog_repository_transitions(object_id,from_status,to_status,from_disposition,to_disposition,reason,evidence_revision,created_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(repositoryObjectId, transition.fromStatus, transition.toStatus, transition.fromDisposition, transition.toDisposition, transition.reason, Number(transition.evidenceRevision), transition.createdAt || createdAt);
+    }
+  }
+
+  importCatalogSnapshot(snapshot, { sourceFile = null } = {}) {
+    if (!snapshot || Number(snapshot.schemaVersion) !== 1 || snapshot.source?.type !== "sqlite-catalog-repository" || !Array.isArray(snapshot.objects)) throw new TypeError("unsupported catalog snapshot format");
+    return this.transaction(() => {
+      if (this.getCatalogRepositorySummary().objects === 0) {
+        for (const exported of snapshot.objects) this._restoreCatalogObjectSnapshot(exported);
+        for (const conflict of snapshot.conflicts || []) {
+          const detailsJson = canonicalJson(conflict.details || {});
+          const fingerprint = conflict.fingerprint || crypto.createHash("sha256").update(detailsJson).digest("hex");
+          this.db.prepare(`INSERT INTO catalog_repository_conflicts(object_type,object_id,conflict_type,fingerprint,details_json,status,occurrence_count,created_at,last_seen_at)
+            VALUES(?,?,?,?,?,?,?,?,?)`).run(conflict.objectType, conflict.objectId, conflict.conflictType, fingerprint, detailsJson, conflict.status, Number(conflict.occurrenceCount || 1), conflict.createdAt, conflict.lastSeenAt);
+        }
+        return { imported: snapshot.objects.length, preserved: 0, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
+      }
+      let imported = 0, preserved = 0;
+      const importedObjects = new Set();
+      for (const exported of snapshot.objects) {
+        const identity = validateCatalogIdentity(exported.objectType, exported.objectId);
+        let existing = this.getCatalogObject(identity.objectType, identity.objectId);
+        const preserveAuthority = !!existing;
+        const evidence = exported.evidence?.length ? exported.evidence : [{ payload: exported.algorithmCandidate || {}, sourceType: "json-import", sourceRef: sourceFile }];
+        for (const item of evidence) {
+          const importedSourceType = preserveAuthority ? "json-import" : item.sourceType || "json-import";
+          const importedSourceRef = `${sourceFile || "catalog-snapshot"}#${item.sourceType || "unknown"}:${item.sourceRef || "evidence"}`;
+          this._observeCatalogObject({ ...identity, payload: item.payload || {}, sourceType: importedSourceType, sourceRef: importedSourceRef, observedAt: item.lastObservedAt, countDuplicate: false });
+          if (!preserveAuthority && item.disposition && item.disposition !== "eligible") {
+            const current = this.getCatalogObject(identity.objectType, identity.objectId);
+            const restoredEvidence = current.evidence.find((candidate) => candidate.sourceType === importedSourceType && candidate.sourceRef === importedSourceRef);
+            this.setCatalogEvidenceDisposition(identity.objectType, identity.objectId, restoredEvidence.id, item.disposition, { reason: "restored-from-json", expectedRevision: current.revision });
+          }
+        }
+        if (existing) { preserved += 1; continue; }
+        existing = this.getCatalogObject(identity.objectType, identity.objectId);
+        const versions = (exported.versions || []).slice(1);
+        for (const version of versions) {
+          existing = this.saveCatalogVersion({ ...identity, payload: version.payload || {}, status: version.status, expectedRevision: existing.revision, origin: version.origin || "legacy-migration" });
+        }
+        if (!versions.length && ["active", "provisional"].includes(exported.status)) {
+          existing = this.saveCatalogVersion({ ...identity, payload: exported.algorithmCandidate || {}, status: exported.status, expectedRevision: existing.revision, origin: "legacy-migration" });
+        }
+        for (const ruling of exported.rulingHistory || []) {
+          const current = this.getCatalogObject(identity.objectType, identity.objectId);
+          if (ruling.decision === "revoke") {
+            if (current.humanValues?.[ruling.fieldPath]) this.revokeCatalogRuling({ ...identity, fieldPath: ruling.fieldPath, actor: ruling.actor || "json-import", note: ruling.note || "restored from JSON", expectedRevision: current.revision, createdAt: ruling.createdAt });
+          } else {
+            this.applyCatalogRuling({ ...identity, fieldPath: ruling.fieldPath, decision: ruling.decision || "modify", value: ruling.value, actor: ruling.actor || "json-import", note: ruling.note || "restored from JSON", expectedRevision: current.revision, createdAt: ruling.createdAt });
+          }
+        }
+        const current = this.getCatalogObject(identity.objectType, identity.objectId);
+        if (exported.disposition && exported.disposition !== "enabled") this.setCatalogObjectDisposition(identity.objectType, identity.objectId, exported.disposition, { reason: "restored-from-json", expectedRevision: current.revision });
+        importedObjects.add(`${identity.objectType}:${identity.objectId}`);
+        imported += 1;
+      }
+      for (const conflict of snapshot.conflicts || []) {
+        if (!importedObjects.has(`${conflict.objectType}:${conflict.objectId}`)) continue;
+        const restoredConflict = this.recordCatalogConflict({ objectType: conflict.objectType, objectId: conflict.objectId, conflictType: conflict.conflictType, details: conflict.details, countDuplicate: false });
+        if (conflict.status === "resolved") this.resolveCatalogConflictFingerprint(conflict.objectType, conflict.objectId, conflict.conflictType, restoredConflict.fingerprint);
+      }
+      return { imported, preserved, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
+    });
+  }
+
   getCatalogRepositorySummary() {
     const counts = { observed: 0, provisional: 0, active: 0 };
     for (const row of this.db.prepare("SELECT status,COUNT(*) AS count FROM catalog_repository_objects GROUP BY status").all()) counts[row.status] = Number(row.count);
@@ -634,8 +809,8 @@ class AutomationDatabase {
     const fingerprint = crypto.createHash("sha256").update(detailsJson).digest("hex");
     const now = new Date().toISOString();
     const conflictAction = countDuplicate
-      ? "DO UPDATE SET occurrence_count=occurrence_count+1,last_seen_at=excluded.last_seen_at"
-      : "DO NOTHING";
+      ? "DO UPDATE SET status='open',occurrence_count=occurrence_count+1,last_seen_at=excluded.last_seen_at"
+      : "DO UPDATE SET status='open',last_seen_at=excluded.last_seen_at";
     this.db.prepare(`INSERT INTO catalog_repository_conflicts(object_type,object_id,conflict_type,fingerprint,details_json,status,occurrence_count,created_at,last_seen_at)
       VALUES(?,?,?,?,?,'open',1,?,?) ON CONFLICT(object_type,object_id,conflict_type,fingerprint) ${conflictAction}`)
       .run(normalizedType, normalizedId, normalizedConflict, fingerprint, detailsJson, now, now);
@@ -648,15 +823,23 @@ class AutomationDatabase {
       ? this.db.prepare("SELECT * FROM catalog_repository_conflicts ORDER BY id").all()
       : this.db.prepare("SELECT * FROM catalog_repository_conflicts WHERE status=? ORDER BY id").all(String(status));
     return rows.map((row) => ({
-      id: Number(row.id), objectType: row.object_type, objectId: row.object_id,
+      id: Number(row.id), objectType: row.object_type, objectId: row.object_id, fingerprint: row.fingerprint,
       conflictType: row.conflict_type, details: parseJson(row.details_json), status: row.status,
       occurrenceCount: Number(row.occurrence_count), createdAt: row.created_at, lastSeenAt: row.last_seen_at,
     }));
   }
 
-  resolveCatalogConflicts(objectType, objectId, conflictType) {
-    this.db.prepare("UPDATE catalog_repository_conflicts SET status='resolved',last_seen_at=? WHERE object_type=? AND object_id=? AND conflict_type=? AND status='open'")
-      .run(new Date().toISOString(), String(objectType), String(objectId), String(conflictType));
+  resolveCatalogConflicts(objectType, objectId, conflictType, { exceptFingerprint = null } = {}) {
+    const except = exceptFingerprint == null ? "" : " AND fingerprint<>?";
+    const values = [new Date().toISOString(), String(objectType), String(objectId), String(conflictType)];
+    if (exceptFingerprint != null) values.push(String(exceptFingerprint));
+    this.db.prepare(`UPDATE catalog_repository_conflicts SET status='resolved',last_seen_at=? WHERE object_type=? AND object_id=? AND conflict_type=? AND status='open'${except}`)
+      .run(...values);
+  }
+
+  resolveCatalogConflictFingerprint(objectType, objectId, conflictType, fingerprint) {
+    this.db.prepare("UPDATE catalog_repository_conflicts SET status='resolved',last_seen_at=? WHERE object_type=? AND object_id=? AND conflict_type=? AND fingerprint=? AND status='open'")
+      .run(new Date().toISOString(), String(objectType), String(objectId), String(conflictType), String(fingerprint));
   }
 
   _importCatalogProjection(catalog, { sourceFile, observedAt }) {

@@ -4,7 +4,8 @@ const { distributionFromDrops, observedDistribution } = require("./catalog-migra
 const { canonicalJson } = require("./canonical-json");
 
 const STRUCTURED_SOURCES = new Set(["runtime-capture", "structured-runtime", "legacy-migration"]);
-const PROVISIONAL_ONLY_SOURCES = new Set(["structural-inference", "visual-evidence", "screenshot-evidence"]);
+const STRUCTURAL_INFERENCE_SOURCES = new Set(["structural-inference"]);
+const VISUAL_EVIDENCE_SOURCES = new Set(["visual-evidence", "screenshot-evidence"]);
 
 function currentPayload(object) {
   return object?.activeVersion?.payload || object?.candidateVersion?.payload || object?.versions?.at(-1)?.payload || {};
@@ -27,7 +28,7 @@ function relationPayload(payload) {
     itemId: String(payload.itemId ?? payload.id ?? ""),
     chainId: payload.chainId == null ? null : String(payload.chainId),
     level: Number(payload.level),
-    mergeTarget: payload.mergeTarget == null ? null : String(payload.mergeTarget),
+    mergeTarget: payload.mergeTarget == null || payload.mergeTarget === "" ? null : String(payload.mergeTarget),
   };
 }
 
@@ -57,7 +58,9 @@ class CatalogReviewGate {
   }
 
   _provisionalEvidence(evidence) {
-    return [...evidence].reverse().find((item) => PROVISIONAL_ONLY_SOURCES.has(item.sourceType)) || null;
+    return [...evidence].reverse().find((item) => STRUCTURAL_INFERENCE_SOURCES.has(item.sourceType))
+      || [...evidence].reverse().find((item) => VISUAL_EVIDENCE_SOURCES.has(item.sourceType))
+      || null;
   }
 
   _recordEvidenceConflict(object, evidence) {
@@ -73,15 +76,18 @@ class CatalogReviewGate {
       payloads.get(key).push({ evidenceId: item.id, sourceType: item.sourceType, sourceRef: item.sourceRef, fingerprint: item.fingerprint });
     }
     this.database.transaction(() => {
-      this.database.resolveCatalogConflicts(object.objectType, object.objectId, "evidence-conflict");
-      if (payloads.size < 2) return;
-      this.database.recordCatalogConflict({
+      if (payloads.size < 2) {
+        this.database.resolveCatalogConflicts(object.objectType, object.objectId, "evidence-conflict");
+        return;
+      }
+      const conflict = this.database.recordCatalogConflict({
         objectType: object.objectType,
         objectId: object.objectId,
         conflictType: "evidence-conflict",
         details: { variants: [...payloads.values()] },
         countDuplicate: false,
       });
+      this.database.resolveCatalogConflicts(object.objectType, object.objectId, "evidence-conflict", { exceptFingerprint: conflict.fingerprint });
     });
   }
 
@@ -172,51 +178,8 @@ class CatalogReviewGate {
   }
 }
 
-function planningVersion(object, includeProvisional) {
-  if (!object || object.disposition !== "enabled") return null;
-  if (object.status === "active") return object.effectiveValue || object.activeVersion?.payload || null;
-  if (includeProvisional && object.status === "provisional") return object.effectiveValue || object.candidateVersion?.payload || null;
-  return null;
-}
-
 function buildPlanningCatalogFromRepository(database, legacyCatalog, { includeProvisional = false } = {}) {
-  const itemCandidates = [];
-  for (const legacyItem of legacyCatalog.items || []) {
-    const identity = planningVersion(database.getCatalogObject("item-identity", String(legacyItem.id)), includeProvisional);
-    const relation = planningVersion(database.getCatalogObject("merge-relation", String(legacyItem.id)), includeProvisional);
-    if (!identity || !relation) continue;
-    itemCandidates.push({
-      ...legacyItem,
-      id: String(identity.itemId), chainId: String(identity.chainId), level: Number(identity.level),
-      baseUnits: Number(identity.baseUnits), iconResource: identity.iconResourceIdentifier,
-      mergeTarget: relation.mergeTarget,
-    });
-  }
-  let items = itemCandidates;
-  for (;;) {
-    const candidateIds = new Set(items.map((item) => String(item.id)));
-    const filtered = items.filter((item) => item.mergeTarget == null || candidateIds.has(String(item.mergeTarget)));
-    if (filtered.length === items.length) break;
-    items = filtered;
-  }
-  const itemById = new Map(items.map((item) => [String(item.id), item]));
-  const producers = [];
-  for (const legacyProducer of legacyCatalog.producers || []) {
-    const profile = planningVersion(database.getCatalogObject("production-profile", String(legacyProducer.itemId)), includeProvisional);
-    if (!profile) continue;
-    if (!itemById.has(String(profile.producerItemId))) continue;
-    if (!profile.theoreticalDistribution.outcomes.every((outcome) => itemById.has(String(outcome.itemId)))) continue;
-    producers.push({
-      ...legacyProducer,
-      itemId: String(profile.producerItemId), chainId: profile.chainId, level: profile.level, energyCost: profile.energyCost,
-      sampleSize: profile.theoreticalDistribution.sampleSpaceSize,
-      drops: profile.theoreticalDistribution.outcomes.map((outcome) => {
-        const item = itemById.get(String(outcome.itemId));
-        return { itemId: String(outcome.itemId), count: outcome.weight, probability: outcome.probability, chainId: item?.chainId ?? null, level: item?.level ?? null, baseUnits: item?.baseUnits ?? null };
-      }),
-    });
-  }
-  return { ...legacyCatalog, items, producers };
+  return database.getCatalogProjection({ includeProvisional });
 }
 
 module.exports = { CatalogReviewGate, buildPlanningCatalogFromRepository, identityPayload, relationPayload, profilePayload };

@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
+const crypto = require("node:crypto");
 const { ZipArchive } = require("archiver");
 const { AdapterLab } = require("./lab");
 const { getConfig } = require("./config");
@@ -58,24 +59,63 @@ class AutomationRuntime {
     this.buildCatalog = buildCatalog;
     this.dataDir = dataDir || path.join(rootDir, "data");
     fs.mkdirSync(this.dataDir, { recursive: true });
-    this.database = new AutomationDatabase(path.join(this.dataDir, "automation.db"));
+    try {
+      this.database = new AutomationDatabase(path.join(this.dataDir, "automation.db"));
+    } catch (error) {
+      const unavailable = new Error(`catalog database unavailable: ${error.message}`, { cause: error });
+      unavailable.code = "CATALOG_DATABASE_UNAVAILABLE";
+      unavailable.statusCode = 500;
+      throw unavailable;
+    }
     this.connectionService = new ConnectionService({ rootDir, dataDir: this.dataDir, onEvent: (event) => this.emit("connection-route", event) });
     const bundledCatalogPath = path.join(rootDir, "captures", "item-catalog.json");
     const persistedCatalogPath = path.join(this.dataDir, "item-catalog.json");
-    this.catalogPath = fs.existsSync(persistedCatalogPath) ? persistedCatalogPath : bundledCatalogPath;
-    this.catalog = JSON.parse(fs.readFileSync(this.catalogPath, "utf8"));
-    const repositoryEmpty = this.database.getCatalogRepositorySummary().objects === 0;
-    migrateLegacyCatalog(this.database, this.catalog, {
-      sourceFile: this.catalogPath,
-      historicActions: this.database.listAttributableProductionActions(),
-      recordSourceEvidence: this.catalogPath === bundledCatalogPath || repositoryEmpty,
-    });
+    this.legacyCatalogPath = fs.existsSync(persistedCatalogPath) ? persistedCatalogPath : bundledCatalogPath;
+    if (!this.database.getSetting("catalog-system-of-record-migration")) {
+      try {
+        const sourceBytes = fs.readFileSync(this.legacyCatalogPath);
+        const legacyCatalog = JSON.parse(sourceBytes.toString("utf8"));
+        const repositoryEmpty = this.database.getCatalogRepositorySummary().objects === 0;
+        this.database.transaction(() => {
+          migrateLegacyCatalog(this.database, legacyCatalog, {
+            sourceFile: this.legacyCatalogPath,
+            historicActions: this.database.listAttributableProductionActions(),
+            recordSourceEvidence: this.legacyCatalogPath === bundledCatalogPath || repositoryEmpty,
+          });
+          if (this.database.getCatalogRepositorySummary().objects === 0) {
+            const empty = new Error("catalog repository is empty after migration");
+            empty.code = "CATALOG_REPOSITORY_EMPTY";
+            throw empty;
+          }
+          this.database.setSetting("catalog-system-of-record-migration", {
+            schemaVersion: 1,
+            sourceFile: this.legacyCatalogPath,
+            sourceSha256: crypto.createHash("sha256").update(sourceBytes).digest("hex"),
+            migratedAt: new Date().toISOString(),
+          });
+        });
+      } catch (error) {
+        this.database.close();
+        const migration = new Error(`catalog migration failed: ${error.message}`, { cause: error });
+        migration.code = error.code || "CATALOG_MIGRATION_FAILED";
+        migration.statusCode = 500;
+        throw migration;
+      }
+    }
+    if (this.database.getCatalogRepositorySummary().objects === 0) {
+      this.database.close();
+      const empty = new Error("catalog repository is empty after migration");
+      empty.code = "CATALOG_REPOSITORY_EMPTY";
+      empty.statusCode = 500;
+      throw empty;
+    }
     this.catalogGate = new CatalogReviewGate(this.database);
   }
 
   emit(type, payload = {}) { this.onEvent?.({ type, at: new Date().toISOString(), ...payload }); }
 
   getCatalogView({ includeRepositoryObjects = true } = {}) {
+    const projection = this.database.getCatalogProjection({ includeProvisional: true });
     const repository = { summary: this.database.getCatalogRepositorySummary() };
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
@@ -83,11 +123,12 @@ class AutomationRuntime {
       repository.reviewQueue = this.database.getCatalogReviewQueue();
     }
     return {
-      stats: this.database.getCatalogStats(),
-      coverage: this.catalog.coverage,
-      chains: this.catalog.chains || [],
-      items: this.catalog.items || [],
-      producers: this.catalog.producers || [],
+      revision: projection.revision,
+      stats: projection.stats,
+      coverage: projection.coverage,
+      chains: projection.chains,
+      items: projection.items,
+      producers: projection.producers,
       repository,
     };
   }
@@ -97,7 +138,21 @@ class AutomationRuntime {
   }
 
   getPlanningCatalog({ includeProvisional = false } = {}) {
-    return buildPlanningCatalogFromRepository(this.database, this.catalog, { includeProvisional });
+    return buildPlanningCatalogFromRepository(this.database, null, { includeProvisional });
+  }
+
+  exportCatalog() {
+    return this.database.exportCatalogSnapshot();
+  }
+
+  importCatalog(snapshot, options = {}) {
+    if (snapshot?.source?.type === "sqlite-catalog-repository") return this.database.importCatalogSnapshot(snapshot, options);
+    const result = migrateLegacyCatalog(this.database, snapshot, {
+      sourceFile: options.sourceFile || "json-import",
+      historicActions: [],
+      recordSourceEvidence: true,
+    });
+    return { imported: result.migrated, preserved: 0, revision: this.database.getCatalogRevision(), repository: result.repository };
   }
 
   setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {
@@ -130,35 +185,12 @@ class AutomationRuntime {
     await fsp.writeFile(path.join(captureDir, captureFile), JSON.stringify(snapshot, null, 2), "utf8");
     const scanned = this.buildCatalog([snapshot]);
     if (!scanned.chains.length) return { ok: false, reason: "selected-item-status-not-found", captureFile };
-    const nextCatalog = mergeCatalogs(this.catalog, scanned);
-    const persistedCatalog = path.join(this.dataDir, "item-catalog.json");
-    const stagedCatalog = `${persistedCatalog}.tmp-${process.pid}-${Date.now()}`;
-    const backupCatalog = `${persistedCatalog}.bak-${process.pid}-${Date.now()}`;
-    const hadPersistedCatalog = fs.existsSync(persistedCatalog);
-    await fsp.writeFile(stagedCatalog, JSON.stringify(nextCatalog, null, 2) + "\n", "utf8");
-    try {
-      if (hadPersistedCatalog) await fsp.rename(persistedCatalog, backupCatalog);
-      await fsp.rename(stagedCatalog, persistedCatalog);
-      try {
-        this.database.transaction(() => {
-          this.database.importCatalog(scanned, { sourceFile: path.join(captureDir, captureFile), sourceType: "runtime-capture" });
-          const observedObjectIds = [...new Set([...(scanned.items || []).map((item) => String(item.id)), ...(scanned.producers || []).map((producer) => String(producer.itemId))])];
-          const gateResults = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
-          for (const object of gateResults) this.emit("catalog-state-updated", { object });
-        });
-      } catch (error) {
-        await fsp.rm(persistedCatalog, { force: true });
-        if (hadPersistedCatalog) await fsp.rename(backupCatalog, persistedCatalog);
-        throw error;
-      }
-      if (hadPersistedCatalog) await fsp.rm(backupCatalog, { force: true });
-    } catch (error) {
-      await fsp.rm(stagedCatalog, { force: true }).catch(() => {});
-      if (hadPersistedCatalog && !fs.existsSync(persistedCatalog) && fs.existsSync(backupCatalog)) await fsp.rename(backupCatalog, persistedCatalog).catch(() => {});
-      throw error;
-    }
-    this.catalog = nextCatalog;
-    this.catalogPath = persistedCatalog;
+    this.database.transaction(() => {
+      this.database.importCatalog(scanned, { sourceFile: path.join(captureDir, captureFile), sourceType: "runtime-capture" });
+      const observedObjectIds = [...new Set([...(scanned.items || []).map((item) => String(item.id)), ...(scanned.producers || []).map((producer) => String(producer.itemId))])];
+      const gateResults = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
+      for (const object of gateResults) this.emit("catalog-state-updated", { object });
+    });
     return { ok: true, reason: "catalog-refreshed", captureFile, catalogView: this.getCatalogView() };
   }
 
@@ -258,7 +290,7 @@ class AutomationRuntime {
       paused: this.pauseGate.paused,
       state,
       plan,
-      catalog: this.database.getCatalogStats(),
+      catalog: { revision: planningCatalog.revision, ...planningCatalog.stats },
       catalogView: this.getCatalogView({ includeRepositoryObjects: false }),
       actions: this.database.listRecentActions(60),
       resourceSamples: this.database.listResourceSamples(120),
@@ -304,7 +336,7 @@ class AutomationRuntime {
       appVersion: "0.1.0",
       platform: { platform: process.platform, arch: process.arch, release: os.release(), node: process.version },
       settings: this.getSettings(),
-      catalog: this.database.getCatalogStats(),
+      catalog: { revision: this.database.getCatalogRevision(), ...this.database.getCatalogRepositorySummary() },
       state,
     };
     await fsp.mkdir(path.dirname(destination), { recursive: true });
@@ -317,7 +349,9 @@ class AutomationRuntime {
       archive.pipe(output);
       archive.append(JSON.stringify(payload, null, 2), { name: "diagnostic.json" });
       archive.append(JSON.stringify(this.database.listRecentActions(500), null, 2), { name: "recent-actions.json" });
-      if (fs.existsSync(this.catalogPath)) archive.file(this.catalogPath, { name: "item-catalog.json" });
+      const catalogSnapshot = this.database.exportCatalogSnapshot();
+      archive.append(JSON.stringify(catalogSnapshot, null, 2), { name: "catalog-repository.json" });
+      archive.append(JSON.stringify(catalogSnapshot.projection, null, 2), { name: "item-catalog.json" });
       archive.finalize();
     });
     return { ok: true, path: destination, bytes: (await fsp.stat(destination)).size };
@@ -439,7 +473,7 @@ class AutomationRuntime {
   async close() {
     this.stop();
     await this.activeRunPromise?.catch(() => {});
-    await this.lab?.close().catch(() => {});
+    await this.lab?.close?.().catch(() => {});
     await this.connectionService.stop().catch(() => {});
     this.database.close();
   }

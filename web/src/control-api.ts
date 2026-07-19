@@ -61,6 +61,20 @@ async function exportDiagnostic() {
   return { ok: true, fileName };
 }
 
+async function exportCatalog() {
+  const response = await fetch("/api/catalog/export", { cache: "no-store" });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const disposition = response.headers.get("content-disposition") || "";
+  const fileName = /filename="([^"]+)"/.exec(disposition)?.[1] || `catalog-repository-${Date.now()}.json`;
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+  return { ok: true, fileName };
+}
+
 export const controlApi = {
   getDashboard: () => request("/api/dashboard"),
   getCatalog: () => request("/api/catalog"),
@@ -69,6 +83,8 @@ export const controlApi = {
   revokeCatalogRuling: (input: any) => post("/api/catalog/ruling/revoke", input),
   setCatalogObjectDisposition: (input: any) => post("/api/catalog/object/disposition", input),
   refreshCatalog: () => post("/api/catalog/refresh"),
+  exportCatalog,
+  importCatalog: (snapshot: any) => post("/api/catalog/import", snapshot),
   getConnectionStatus: () => request("/api/connection"),
   startConnection: (options?: any) => post("/api/connection/start", options || {}),
   stopConnection: () => post("/api/connection/stop"),

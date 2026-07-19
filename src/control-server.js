@@ -7,7 +7,7 @@ const path = require("node:path");
 const WebSocket = require("ws");
 
 const WS_PATH = "/ws";
-const JSON_LIMIT_BYTES = 1024 * 1024;
+const JSON_LIMIT_BYTES = 16 * 1024 * 1024;
 const CATALOG_OBJECT_TYPES = new Set(["item-identity", "merge-relation", "production-profile"]);
 
 const MIME_TYPES = Object.freeze({
@@ -132,6 +132,23 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "GET /api/health") return writeJson(res, 200, { ok: true, wsPath: WS_PATH });
       if (route === "GET /api/dashboard") return writeJson(res, 200, await dashboard());
       if (route === "GET /api/catalog") return writeJson(res, 200, runtime.getCatalogView());
+      if (route === "GET /api/catalog/export") {
+        const snapshot = runtime.exportCatalog();
+        const body = JSON.stringify(snapshot, null, 2) + "\n";
+        res.writeHead(200, {
+          "cache-control": "no-store",
+          "content-disposition": `attachment; filename="catalog-repository-${Date.now()}.json"`,
+          "content-length": Buffer.byteLength(body),
+          "content-type": "application/json; charset=utf-8",
+        });
+        res.end(body);
+        return;
+      }
+      if (route === "POST /api/catalog/import") {
+        const result = runtime.importCatalog(await readJson(req), { sourceFile: "control-api" });
+        broadcast({ type: "catalog-repository-imported", revision: result.revision, imported: result.imported, preserved: result.preserved });
+        return writeJson(res, 200, result);
+      }
       if (route === "GET /api/catalog/object") {
         const objectType = requestUrl.searchParams.get("type");
         const objectId = requestUrl.searchParams.get("id");
