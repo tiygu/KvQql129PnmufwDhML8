@@ -139,3 +139,98 @@ test("a space-verified rolling plan may use the last buffer and executes only it
   assert.equal(calls[0].producer, 7);
   assert.equal(calls[0].plannedAction.type, "produce");
 });
+
+test("warehouse store is proposed only after native preflight returns a concrete slot", async () => {
+  const calls = [];
+  const candidate = { type: "store-to-warehouse", sourceIndex: 3, itemId: "safe", opportunityCost: 4, storeAvailability: { status: "native-preflight-required" } };
+  const loop = new OrderCoinLoop({
+    minEmptySpaces: 2,
+    collectState: async () => ({ resources: { energy: 10 }, warehouse: { inventoryKnowledge: { status: "unknown" } }, board: { empty: 1, mergeCandidates: [], grids: [{ index: 3, itemId: "safe", empty: false, normal: true, moveable: true }] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async (current) => {
+      const target = { slot: "a", feasible: true, producerSteps: [{ gridIndex: 7 }], ...(current.warehouse?.storeAvailability?.status === "available" ? { nextAction: { ...candidate, storeAvailability: current.warehouse.storeAvailability } } : {}) };
+      return { plans: [target], recommended: target, warehouseStoreCandidates: [candidate] };
+    },
+    preflightStore: async (index) => { calls.push(`preflight:${index}`); return { ok: true, storeAvailability: { status: "available", sourceIndex: index, itemId: "safe", targetSlotId: "w2" } }; },
+    runBoardAction: async () => ({ ok: true, actions: [] }), submitOrder: async () => ({ ok: true }),
+    storeBoardItem: async () => { throw new Error("preview must not execute"); },
+  });
+  const result = await loop.run({ execute: false, maxActions: 1 });
+  assert.deepEqual(calls, ["preflight:3"]);
+  assert.deepEqual(result.nextAction, { ...candidate, storeAvailability: { status: "available", sourceIndex: 3, itemId: "safe", targetSlotId: "w2" } });
+});
+
+test("warehouse store replans from the fresh state captured by native preflight", async () => {
+  const candidate = { type: "store-to-warehouse", sourceIndex: 3, itemId: "safe", opportunityCost: 4, storeAvailability: { status: "native-preflight-required" } };
+  const initialState = { revision: "initial", resources: { energy: 10 }, board: { empty: 0, mergeCandidates: [], grids: [] }, orders: [{ slot: "a", ready: false }] };
+  const freshState = { revision: "preflight", resources: { energy: 9 }, board: { empty: 0, mergeCandidates: [], signature: "fresh", grids: [] }, orders: [{ slot: "a", ready: false }] };
+  const seenRevisions = [];
+  const loop = new OrderCoinLoop({
+    collectState: async () => initialState,
+    planOrders: async (current) => {
+      seenRevisions.push(current.revision);
+      const available = current.revision === "preflight" && current.warehouse?.storeAvailability?.status === "available";
+      const target = { slot: "a", feasible: available, ...(available ? { nextAction: { ...candidate, storeAvailability: current.warehouse.storeAvailability } } : {}) };
+      return { plans: [target], recommended: available ? target : null, boundaryReason: available ? null : "board-space-deadlock", warehouseStoreCandidates: [candidate] };
+    },
+    preflightStore: async () => ({ ok: true, before: freshState, storeAvailability: { status: "available", sourceIndex: 3, itemId: "safe", targetSlotId: "w2", boardSignature: "fresh" } }),
+    storeBoardItem: async () => { throw new Error("preview must not execute"); }, runBoardAction: async () => ({}), submitOrder: async () => ({}),
+  });
+  const result = await loop.run({ execute: false, maxActions: 1 });
+  assert.equal(result.reason, "planned");
+  assert.deepEqual(seenRevisions, ["initial", "preflight"]);
+});
+
+test("warehouse exchange can recover an otherwise blocked Board Space Feasibility path", async () => {
+  const candidate = { type: "store-to-warehouse", sourceIndex: 3, itemId: "safe", opportunityCost: 4, storeAvailability: { status: "native-preflight-required" } };
+  const loop = new OrderCoinLoop({
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 0, mergeCandidates: [], grids: [] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async (current) => {
+      const available = current.warehouse?.storeAvailability?.status === "available";
+      const target = { slot: "a", feasible: available, blockingReason: available ? null : "board-space-deadlock", ...(available ? { nextAction: { ...candidate, storeAvailability: current.warehouse.storeAvailability } } : {}) };
+      return { plans: [target], recommended: available ? target : null, boundaryReason: available ? null : "board-space-deadlock", warehouseStoreCandidates: [candidate] };
+    },
+    preflightStore: async () => ({ ok: true, storeAvailability: { status: "available", sourceIndex: 3, itemId: "safe", targetSlotId: "w2" } }),
+    storeBoardItem: async () => { throw new Error("preview must not execute"); }, runBoardAction: async () => ({}), submitOrder: async () => ({}),
+  });
+  const result = await loop.run({ execute: false, maxActions: 1 });
+  assert.equal(result.reason, "planned");
+  assert.equal(result.nextAction.type, "store-to-warehouse");
+  assert.equal(result.nextAction.storeAvailability.targetSlotId, "w2");
+});
+
+test("failed warehouse execution stops instead of relying on remaining stale predictions", async () => {
+  const preflights = [], stores = [];
+  const candidates = [3, 4].map((sourceIndex) => ({ type: "store-to-warehouse", sourceIndex, itemId: `safe-${sourceIndex}`, opportunityCost: sourceIndex, storeAvailability: { status: "native-preflight-required" } }));
+  const loop = new OrderCoinLoop({
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 0, mergeCandidates: [], grids: [] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async (current) => {
+      const available = current.warehouse?.storeAvailability?.status === "available";
+      const selected = candidates.find((candidate) => candidate.sourceIndex === current.warehouse?.storeAvailability?.sourceIndex) || candidates[0];
+      const target = { slot: "a", feasible: available, ...(available ? { nextAction: { ...selected, storeAvailability: current.warehouse.storeAvailability } } : {}) };
+      return { plans: [target], recommended: available ? target : null, boundaryReason: available ? null : "board-space-deadlock", warehouseStoreCandidates: candidates };
+    },
+    preflightStore: async (index) => { preflights.push(index); return { ok: true, storeAvailability: { status: "available", sourceIndex: index, itemId: `safe-${index}`, targetSlotId: `w${index}` } }; },
+    storeBoardItem: async (index) => { stores.push(index); return { ok: false, reason: "warehouse-store-not-observed" }; },
+    runBoardAction: async () => ({}), submitOrder: async () => ({}),
+  });
+  const result = await loop.run({ execute: true, maxActions: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "warehouse-store-not-observed");
+  assert.deepEqual(preflights, [3]);
+  assert.deepEqual(stores, [3]);
+});
+
+test("an explicit empty evidence-gated candidate list never falls back to raw board items", async () => {
+  let preflights = 0;
+  const target = { slot: "a", feasible: true, producerSteps: [{ gridIndex: 7 }] };
+  const loop = new OrderCoinLoop({
+    minEmptySpaces: 2,
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 1, mergeCandidates: [], grids: [{ index: 3, itemId: "provisional", normal: true, moveable: true }] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async () => ({ plans: [target], recommended: target, warehouseStoreCandidates: [] }),
+    preflightStore: async () => { preflights += 1; return { ok: true }; }, storeBoardItem: async () => ({ ok: true }),
+    runBoardAction: async () => ({}), submitOrder: async () => ({}),
+  });
+  const result = await loop.run({ execute: false, maxActions: 1 });
+  assert.equal(result.reason, "waiting-board-space");
+  assert.equal(preflights, 0);
+});

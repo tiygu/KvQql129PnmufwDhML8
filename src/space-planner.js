@@ -1,6 +1,7 @@
 "use strict";
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
+const { normalizeWarehouseState, unknownWarehouseInventoryKnowledge, warehouseGridEligibility } = require("./warehouse-domain");
 
 const ITEM_OPPORTUNITY_POLICY = Object.freeze({
   exactOrderDemand: 1000,
@@ -10,6 +11,8 @@ const ITEM_OPPORTUNITY_POLICY = Object.freeze({
   currentLevel: 0.1,
   saleReturn: 1,
   boardOccupancyPenalty: 5,
+  warehouseOccupancyPenalty: 5,
+  unknownWarehouseCapacityPenalty: 5,
 });
 
 function deepFreeze(value) {
@@ -53,9 +56,12 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
   const rawMapCoinDeficit = Number(mapRequirement?.deficit ?? (Number(mapRequirement?.required || 0) - Number(mapRequirement?.current || 0)));
   const normalizedItems = (catalog.items || []).map((item) => {
     const inferredTarget = (catalog.items || []).find((candidate) => String(candidate.chainId) === String(item.chainId) && Number(candidate.level) === Number(item.level) + 1);
+    const relevantEvidence = (catalog.evidence?.objects || []).filter((object) => String(object.objectId) === String(item.id) && ["item-identity", "merge-relation"].includes(object.objectType));
+    const evidenceSufficient = !item.inferred && (relevantEvidence.length === 0 || ["item-identity", "merge-relation"].every((objectType) => relevantEvidence.some((object) => object.objectType === objectType && object.status === "active" && object.disposition === "enabled")));
     return {
       id: String(item.id), chainId: item.chainId == null ? null : String(item.chainId), level: Number(item.level || 0),
       baseUnits: Number(item.baseUnits || 0), saleValue: Number(item.saleValue || item.sellValue || 0),
+      evidenceSufficient,
       mergeTarget: item.mergeTarget == null || item.mergeTarget === "" ? (inferredTarget ? String(inferredTarget.id) : null) : String(item.mergeTarget),
     };
   });
@@ -67,10 +73,7 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
       spaceKnown: Number.isFinite(reportedEmpty) || Number.isFinite(dimensions),
       grids,
     },
-    warehouse: state.warehouse == null ? { knowledge: "unknown" } : {
-      ...state.warehouse,
-      knowledge: state.warehouse.loaded ? "loaded" : "unknown",
-    },
+    warehouse: normalizeWarehouseState(state.warehouse),
     orders: (state.orders || []).map((order) => ({
       slot: String(order.slot), rewardCoins: Number(order.rewardCoins || 0), ready: !!order.ready,
       items: (order.items || []).map((item) => ({ itemId: String(item.itemId), complete: !!item.complete })),
@@ -136,7 +139,7 @@ function updateOrderReadiness(state) {
   }
 }
 
-function totalItemOpportunityValue(state, demandState = state) {
+function totalItemOpportunityValue(state, demandState = state, { includeBoardOccupancy = true } = {}) {
   const exactDemand = new Map(), chainDemandUnits = new Map(), chainSupply = new Map();
   for (const order of demandState.orders) for (const requirement of order.items.filter((item) => !item.complete)) {
     exactDemand.set(requirement.itemId, (exactDemand.get(requirement.itemId) || 0) + 1);
@@ -174,7 +177,7 @@ function totalItemOpportunityValue(state, demandState = state) {
       + scarcity * ITEM_OPPORTUNITY_POLICY.chainScarcity
       + item.level * ITEM_OPPORTUNITY_POLICY.currentLevel
       + item.saleValue * ITEM_OPPORTUNITY_POLICY.saleReturn
-      - pressure * ITEM_OPPORTUNITY_POLICY.boardOccupancyPenalty;
+      - (includeBoardOccupancy ? pressure * ITEM_OPPORTUNITY_POLICY.boardOccupancyPenalty : 0);
   }
   return total;
 }
@@ -247,11 +250,71 @@ function simulateSubmit(state, action) {
   return { ok: true, state: deepFreeze(next) };
 }
 
+function simulateWarehouseStore(state, action) {
+  if (action.storeAvailability?.status !== "available" || !action.storeAvailability.targetSlotId) return { ok: false, reason: "warehouse-native-preflight-required" };
+  const source = gridAt(state, action.sourceIndex);
+  const sourceItem = catalogItem(state, source.itemId);
+  const eligibility = warehouseGridEligibility(source, { catalogItemKnown: !!sourceItem?.evidenceSufficient });
+  if (!eligibility.eligible) return { ok: false, reason: eligibility.reason };
+  const knowledge = state.warehouse.inventoryKnowledge;
+  if (knowledge.status === "loaded" && knowledge.exchangeCapacity <= 0) return { ok: false, reason: "warehouse-full" };
+  const beforeCapacity = knowledge.exchangeCapacity;
+  const next = mutableCopy(state);
+  const nextSource = gridAt(next, action.sourceIndex);
+  Object.assign(nextSource, { itemId: "", empty: true, level: null, mergeTarget: null, protected: false });
+  next.board.occupied -= 1;
+  next.board.empty += 1;
+  const afterCapacity = beforeCapacity == null ? null : Math.max(0, beforeCapacity - 1);
+  next.warehouse.inventoryKnowledge = unknownWarehouseInventoryKnowledge("warehouse-store-invalidated");
+  next.warehouse.storeAvailability = { status: "unknown" };
+  updateOrderReadiness(next);
+  return {
+    ok: true,
+    state: deepFreeze(next),
+    opportunityCost: Number(action.opportunityCost || 0),
+    warehouseExchange: { beforeCapacity, afterCapacity, targetSlotId: String(action.storeAvailability.targetSlotId) },
+  };
+}
+
 function simulateDeterministicTransition(state, action) {
   if (action?.type === "merge") return simulateMerge(state, action);
   if (action?.type === "produce") return simulateProduce(state, action);
   if (action?.type === "submit-order") return simulateSubmit(state, action);
+  if (action?.type === "store-to-warehouse") return simulateWarehouseStore(state, action);
   return { ok: false, reason: "unsupported-deterministic-transition" };
+}
+
+function buildWarehouseStoreCandidates(state) {
+  const knowledge = state.warehouse.inventoryKnowledge;
+  if (knowledge.status === "loaded" && knowledge.exchangeCapacity != null && knowledge.exchangeCapacity <= 0) return [];
+  const beforeOpportunity = totalItemOpportunityValue(state, state, { includeBoardOccupancy: false });
+  const candidates = [];
+  for (const grid of state.board.grids) {
+    const eligibility = warehouseGridEligibility(grid, { catalogItemKnown: !!catalogItem(state, grid.itemId)?.evidenceSufficient });
+    if (!eligibility.eligible) continue;
+    const after = mutableCopy(state);
+    const removed = gridAt(after, grid.index);
+    Object.assign(removed, { itemId: "", empty: true, level: null, mergeTarget: null, protected: false });
+    after.board.occupied -= 1;
+    after.board.empty += 1;
+    const intrinsicCost = Math.max(0, beforeOpportunity - totalItemOpportunityValue(after, state, { includeBoardOccupancy: false }));
+    const warehouseOccupancyCost = knowledge.status === "loaded" && Number(knowledge.unlockedSlots) > 0
+      ? Number(knowledge.occupiedSlots) / Number(knowledge.unlockedSlots) * ITEM_OPPORTUNITY_POLICY.warehouseOccupancyPenalty
+      : ITEM_OPPORTUNITY_POLICY.unknownWarehouseCapacityPenalty;
+    const opportunityCost = intrinsicCost + warehouseOccupancyCost;
+    const observedAvailability = state.warehouse.storeAvailability;
+    const storeAvailability = observedAvailability?.status === "available"
+      && Number(observedAvailability.sourceIndex) === Number(grid.index)
+      && String(observedAvailability.itemId) === String(grid.itemId)
+      ? { ...observedAvailability }
+      : { status: "native-preflight-required" };
+    candidates.push({
+      type: "store-to-warehouse", sourceIndex: grid.index, itemId: grid.itemId, opportunityCost,
+      warehouseInventoryKnowledge: { ...knowledge },
+      storeAvailability,
+    });
+  }
+  return candidates.sort((left, right) => left.opportunityCost - right.opportunityCost || left.sourceIndex - right.sourceIndex);
 }
 
 function comparePathScores(a, b) {
@@ -295,6 +358,10 @@ function candidateActions(state, pruned) {
       else pruned[simulated.reason] = (pruned[simulated.reason] || 0) + 1;
     }
   }
+  for (const candidate of buildWarehouseStoreCandidates(state)) {
+    if (candidate.storeAvailability.status === "available") actions.push(candidate);
+    else pruned["warehouse-native-preflight-required"] = (pruned["warehouse-native-preflight-required"] || 0) + 1;
+  }
   return actions.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
 
@@ -326,7 +393,9 @@ function planDeterministicOrder(state, orderSlot, { maxStates = 768, maxDepth = 
       const next = transition.state;
       if (next.board.occupied < 0 || next.board.occupied > next.board.capacity || next.board.empty < 0) { pruned["board-capacity-violation"] = (pruned["board-capacity-violation"] || 0) + 1; continue; }
       const firstAction = node.firstAction || action;
-      const transitionOpportunityLoss = Math.max(0, totalItemOpportunityValue(node.state, state) - totalItemOpportunityValue(next, state));
+      const transitionOpportunityLoss = action.type === "store-to-warehouse"
+        ? Math.max(0, Number(action.opportunityCost || 0))
+        : Math.max(0, totalItemOpportunityValue(node.state, state) - totalItemOpportunityValue(next, state));
       const nextNode = { state: next, firstAction, depth: node.depth + 1, peakOccupied: Math.max(node.peakOccupied, next.board.occupied), minimumEmpty: Math.min(node.minimumEmpty, next.board.empty), opportunityLoss: node.opportunityLoss + transitionOpportunityLoss };
       if (orderSatisfied(next, order)) {
         const mapProgressCoins = Math.min(order.rewardCoins, state.mapCoinDeficit);
@@ -362,4 +431,4 @@ function planDeterministicOrder(state, orderSlot, { maxStates = 768, maxDepth = 
   };
 }
 
-module.exports = { normalizePlannerState, simulateDeterministicTransition, planDeterministicOrder, comparePathScores };
+module.exports = { normalizePlannerState, simulateDeterministicTransition, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates };

@@ -1,7 +1,7 @@
 "use strict";
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
-const { normalizePlannerState, planDeterministicOrder, comparePathScores } = require("./space-planner");
+const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates } = require("./space-planner");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -217,8 +217,11 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     };
   });
 
+  let normalizedState = null;
+  let warehouseStoreCandidates = [];
   if (gameState) {
-    const normalizedState = normalizePlannerState({ state, catalog });
+    normalizedState = normalizePlannerState({ state, catalog });
+    warehouseStoreCandidates = buildWarehouseStoreCandidates(normalizedState);
     const hasStochasticProduction = (catalog.producers || []).some((producer) => producer.drops?.length !== 1 || Number(producer.drops?.[0]?.probability) !== 1);
     for (const plan of plans) {
       const spacePlan = planDeterministicOrder(normalizedState, plan.slot);
@@ -271,6 +274,12 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       executable: { total: executableGrids.length, counts: countsObject(executableGrids) },
       unavailable: { total: unavailableItems.length, counts: countsObject(unavailableGrids), items: unavailableItems },
     },
+    warehouse: normalizedState ? {
+      inventoryKnowledge: normalizedState.warehouse.inventoryKnowledge,
+      storeAvailability: normalizedState.warehouse.storeAvailability,
+      exchangeCapacity: normalizedState.warehouse.inventoryKnowledge.exchangeCapacity,
+    } : null,
+    warehouseStoreCandidates,
     plans,
     status: allCatalogBlocked ? "evidence-waiting" : recommended ? "ready" : "waiting",
     evidenceBlocks,

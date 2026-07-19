@@ -28,6 +28,7 @@ const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
+const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -64,6 +65,8 @@ class AutomationRuntime {
     this.passiveCatalogDiffs = [];
     this.passiveCatalogDrainPromise = null;
     this.closing = false;
+    this.warehouseInventoryKnowledgeInvalidated = false;
+    this.warehouseInventoryInvalidationReason = null;
     this.buildCatalog = buildCatalog;
     this.dataDir = dataDir || path.join(rootDir, "data");
     fs.mkdirSync(this.dataDir, { recursive: true });
@@ -408,6 +411,14 @@ class AutomationRuntime {
     let boardState = null;
     try { boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, selection.probe.context.id); } catch (_) {}
     const state = buildGameState({ state: summarizeSnapshot(snapshot), boardState });
+    if (this.warehouseInventoryKnowledgeInvalidated) {
+      if (state.scene === "warehouse" && state.warehouse?.visible && state.warehouse?.inventoryKnowledge?.status === "loaded") {
+        this.warehouseInventoryKnowledgeInvalidated = false;
+        this.warehouseInventoryInvalidationReason = null;
+      } else if (state.warehouse) {
+        state.warehouse.inventoryKnowledge = unknownWarehouseInventoryKnowledge(this.warehouseInventoryInvalidationReason || "warehouse-inventory-invalidated");
+      }
+    }
     this.queuePassiveCatalogEvidence({ state });
     this.lastState = state;
     this.database.logResourceSample({ sessionId: this.activeSessionId, coins: state.resources.coins, energy: state.resources.energy, diamonds: state.resources.diamonds, scene: state.scene, observedAt: state.collectedAt });
@@ -438,6 +449,12 @@ class AutomationRuntime {
         if (!this.closing && (this.passiveCatalogState || this.passiveCatalogDiffs.length)) this.queuePassiveCatalogEvidence();
       }
     }));
+  }
+
+  invalidateWarehouseInventoryKnowledge(reason) {
+    this.warehouseInventoryKnowledgeInvalidated = true;
+    this.warehouseInventoryInvalidationReason = String(reason || "warehouse-inventory-invalidated");
+    this.emit("warehouse-inventory-invalidated", { reason: this.warehouseInventoryInvalidationReason });
   }
 
   async dashboard() {
@@ -538,8 +555,8 @@ class AutomationRuntime {
     const submitter = new OrderSubmitter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const navigator = new SceneNavigator({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const mapCompleter = new MapMissionCompleter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation" }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), storeBoardItem: (index, { signal }) => warehouse.move(index, { execute: true, signal }) });
+    const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs, onInventoryKnowledgeInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason) });
+    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation" }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }) });
     let sequence = 0;
     return new FullAutomationLoop({
       collectState,

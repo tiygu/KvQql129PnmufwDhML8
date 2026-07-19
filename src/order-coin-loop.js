@@ -1,35 +1,86 @@
 "use strict";
 
-const { isGridExecutable } = require("./inventory-availability");
 const { isPlanActionable } = require("./plan-actionability");
+const { warehouseGridEligibility } = require("./warehouse-domain");
 
 function selectWarehouseCandidate(state) {
   const requiredIds = new Set(Object.entries(state.board?.requiredItemCounts || {})
     .filter(([, count]) => Number(count) > 0)
     .map(([itemId]) => String(itemId)));
+  const knowledge = state.warehouse?.inventoryKnowledge;
+  if (knowledge?.status === "loaded" && Number(knowledge.exchangeCapacity) <= 0) return null;
   const capacity = Number(state.warehouse?.unlockedSlots ?? state.warehouse?.totalSlots ?? Infinity);
   const occupied = Number(state.warehouse?.occupiedSlots ?? 0);
-  if (Number.isFinite(capacity) && occupied >= capacity) return null;
+  if (!knowledge && Number.isFinite(capacity) && occupied >= capacity) return null;
   return (state.board?.grids || []).find((grid) => {
-    if (!grid || grid.empty || !grid.itemId || grid.taskNeed) return false;
-    if (requiredIds.has(String(grid.itemId))) return false;
-    if (!isGridExecutable(grid)) return false;
-    if (grid.produceCount != null && Number(grid.energyCost) > 0) return false;
-    return true;
+    return warehouseGridEligibility(grid, { requiredItemIds: requiredIds }).eligible;
   }) || null;
 }
 
 class OrderCoinLoop {
-  constructor({ collectState, planOrders, runBoardAction, submitOrder, storeBoardItem = null, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
+  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
     this.collectState = collectState;
     this.planOrders = planOrders;
     this.runBoardAction = runBoardAction;
     this.submitOrder = submitOrder;
+    this.preflightStore = preflightStore;
     this.storeBoardItem = storeBoardItem;
     this.onEvent = onEvent;
     this.minEnergy = Math.max(0, Number(minEnergy) || 0);
     this.minEmptySpaces = Math.max(0, Number(minEmptySpaces) || 0);
     this.targetSlot = null;
+  }
+
+  async tryWarehouseStore({ plan, state, execute, signal, actions }) {
+    const fallback = this.storeBoardItem ? selectWarehouseCandidate(state) : null;
+    const plannerOwnsCandidates = Array.isArray(plan.warehouseStoreCandidates);
+    const candidates = plannerOwnsCandidates
+      ? plan.warehouseStoreCandidates
+      : fallback ? [{ type: "store-to-warehouse", sourceIndex: fallback.index, itemId: fallback.itemId, opportunityCost: null, storeAvailability: { status: "native-preflight-required" } }] : [];
+    if (!candidates.length) return null;
+    let warehouseCandidate = null, checked = null;
+    const preflightResults = [];
+    for (const candidate of candidates) {
+      const result = this.preflightStore
+        ? await this.preflightStore(candidate.sourceIndex, { signal })
+        : { ok: true, storeAvailability: { status: "available", sourceIndex: candidate.sourceIndex, itemId: candidate.itemId, targetSlotId: null } };
+      preflightResults.push({ sourceIndex: candidate.sourceIndex, itemId: candidate.itemId, ok: result.ok, reason: result.reason || null });
+      if (!result.ok) continue;
+      if (plannerOwnsCandidates) {
+        const freshState = result.before || state;
+        const expectedSignature = result.storeAvailability?.boardSignature;
+        if (expectedSignature != null && freshState.board?.signature != null && String(expectedSignature) !== String(freshState.board.signature)) {
+          preflightResults.at(-1).reason = "warehouse-preflight-signature-mismatch";
+          continue;
+        }
+        const enrichedState = JSON.parse(JSON.stringify(freshState));
+        enrichedState.warehouse = { ...(enrichedState.warehouse || {}), storeAvailability: result.storeAvailability };
+        const replanned = await this.planOrders(enrichedState);
+        const replannedTarget = this.targetSlot == null
+          ? replanned.recommended
+          : replanned.plans.find((item) => String(item.slot) === this.targetSlot) || replanned.recommended;
+        const selectedAction = replannedTarget?.nextAction;
+        if (selectedAction?.type !== "store-to-warehouse" || Number(selectedAction.sourceIndex) !== Number(candidate.sourceIndex)) {
+          preflightResults.at(-1).reason = "planner-selected-another-path";
+          continue;
+        }
+        warehouseCandidate = { ...candidate, ...selectedAction };
+        plan = replanned;
+      } else {
+        warehouseCandidate = candidate;
+      }
+      checked = result;
+      break;
+    }
+    if (!warehouseCandidate) return { result: { ok: true, executed: execute, reason: "waiting-warehouse-store-unavailable", targetSlot: this.targetSlot, preflightResults, actions, state, plan } };
+    const nextAction = { ...warehouseCandidate, storeAvailability: checked.storeAvailability };
+    if (!execute) return { result: { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction, preflightResults, actions, state, plan } };
+    const stored = await this.storeBoardItem(warehouseCandidate.sourceIndex, { signal, preflight: checked });
+    const action = { step: actions.length + 1, type: "move-to-warehouse", index: warehouseCandidate.sourceIndex, itemId: warehouseCandidate.itemId, targetSlotId: checked.storeAvailability?.targetSlotId ?? null, opportunityCost: warehouseCandidate.opportunityCost, ok: stored.ok, reason: stored.reason, before: stored.before, after: stored.after };
+    actions.push(action);
+    this.onEvent?.(action);
+    if (!stored.ok) return { result: { ok: false, executed: true, reason: stored.reason || "warehouse-store-failed", targetSlot: this.targetSlot, actions, state, plan, warehouse: stored } };
+    return { continue: true };
   }
 
   async run({ execute = false, maxActions = null, signal = null } = {}) {
@@ -57,6 +108,11 @@ class OrderCoinLoop {
       }
       if (!target) {
         const boundary = plan.boundaryReason || "no-feasible-order";
+        if (boundary === "board-space-deadlock") {
+          const warehouse = await this.tryWarehouseStore({ plan, state, execute, signal, actions });
+          if (warehouse?.continue) continue;
+          if (warehouse?.result) return warehouse.result;
+        }
         if (boundary === "evidence-waiting") return { ok: true, executed: execute, status: "evidence-waiting", reason: "evidence-waiting", actions, state, plan };
         const reason = String(boundary).startsWith("waiting-") ? boundary : `waiting-${boundary}`;
         return { ok: true, executed: execute, reason, actions, state, plan };
@@ -73,16 +129,9 @@ class OrderCoinLoop {
       const mergeAvailable = plannedAction?.type === "merge" || (state.board?.mergeCandidates || []).length > 0;
       const plannedSpaceSafe = !!plannedAction && target.boardSpaceFeasibility?.feasible === true;
       if (!mergeAvailable && !plannedSpaceSafe && Number(state.board?.empty ?? Infinity) <= this.minEmptySpaces) {
-        const warehouseCandidate = this.storeBoardItem ? selectWarehouseCandidate(state) : null;
-        if (warehouseCandidate) {
-          if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: { type: "move-to-warehouse", index: warehouseCandidate.index, itemId: warehouseCandidate.itemId }, actions, state, plan };
-          const stored = await this.storeBoardItem(warehouseCandidate.index, { signal });
-          const action = { step: actions.length + 1, type: "move-to-warehouse", index: warehouseCandidate.index, itemId: warehouseCandidate.itemId, ok: stored.ok, reason: stored.reason, before: stored.before, after: stored.after };
-          actions.push(action);
-          this.onEvent?.(action);
-          if (!stored.ok) return { ok: false, executed: true, reason: stored.reason || "warehouse-store-failed", targetSlot: this.targetSlot, actions, state, plan, warehouse: stored };
-          continue;
-        }
+        const warehouse = await this.tryWarehouseStore({ plan, state, execute, signal, actions });
+        if (warehouse?.continue) continue;
+        if (warehouse?.result) return warehouse.result;
         return { ok: true, executed: execute, reason: "waiting-board-space", targetSlot: this.targetSlot, actions, state, plan };
       }
       const producer = plannedAction?.type === "produce" ? plannedAction.producer : target.producerSteps?.[0]?.gridIndex;
