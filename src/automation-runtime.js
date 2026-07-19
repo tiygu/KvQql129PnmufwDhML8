@@ -25,7 +25,7 @@ const { migrateLegacyCatalog } = require("./catalog-migration");
 const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./catalog-review-gate");
 const { PauseGate } = require("./pause-gate");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
-const { IconEvidenceService, resolveCocosSpriteFrame, readCdpResource } = require("./icon-evidence");
+const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -124,6 +124,14 @@ class AutomationRuntime {
         await this.connect();
         return readCdpResource({ client: this.lab.client, resourceUrl, mimeType });
       },
+      resolveScreenshotBounds: async ({ itemId, itemIdentity }) => {
+        const selection = await this.connect();
+        return resolveScreenshotTarget({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity });
+      },
+      captureScreenshot: async () => {
+        await this.connect();
+        return captureCdpScreenshot({ client: this.lab.client });
+      },
       onEvent: (event) => this.emit(event.type, event),
     });
   }
@@ -187,6 +195,41 @@ class AutomationRuntime {
 
   getCatalogIconAsset(hash) {
     return this.database.getIconAsset(hash);
+  }
+
+  selectCatalogIcon(itemId, candidateId, input) {
+    const object = this.database.selectIconCandidate(String(itemId), Number(candidateId), input);
+    this.emit("catalog-review-updated", { objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+    return this.getCatalogObject("item-identity", String(itemId));
+  }
+
+  revokeCatalogIconSelection(itemId, input) {
+    const object = this.database.revokeIconSelection(String(itemId), input);
+    this.emit("catalog-review-updated", { objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+    return this.getCatalogObject("item-identity", String(itemId));
+  }
+
+  async uploadCatalogIcon(itemId, { dataBase64, mimeType, actor, note, expectedRevision }) {
+    if (this.running || this.actionBoundaryPending) throw Object.assign(new Error("icon upload requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
+    this.actionBoundaryPending = true;
+    try {
+      const object = this.database.getCatalogObject("item-identity", String(itemId));
+      if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
+      if (!String(actor || "").trim() || !String(note || "").trim()) throw Object.assign(new Error("icon upload actor and note are required"), { statusCode: 400 });
+      this.database.assertCatalogObjectRevision("item-identity", String(itemId), expectedRevision);
+      if (!/^image\/(png|jpeg)$/i.test(String(mimeType || ""))) throw Object.assign(new Error("uploaded icon must be PNG or JPEG"), { statusCode: 415 });
+      const body = Buffer.from(String(dataBase64 || "").replace(/^data:[^,]+,/, ""), "base64");
+      if (!body.length || body.length > 8 * 1024 * 1024) throw Object.assign(new Error("uploaded icon is empty or too large"), { statusCode: 413 });
+      const asset = await this.iconService.processImage({ resourceBody: body, metadata: { mimeType }, cacheDir: this.iconService.cacheDir });
+      this.database.assertCatalogObjectRevision("item-identity", String(itemId), expectedRevision);
+      const cacheKey = crypto.createHash("sha256").update(`user-upload:${asset.hash}`).digest("hex");
+      const candidate = this.database.saveIconCandidate({ itemId: String(itemId), cacheKey, sourceType: "user-upload", crop: { provider: "user-upload" }, rankScore: 0, autoSelect: false, asset });
+      const selected = this.database.selectIconCandidate(String(itemId), candidate.id, { actor, note, expectedRevision: this.database.getCatalogObject("item-identity", String(itemId)).revision });
+      this.emit("catalog-review-updated", { objectType: selected.objectType, objectId: selected.objectId, revision: selected.revision, reviewStatus: selected.reviewStatus });
+      return this.getCatalogObject("item-identity", String(itemId));
+    } finally {
+      this.actionBoundaryPending = false;
+    }
   }
 
   setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {

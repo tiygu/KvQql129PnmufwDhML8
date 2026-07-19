@@ -169,6 +169,27 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         const task = runtime.getCatalogIconTask(requestUrl.searchParams.get("id"));
         return writeJson(res, task ? 200 : 404, task || { ok: false, error: "icon-task-not-found" });
       }
+      if (route === "POST /api/catalog/icon/select") {
+        const body = await readJson(req);
+        if (!body.objectId || !Number.isInteger(Number(body.candidateId)) || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-selection-request" });
+        const object = runtime.selectCatalogIcon(String(body.objectId), Number(body.candidateId), { actor: body.actor, note: body.note, expectedRevision: Number(body.expectedRevision) });
+        broadcast({ type: "catalog-review-updated", objectType: "item-identity", objectId: String(body.objectId), revision: object.revision, reviewStatus: object.reviewStatus });
+        return writeJson(res, 200, object);
+      }
+      if (route === "POST /api/catalog/icon/revoke") {
+        const body = await readJson(req);
+        if (!body.objectId || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-revoke-request" });
+        const object = runtime.revokeCatalogIconSelection(String(body.objectId), { actor: body.actor, note: body.note, expectedRevision: Number(body.expectedRevision) });
+        broadcast({ type: "catalog-review-updated", objectType: "item-identity", objectId: String(body.objectId), revision: object.revision, reviewStatus: object.reviewStatus });
+        return writeJson(res, 200, object);
+      }
+      if (route === "POST /api/catalog/icon/upload") {
+        const body = await readJson(req);
+        if (!body.objectId || !body.dataBase64 || !body.mimeType || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-upload-request" });
+        const object = await runtime.uploadCatalogIcon(String(body.objectId), body);
+        broadcast({ type: "catalog-review-updated", objectType: "item-identity", objectId: String(body.objectId), revision: object.revision, reviewStatus: object.reviewStatus });
+        return writeJson(res, 200, object);
+      }
       if (route === "GET /api/catalog/object") {
         const objectType = requestUrl.searchParams.get("type");
         const objectId = requestUrl.searchParams.get("id");

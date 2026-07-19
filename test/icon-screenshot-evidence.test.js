@@ -1,0 +1,207 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { PNG } = require("pngjs");
+const jpeg = require("jpeg-js");
+const { AutomationDatabase } = require("../src/automation-database");
+const { AutomationRuntime } = require("../src/automation-runtime");
+const { cropScreenshot, compareIcons, chooseStableFrame } = require("../src/icon-screenshot-evidence");
+const { IconEvidenceService, resolveScreenshotTarget, captureCdpScreenshot } = require("../src/icon-evidence");
+
+function image(width, height, pixel) {
+  const png = new PNG({ width, height });
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) png.data.set(pixel(x, y), (y * width + x) * 4);
+  return PNG.sync.write(png);
+}
+
+function nearestScale(buffer, factor) {
+  const source = PNG.sync.read(buffer);
+  return image(source.width * factor, source.height * factor, (x, y) => [...source.data.subarray((Math.floor(y / factor) * source.width + Math.floor(x / factor)) * 4, (Math.floor(y / factor) * source.width + Math.floor(x / factor)) * 4 + 4)]);
+}
+
+test("screenshot crops use runtime viewport scale and bind the observed item", () => {
+  const screenshot = image(200, 100, (x, y) => x >= 20 && x < 60 && y >= 10 && y < 30 ? [240, 20, 20, 255] : [0, 0, 0, 255]);
+  const result = cropScreenshot(screenshot, {
+    observedItemId: "item-7",
+    bounds: { x: 10, y: 5, width: 20, height: 10 },
+    viewport: { width: 100, height: 50 },
+  });
+  const cropped = PNG.sync.read(result.png);
+  assert.equal(result.observedItemId, "item-7");
+  assert.deepEqual(result.pixelCrop, { x: 20, y: 10, width: 40, height: 20 });
+  assert.equal(cropped.width, 40);
+  assert.equal(cropped.height, 20);
+  assert.deepEqual([...cropped.data.subarray(0, 4)], [240, 20, 20, 255]);
+});
+
+test("screenshot provider uses atomic runtime bounds and CDP capture", async () => {
+  const expressions = [];
+  const calls = [];
+  const client = {
+    evaluate: async (source, contextId) => { expressions.push(source); assert.equal(contextId, 9); if (expressions.length === 1) return null; if (expressions.length === 2) return { observedItemId: "i1", runtimeSource: "board-cell" }; return { bounds: { x: 1, y: 2, width: 3, height: 4 }, viewport: { width: 100, height: 50 }, devicePixelRatio: 2 }; },
+    send: async (method, params) => { calls.push([method, params]); return method === "Page.captureScreenshot" ? { data: Buffer.from("png").toString("base64") } : {}; },
+  };
+  const target = await resolveScreenshotTarget({ client, contextId: 9, itemId: "i1" });
+  assert.equal(target.devicePixelRatio, 2);
+  assert.match(expressions[1], /i1/);
+  assert.match(expressions[2], /getBoundingBoxToWorld/);
+  const token = /slots\["([^"]+)"\]/.exec(expressions[1])?.[1];
+  assert.ok(token && expressions[2].includes(token));
+  assert.equal(expressions.every((expression) => !/while\s*\(/.test(expression)), true);
+  assert.equal((await captureCdpScreenshot({ client })).toString(), "png");
+  assert.deepEqual(calls.map(([method]) => method), ["Page.enable", "Page.captureScreenshot"]);
+});
+
+test("multi-frame selection prefers the repeated stable frame over a transient overlay", () => {
+  const stable = image(12, 12, (x, y) => x > 2 && x < 9 && y > 2 && y < 9 ? [20, 180, 80, 255] : [30, 30, 30, 255]);
+  const overlay = image(12, 12, (x, y) => x === 0 || y === 0 || x === 11 || y === 11 ? [255, 220, 0, 255] : [20, 180, 80, 255]);
+  const chosen = chooseStableFrame([stable, overlay, stable]);
+  assert.equal(chosen.index, 0);
+  assert.deepEqual(chosen.acceptedFrameIndexes, [0, 2]);
+  assert.deepEqual(chosen.rejectedFrameIndexes, [1]);
+  assert.equal(chosen.reason, "exact-majority");
+});
+
+test("similarity evidence explains scaling, JPEG compression, background changes, and different icons", () => {
+  const base = image(24, 24, (x, y) => {
+    if (x > 5 && x < 18 && y > 4 && y < 19) return x < 12 ? [230, 50, 40, 255] : [40, 120, 230, 255];
+    return [25, 30, 35, 255];
+  });
+  const scaled = nearestScale(base, 2);
+  const decoded = PNG.sync.read(base);
+  const compressed = jpeg.encode({ data: decoded.data, width: decoded.width, height: decoded.height }, 72).data;
+  const changedBackground = image(24, 24, (x, y) => x > 5 && x < 18 && y > 4 && y < 19 ? (x < 12 ? [230, 50, 40, 255] : [40, 120, 230, 255]) : [215, 210, 195, 255]);
+  const different = image(24, 24, (x, y) => (x + y) % 2 ? [245, 230, 30, 255] : [80, 20, 130, 255]);
+  const scaledEvidence = compareIcons(base, scaled);
+  const compressedEvidence = compareIcons(base, compressed, "image/png", "image/jpeg");
+  const backgroundEvidence = compareIcons(base, changedBackground);
+  const differentEvidence = compareIcons(base, different);
+  assert.equal(scaledEvidence.exactMatch, false);
+  assert.ok(scaledEvidence.composite > 0.95);
+  assert.ok(compressedEvidence.composite > 0.72);
+  assert.ok(backgroundEvidence.composite > 0.55);
+  assert.ok(differentEvidence.composite < 0.55, JSON.stringify({ backgroundEvidence, differentEvidence }));
+  for (const evidence of [scaledEvidence, compressedEvidence, backgroundEvidence, differentEvidence]) {
+    assert.deepEqual(Object.keys(evidence.metrics).sort(), ["colorHistogram", "perceptualHash", "structure", "transparentContour"]);
+  }
+});
+
+test("uniform screenshot backgrounds become transparent contour evidence", () => {
+  const screenshot = (background) => image(30, 30, (x, y) => x >= 8 && x < 22 && y >= 7 && y < 23 ? [220, 45, 70, 255] : background);
+  const target = { observedItemId: "i1", bounds: { x: 0, y: 0, width: 30, height: 30 }, viewport: { width: 30, height: 30 } };
+  const dark = cropScreenshot(screenshot([20, 25, 30, 255]), target);
+  const light = cropScreenshot(screenshot([220, 215, 200, 255]), target);
+  assert.equal(dark.backgroundRemoval.applied, true);
+  assert.equal(light.backgroundRemoval.applied, true);
+  const evidence = compareIcons(dark.png, light.png);
+  assert.ok(evidence.metrics.transparentContour > 0.95);
+  assert.ok(evidence.composite > 0.8);
+});
+
+test("manual icon selection outranks later automatic candidates and revoke retains history", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-choice-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  const file = path.join(root, "icon.png");
+  fs.writeFileSync(file, image(1, 1, () => [255, 0, 0, 255]));
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { itemId: "i1" }, sourceType: "runtime" });
+  const save = (hash, cacheKey) => database.saveIconCandidate({ itemId: "i1", cacheKey, sourceType: "screenshot-runtime", crop: {}, similarity: { composite: 0.8 }, asset: { hash, mimeType: "image/png", width: 1, height: 1, byteSize: 1, filePath: file } });
+  try {
+    const first = save("1".repeat(64), "first");
+    const second = save("2".repeat(64), "second");
+    database.selectIconCandidate("i1", first.id, { actor: "operator", note: "preferred", expectedRevision: database.getCatalogObject("item-identity", "i1").revision });
+    save("3".repeat(64), "third");
+    assert.equal(database.getSelectedIconCandidate("i1").id, first.id);
+    database.revokeIconSelection("i1", { actor: "operator", note: "recheck", expectedRevision: database.getCatalogObject("item-identity", "i1").revision });
+    assert.equal(database.getSelectedIconCandidate("i1"), null);
+    const object = database.getCatalogObject("item-identity", "i1");
+    assert.deepEqual(object.iconSelectionHistory.map((entry) => entry.action), ["manual-select", "manual-revoke"]);
+    assert.equal(object.iconCandidates.length, 3);
+    assert.equal(second.selected, true);
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("exact mapping failure falls back to stable runtime screenshot evidence without activating catalog knowledge", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-fallback-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { itemId: "i1" }, sourceType: "runtime" });
+  database.observeCatalogObject({ objectType: "merge-relation", objectId: "i1", payload: { itemId: "i1", mergeTarget: "i2" }, sourceType: "visual-similarity" });
+  database.observeCatalogObject({ objectType: "production-profile", objectId: "p1:default", payload: { producerItemId: "p1", energyCost: 1, planningDistribution: { outcomes: [{ itemId: "i1", probability: 1 }] } }, sourceType: "visual-similarity" });
+  const stable = image(40, 40, (x, y) => x >= 10 && x < 30 && y >= 10 && y < 30 ? [20, 180, 80, 255] : [30, 30, 30, 255]);
+  const overlay = image(40, 40, (x, y) => x < 8 || y < 8 ? [255, 230, 0, 255] : (x >= 10 && x < 30 && y >= 10 && y < 30 ? [20, 180, 80, 255] : [30, 30, 30, 255]));
+  const frames = [stable, overlay, stable];
+  let captures = 0;
+  const service = new IconEvidenceService({
+    database, cacheDir: path.join(root, "cache"), concurrency: 1, screenshotFrameDelayMs: 0,
+    resolveSpriteFrame: async () => { throw new Error("no SpriteFrame mapping"); },
+    resolveScreenshotBounds: async ({ itemId }) => ({ observedItemId: itemId, bounds: { x: 5, y: 5, width: 20, height: 20 }, viewport: { width: 40, height: 40 }, devicePixelRatio: 1, runtimeSource: "board-cell" }),
+    captureScreenshot: async () => frames[captures++],
+  });
+  try {
+    service.request("i1");
+    await service.waitForIdle();
+    const task = service.getTask(1);
+    assert.equal(task.status, "complete");
+    assert.equal(task.result.provider, "screenshot-runtime");
+    const candidate = database.getSelectedIconCandidate("i1");
+    assert.equal(candidate.sourceType, "screenshot-runtime");
+    assert.equal(candidate.crop.observedItemId, "i1");
+    assert.equal(candidate.crop.runtimeSource, "board-cell");
+    assert.deepEqual(candidate.similarity.frameSelection.acceptedFrameIndexes, [0, 2]);
+    assert.equal(database.getCatalogObject("merge-relation", "i1").status, "observed");
+    assert.equal(database.getCatalogObject("production-profile", "p1:default").status, "observed");
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("corrupt mapped resources fail explicitly instead of being misclassified as mapping fallback", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-corrupt-resource-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { itemId: "i1" }, sourceType: "runtime" });
+  let screenshotBoundsCalls = 0;
+  const service = new IconEvidenceService({
+    database, cacheDir: path.join(root, "cache"), concurrency: 1,
+    resolveSpriteFrame: async () => ({ resourceUrl: "wxfile://mapped.png", mimeType: "image/png", rect: { x: 0, y: 0, width: 1, height: 1 } }),
+    readResource: async () => ({ body: Buffer.from("corrupt"), mimeType: "image/png" }),
+    resolveScreenshotBounds: async () => { screenshotBoundsCalls += 1; return null; },
+  });
+  try {
+    service.request("i1");
+    await service.waitForIdle();
+    assert.equal(service.getTask(1).status, "error");
+    assert.equal(screenshotBoundsCalls, 0);
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uploaded replacement is normalized, manually selected, and leaves planning unchanged", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-upload-"));
+  fs.mkdirSync(path.join(root, "captures"));
+  fs.writeFileSync(path.join(root, "captures", "item-catalog.json"), JSON.stringify({
+    chains: [{ id: "c", complete: true, minLevel: 1, maxLevel: 2, itemIds: ["i1", "i2"] }],
+    items: [{ id: "i1", chainId: "c", level: 1, baseUnits: 1, mergeTarget: "i2" }, { id: "i2", chainId: "c", level: 2, baseUnits: 2, mergeTarget: null }], producers: [],
+  }));
+  const runtime = new AutomationRuntime({ rootDir: root, dataDir: path.join(root, "data"), manageConnectionRoute: false });
+  try {
+    const before = runtime.getPlanningCatalog().items.map((item) => item.id);
+    const object = runtime.getCatalogObject("item-identity", "i1");
+    const uploaded = await runtime.uploadCatalogIcon("i1", { dataBase64: image(3, 2, () => [90, 30, 200, 255]).toString("base64"), mimeType: "image/png", actor: "operator", note: "clean replacement", expectedRevision: object.revision });
+    assert.equal(uploaded.selectedIcon.sourceType, "user-upload");
+    assert.equal(uploaded.selectedIcon.selectionOrigin, "manual");
+    assert.equal(uploaded.iconSelectionHistory.at(-1).action, "manual-select");
+    assert.deepEqual(runtime.getPlanningCatalog().items.map((item) => item.id), before);
+  } finally {
+    await runtime.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

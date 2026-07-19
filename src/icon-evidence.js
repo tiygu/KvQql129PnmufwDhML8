@@ -5,21 +5,18 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { Worker } = require("node:worker_threads");
 const { PNG } = require("pngjs");
-const jpeg = require("jpeg-js");
 const { canonicalJson } = require("./canonical-json");
+const { decodeImage } = require("./image-codec");
+const { writeContentAddressedIcon } = require("./icon-cache");
 
-function decodeImage(buffer, mimeType = "") {
-  const bytes = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
-  const pngSignature = bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-  if (pngSignature || /png/i.test(mimeType)) {
-    const image = PNG.sync.read(bytes);
-    return { width: image.width, height: image.height, data: Buffer.from(image.data) };
-  }
-  if ((bytes[0] === 0xff && bytes[1] === 0xd8) || /jpe?g/i.test(mimeType)) {
-    const image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
-    return { width: image.width, height: image.height, data: Buffer.from(image.data) };
-  }
-  throw new Error(`unsupported icon image MIME: ${mimeType || "unknown"}`);
+function runIconWorker(input) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.join(__dirname, "icon-image-worker.js"), { workerData: input });
+    let settled = false;
+    worker.once("message", (message) => { settled = true; message?.error ? reject(Object.assign(new Error(message.error.message), { stack: message.error.stack })) : resolve(message); });
+    worker.once("error", (error) => { settled = true; reject(error); });
+    worker.once("exit", (code) => { if (code !== 0 && !settled) reject(new Error(`icon image worker exited with code ${code}`)); });
+  });
 }
 
 function pixelCopy(source, sourceWidth, sourceX, sourceY, target, targetWidth, targetX, targetY) {
@@ -98,26 +95,44 @@ async function resolveCocosSpriteFrame({ client, contextId, itemId, itemIdentity
 
 function processIconResource({ resourceBody, metadata, cacheDir }) {
   const output = reconstructIcon(Buffer.from(resourceBody), metadata);
-  const hash = crypto.createHash("sha256").update(output).digest("hex");
   const decoded = PNG.sync.read(output);
-  const directory = path.join(cacheDir, hash.slice(0, 2));
-  const filePath = path.join(directory, `${hash}.png`);
-  fs.mkdirSync(directory, { recursive: true });
-  if (!fs.existsSync(filePath)) {
-    const temporary = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-    fs.writeFileSync(temporary, output);
-    try { fs.renameSync(temporary, filePath); } catch (error) { fs.rmSync(temporary, { force: true }); if (!fs.existsSync(filePath)) throw error; }
-  }
-  return { hash, mimeType: "image/png", width: decoded.width, height: decoded.height, byteSize: output.length, filePath };
+  return { ...writeContentAddressedIcon(output, cacheDir), mimeType: "image/png", width: decoded.width, height: decoded.height };
 }
 
 function processIconInWorker(input) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(path.join(__dirname, "icon-image-worker.js"), { workerData: input });
-    worker.once("message", (message) => message?.error ? reject(Object.assign(new Error(message.error.message), { stack: message.error.stack })) : resolve(message.asset));
-    worker.once("error", reject);
-    worker.once("exit", (code) => { if (code !== 0) reject(new Error(`icon image worker exited with code ${code}`)); });
-  });
+  return runIconWorker(input).then((message) => message.asset);
+}
+
+function processScreenshotInWorker(input) {
+  return runIconWorker({ ...input, operation: "screenshot-frames" });
+}
+
+function buildScreenshotDiscoveryExpression(itemIdentity, token) {
+  const identity = typeof itemIdentity === "object" && itemIdentity ? itemIdentity : { itemId: itemIdentity };
+  const encoded = JSON.stringify({ itemId: String(identity.itemId) });
+  return `(() => {const wanted=${encoded}.itemId,cc=globalThis.cc,root=cc?.director?.getScene?.();if(!root)return null;const idOf=entry=>entry?.itemId??entry?._itemId??entry?.data?.itemId??entry?._data?.itemId;const sprite=(root.getComponentsInChildren?.(cc.Sprite)||[]).find(candidate=>[candidate.node,candidate.node?.parent,candidate.node?.parent?.parent].some(node=>[node,...(node?._components||[])].some(entry=>String(idOf(entry)??"")===wanted)));const slots=globalThis.__miniGameCatalogScreenshotNodes??=(Object.create(null));slots[${JSON.stringify(String(token))}]=sprite?.node||null;return sprite?{observedItemId:wanted,runtimeSource:"cocos-sprite-discovery"}:null;})()`;
+}
+
+function buildScreenshotTargetExpression(token) {
+  return `(() => {const slots=globalThis.__miniGameCatalogScreenshotNodes,node=slots?.[${JSON.stringify(String(token))}];if(slots)delete slots[${JSON.stringify(String(token))}];const cc=globalThis.cc,box=node?.getBoundingBoxToWorld?.()||node?._uiProps?.uiTransformComp?.getBoundingBoxToWorld?.(),visible=cc?.view?.getVisibleSize?.();if(!box||!visible?.width||!visible?.height)return null;return{bounds:{x:Number(box.x)/visible.width*innerWidth,y:(visible.height-Number(box.y)-Number(box.height))/visible.height*innerHeight,width:Number(box.width)/visible.width*innerWidth,height:Number(box.height)/visible.height*innerHeight},viewport:{width:innerWidth,height:innerHeight},devicePixelRatio:Number(globalThis.devicePixelRatio||1)};})()`;
+}
+
+async function resolveScreenshotTarget({ client, contextId, itemId, itemIdentity = null }) {
+  const hook = await client.evaluate(`globalThis.__miniGameCatalogResolveScreenshotTarget?.(${JSON.stringify(String(itemId))})??null`, contextId);
+  if (hook?.bounds && String(hook.observedItemId) === String(itemId)) return hook;
+  const token = crypto.randomUUID();
+  const discovery = await client.evaluate(buildScreenshotDiscoveryExpression(itemIdentity || { itemId }, token), contextId);
+  const bounds = await client.evaluate(buildScreenshotTargetExpression(token), contextId);
+  const target = discovery && bounds ? { ...discovery, ...bounds } : null;
+  if (!target?.bounds || String(target.observedItemId) !== String(itemId)) throw new Error(`runtime screenshot bounds not found for item ${itemId}`);
+  return target;
+}
+
+async function captureCdpScreenshot({ client }) {
+  await client.send("Page.enable");
+  const result = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true, captureBeyondViewport: false });
+  if (!result?.data) throw new Error("CDP screenshot body is empty");
+  return Buffer.from(result.data, "base64");
 }
 
 function flattenResourceTree(frameTree, output = []) {
@@ -147,7 +162,7 @@ async function readCdpResource({ client, resourceUrl, mimeType }) {
 }
 
 class IconEvidenceService {
-  constructor({ database, cacheDir, concurrency = 2, queueLimit = 100, resolveSpriteFrame = resolveCocosSpriteFrame, readResource = readCdpResource, processImage = processIconInWorker, onEvent = null }) {
+  constructor({ database, cacheDir, concurrency = 2, queueLimit = 100, resolveSpriteFrame = resolveCocosSpriteFrame, readResource = readCdpResource, processImage = processIconInWorker, resolveScreenshotBounds = resolveScreenshotTarget, captureScreenshot = captureCdpScreenshot, processScreenshot = processScreenshotInWorker, screenshotFrameCount = 3, screenshotFrameDelayMs = 60, onEvent = null }) {
     if (!database) throw new TypeError("database is required");
     this.database = database;
     this.cacheDir = path.resolve(String(cacheDir));
@@ -156,6 +171,11 @@ class IconEvidenceService {
     this.resolveSpriteFrame = resolveSpriteFrame;
     this.readResource = readResource;
     this.processImage = processImage;
+    this.resolveScreenshotBounds = resolveScreenshotBounds;
+    this.captureScreenshot = captureScreenshot;
+    this.processScreenshot = processScreenshot;
+    this.screenshotFrameCount = Math.max(3, Math.min(7, Number(screenshotFrameCount) || 3));
+    this.screenshotFrameDelayMs = Math.max(0, Math.min(500, Number(screenshotFrameDelayMs) || 0));
     this.onEvent = onEvent;
     this.pending = [];
     this.active = 0;
@@ -200,8 +220,23 @@ class IconEvidenceService {
   }
 
   async _run(task) {
-    const metadata = await this.resolveSpriteFrame({ ...task.runtime, itemId: task.itemId });
-    if (!metadata?.resourceUrl) throw new Error(`SpriteFrame resource not found for item ${task.itemId}`);
+    try {
+      return await this._runExact(task);
+    } catch (exactError) {
+      if (exactError.code !== "ICON_EXACT_PROVIDER_UNAVAILABLE") throw exactError;
+      return this._runScreenshotFallback(task, exactError);
+    }
+  }
+
+  async _runExact(task) {
+    let metadata;
+    try {
+      metadata = await this.resolveSpriteFrame({ ...task.runtime, itemId: task.itemId });
+      if (!metadata?.resourceUrl) throw new Error(`SpriteFrame resource not found for item ${task.itemId}`);
+    } catch (error) {
+      if (/SpriteFrame resource not found|SpriteFrame mapping/i.test(error.message)) error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
+      throw error;
+    }
     const crop = { rect: metadata.rect, rotated: !!metadata.rotated, rotation: metadata.rotation ?? null, originalSize: metadata.originalSize, offset: metadata.offset, yOrigin: metadata.yOrigin || "top-left" };
     const cacheKey = crypto.createHash("sha256").update(canonicalJson({ resourceUrl: metadata.resourceUrl, textureUuid: metadata.textureUuid || null, crop })).digest("hex");
     const cached = this.database.findIconAcquisition(cacheKey);
@@ -214,16 +249,51 @@ class IconEvidenceService {
       this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: true });
       return { candidate, cached: true };
     }
-    const resource = await this.readResource({ ...task.runtime, resourceUrl: metadata.resourceUrl, mimeType: metadata.mimeType });
+    let resource;
+    try {
+      resource = await this.readResource({ ...task.runtime, resourceUrl: metadata.resourceUrl, mimeType: metadata.mimeType });
+    } catch (error) {
+      if (/resource (?:not loaded|not found)|not found for item/i.test(error.message)) error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
+      throw error;
+    }
     const asset = await this.processImage({ resourceBody: resource.body, metadata: { ...metadata, mimeType: resource.mimeType || metadata.mimeType }, cacheDir: this.cacheDir });
     const candidate = this.database.saveIconCandidate({
       itemId: task.itemId, cacheKey, sourceType: "cocos-runtime-resource", resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
       runtimeIdentifier: metadata.runtimeIdentifier || null, textureUuid: metadata.textureUuid || null, crop,
-      asset,
+      rankScore: 1, asset,
     });
     this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: false });
     return { candidate, cached: false };
   }
+
+  async _runScreenshotFallback(task, exactError) {
+    const frames = [], targets = [];
+    for (let attempt = 0; attempt < this.screenshotFrameCount * 2 && frames.length < this.screenshotFrameCount; attempt += 1) {
+      const before = await this.resolveScreenshotBounds({ ...task.runtime, itemId: task.itemId });
+      const body = await this.captureScreenshot({ ...task.runtime, target: before });
+      const after = await this.resolveScreenshotBounds({ ...task.runtime, itemId: task.itemId });
+      if (String(before.observedItemId) !== task.itemId || String(after.observedItemId) !== task.itemId) continue;
+      const drift = Math.max(...["x", "y", "width", "height"].map((key) => Math.abs(Number(before.bounds[key]) - Number(after.bounds[key]))));
+      if (drift > 2) continue;
+      frames.push(body);
+      targets.push({ ...before, insetRatio: 0.06, mimeType: "image/png" });
+      if (this.screenshotFrameDelayMs && frames.length < this.screenshotFrameCount) await new Promise((resolve) => setTimeout(resolve, this.screenshotFrameDelayMs));
+    }
+    if (frames.length < 3) throw new Error(`stable screenshot frames unavailable after exact provider failed: ${exactError.message}`);
+    const allCandidates = this.database.listIconCandidates(task.itemId);
+    const prioritizedCandidates = [...allCandidates.filter((candidate) => candidate.selected), ...allCandidates.slice(-12)];
+    const comparisonCandidates = [...new Map(prioritizedCandidates.map((candidate) => [candidate.id, candidate])).values()].slice(0, 12);
+    const processed = await this.processScreenshot({ frames, targets, cacheDir: this.cacheDir, comparisonCandidates });
+    const crop = { provider: "runtime-screenshot", ...processed.crop, exactProviderError: exactError.message };
+    const cacheKey = crypto.createHash("sha256").update(canonicalJson({ itemId: task.itemId, assetHash: processed.asset.hash, bounds: crop.bounds, viewport: crop.viewport })).digest("hex");
+    const stability = processed.similarity.frameSelection.acceptedFrameIndexes.length / frames.length;
+    const candidate = this.database.saveIconCandidate({
+      itemId: task.itemId, cacheKey, sourceType: "screenshot-runtime", runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds", crop,
+      similarity: processed.similarity, rankScore: 0.5 + stability * 0.3, asset: processed.asset,
+    });
+    this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: false, provider: "screenshot-runtime", exactProviderError: exactError.message });
+    return { candidate, cached: false, provider: "screenshot-runtime", exactProviderError: exactError.message };
+  }
 }
 
-module.exports = { IconEvidenceService, reconstructIcon, processIconResource, processIconInWorker, buildSpriteFrameExpression, resolveCocosSpriteFrame, readCdpResource, flattenResourceTree };
+module.exports = { IconEvidenceService, reconstructIcon, processIconResource, processIconInWorker, processScreenshotInWorker, buildSpriteFrameExpression, resolveCocosSpriteFrame, buildScreenshotDiscoveryExpression, buildScreenshotTargetExpression, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource, flattenResourceTree };

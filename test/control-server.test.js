@@ -17,6 +17,9 @@ function createRuntime() {
     acquireCatalogIcon: (itemId) => ({ status: "queued", taskId: 17, itemId }),
     getCatalogIconTask: (taskId) => ({ status: "complete", taskId: Number(taskId), itemId: "i" }),
     getCatalogIconAsset: () => null,
+    selectCatalogIcon: (itemId, candidateId, input) => ({ objectType: "item-identity", objectId: itemId, selectedIcon: { id: candidateId }, revision: input.expectedRevision + 1, reviewStatus: "clear" }),
+    revokeCatalogIconSelection: (itemId, input) => ({ objectType: "item-identity", objectId: itemId, selectedIcon: null, revision: input.expectedRevision + 1, reviewStatus: "needs-review" }),
+    uploadCatalogIcon: async (itemId, input) => ({ objectType: "item-identity", objectId: itemId, selectedIcon: { sourceType: "user-upload" }, revision: Number(input.expectedRevision) + 2, reviewStatus: "clear" }),
     getCatalogObject: (type, id) => ({ objectType: type, objectId: id, status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }),
     setCatalogObjectDisposition: (type, id, disposition, reason, expectedRevision) => {
       if (expectedRevision !== 3) throw Object.assign(new Error("catalog revision conflict"), { statusCode: 409 });
@@ -139,6 +142,12 @@ test("control server 按需排队图标任务并提供内容哈希资源", async
     const icon = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/${hash}`);
     assert.equal(icon.headers.get("content-type"), "image/png");
     assert.equal(await icon.text(), "png-fixture");
+    const selected = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/select`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ objectId: "i", candidateId: 4, actor: "operator", note: "best", expectedRevision: 3 }) });
+    assert.equal((await selected.json()).selectedIcon.id, 4);
+    const revoked = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/revoke`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ objectId: "i", actor: "operator", note: "recheck", expectedRevision: 4 }) });
+    assert.equal((await revoked.json()).selectedIcon, null);
+    const uploaded = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/upload`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ objectId: "i", actor: "operator", note: "replacement", expectedRevision: 5, mimeType: "image/png", dataBase64: "cG5n" }) });
+    assert.equal((await uploaded.json()).selectedIcon.sourceType, "user-upload");
   } finally {
     await server.close(); fs.rmSync(root, { recursive: true, force: true });
   }

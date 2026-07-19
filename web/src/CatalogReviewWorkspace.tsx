@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, History, Image, Pause, Play, RotateCcw, Save } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, History, Image, Pause, Play, RotateCcw, Save, Upload, X } from "lucide-react";
 import { controlApi } from "./control-api";
 
 const reasonLabels: Record<string, string> = {
@@ -31,6 +31,7 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
   const [note, setNote] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const iconUploadRef = useRef<HTMLInputElement>(null);
 
   const selectedSummary = useMemo(() => {
     const candidates = queue.length ? queue : objects;
@@ -145,6 +146,38 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
     finally { setBusy(false); }
   };
 
+  const selectIcon = async (candidateId: number) => {
+    if (!detail || !actor.trim() || !note.trim()) { setMessage("选择图标前请填写操作员和备注"); return; }
+    setBusy(true);
+    try {
+      const updated = await controlApi.selectCatalogIcon({ objectId: detail.objectId, candidateId, actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision });
+      setDetail(updated); setNote(""); setMessage("已选择显示图标；人工选择优先于自动候选"); onChanged();
+    } catch (error: any) { if (error.payload?.currentObject) setDetail(error.payload.currentObject); setMessage(error.message); }
+    finally { setBusy(false); }
+  };
+
+  const revokeIcon = async () => {
+    if (!detail?.selectedIcon || !actor.trim() || !note.trim()) { setMessage("撤销图标前请填写操作员和备注"); return; }
+    setBusy(true);
+    try {
+      const updated = await controlApi.revokeCatalogIcon({ objectId: detail.objectId, actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision });
+      setDetail(updated); setNote(""); setMessage("已撤销显示图标，历史候选仍完整保留"); onChanged();
+    } catch (error: any) { if (error.payload?.currentObject) setDetail(error.payload.currentObject); setMessage(error.message); }
+    finally { setBusy(false); }
+  };
+
+  const uploadIcon = async (file?: File) => {
+    if (!detail || !file) return;
+    if (!actor.trim() || !note.trim()) { setMessage("上传替代图标前请填写操作员和备注"); return; }
+    setBusy(true);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file); });
+      const updated = await controlApi.uploadCatalogIcon({ objectId: detail.objectId, actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision, mimeType: file.type, dataBase64: dataUrl.split(",")[1] });
+      setDetail(updated); setNote(""); setMessage("替代图标已上传并作为人工选择"); onChanged();
+    } catch (error: any) { if (error.payload?.currentObject) setDetail(error.payload.currentObject); setMessage(error.message); }
+    finally { if (iconUploadRef.current) iconUploadRef.current.value = ""; setBusy(false); }
+  };
+
   return <section className="catalog-review-workspace">
     <div className="panel review-queue">
       <div className="panel-head"><div><span className="eyebrow">Catalog Review Queue</span><h2>审核队列</h2></div><b>{queue.length}</b></div>
@@ -158,6 +191,11 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
       {!detail ? <div className="empty-state"><History/><span>从审核队列选择对象</span></div> : <>
         <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{detail.objectType} · {detail.status} · r{detail.revision}</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
         {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt={`${detail.objectId} icon`}/> : <Image/>}<div><strong>{detail.selectedIcon ? "精确运行时图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.assetHash} · ${detail.selectedIcon.width}×${detail.selectedIcon.height}` : "缺失仅影响视觉核对，不影响其他 Active 字段参与规划"}</span></div></div>}
+        {detail.objectType === "item-identity" && <div className="icon-candidate-review">
+          <div className="icon-candidate-head"><div><h3>Icon candidate comparison</h3><p>Resource, screenshot, and uploaded evidence remain available for review.</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>Upload replacement</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>Revoke selection</button></div></div>
+          <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`candidate ${candidate.id}`}/><div><strong>{candidate.sourceType}</strong><span>{candidate.width} x {candidate.height} / {new Date(candidate.createdAt).toLocaleString()}</span><span className="candidate-hash">{candidate.assetHash}</span>{candidate.resourceUrl && <span className="candidate-hash">URL: {candidate.resourceUrl}</span>}<span>Crop: {candidate.crop?.pixelCrop ? `${candidate.crop.pixelCrop.x},${candidate.crop.pixelCrop.y} ${candidate.crop.pixelCrop.width}x${candidate.crop.pixelCrop.height}` : candidate.crop?.rect ? `${candidate.crop.rect.x},${candidate.crop.rect.y} ${candidate.crop.rect.width}x${candidate.crop.rect.height}` : "full image"}</span>{candidate.similarity?.frameSelection && <span>Stable frames: {candidate.similarity.frameSelection.acceptedFrameIndexes.length}/{candidate.similarity.frameSelection.frameHashes.length} / {candidate.similarity.frameSelection.reason}</span>}{candidate.similarity?.comparisons?.[0] && <span>Best match: {(candidate.similarity.comparisons[0].composite * 100).toFixed(1)}% / perceptual {(candidate.similarity.comparisons[0].metrics.perceptualHash * 100).toFixed(0)} / structure {(candidate.similarity.comparisons[0].metrics.structure * 100).toFixed(0)} / color {(candidate.similarity.comparisons[0].metrics.colorHistogram * 100).toFixed(0)} / contour {(candidate.similarity.comparisons[0].metrics.transparentContour * 100).toFixed(0)}</span>}</div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `Current / ${candidate.selectionOrigin || "automatic"}` : "Select candidate"}</button></article>) : <div className="empty-state compact"><Image/><span>No icon candidates yet</span></div>}</div>
+          {detail.iconSelectionHistory?.length > 0 && <div className="icon-selection-history"><h4>Icon selection history</h4>{[...detail.iconSelectionHistory].reverse().map((entry: any) => <p key={entry.id}><strong>{entry.action}</strong><span>{entry.actor} / {new Date(entry.createdAt).toLocaleString()} / {entry.assetHash || "no selection"} / {entry.note}</span></p>)}</div>}
+        </div>}
         {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reasonLabels[reason.type] || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
         <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <button className={`field-row ${fieldPath === field ? "active" : ""}`} key={field} onClick={() => selectField(field)}><strong>{field}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></button>)}</div>
         <div className="ruling-editor"><label><span>字段</span><select value={fieldPath} onChange={(event) => selectField(event.target.value)}>{fields.map((field) => <option key={field}>{field}</option>)}</select></label><label className="wide"><span>人工值（JSON 或文本）</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)}/></label><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录判断依据"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => commit("confirm")}><Check size={15}/>确认候选</button><button disabled={busy} onClick={() => commit("modify")}><Save size={15}/>保存修改</button><button disabled={busy || !detail.humanValues?.[fieldPath]} onClick={revoke}><RotateCcw size={15}/>撤销裁决</button></div>{message && <p className="review-message">{message}</p>}</div>
