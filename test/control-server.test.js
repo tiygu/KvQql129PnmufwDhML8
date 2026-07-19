@@ -32,6 +32,7 @@ function createRuntime() {
     },
     revokeCatalogRuling: (input) => ({ objectType: input.objectType, objectId: input.objectId, revision: 5, reviewStatus: "clear", humanValues: {} }),
     refreshCatalogFromRuntime: async () => ({ ok: true }),
+    runActiveCatalogScan: async ({ itemIds }) => ({ ok: true, reason: "active-catalog-scan-complete", itemIds, plan: { status: "ready" } }),
     connectionRouteStatus: async () => ({ listening: false, managed: false }),
     startConnectionRoute: async () => ({ ok: true, reason: "route-started" }),
     stopConnectionRoute: async () => ({ ok: true, reason: "route-stopped" }),
@@ -93,6 +94,11 @@ test("control server hosts the console and accepts background automation", async
       body: JSON.stringify({ objectType: "item-identity", objectId: "i", disposition: "paused", reason: "stale", expectedRevision: 2 }),
     });
     assert.equal(staleDispositionResponse.status, 409);
+    const scanResponse = await fetch(`http://127.0.0.1:${port}/api/catalog/scan`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ itemIds: ["i"] }) });
+    assert.deepEqual(await scanResponse.json(), { ok: true, reason: "active-catalog-scan-complete", itemIds: ["i"], plan: { status: "ready" } });
+    const oversizedScanResponse = await fetch(`http://127.0.0.1:${port}/api/catalog/scan`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ itemIds: Array.from({ length: 13 }, (_, index) => `i${index}`) }) });
+    assert.equal(oversizedScanResponse.status, 400);
+    assert.deepEqual(await oversizedScanResponse.json(), { ok: false, error: "active-catalog-scan-target-limit", limit: 12 });
   } finally {
     await server.close();
     fs.rmSync(root, { recursive: true, force: true });

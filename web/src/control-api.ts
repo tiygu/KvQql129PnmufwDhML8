@@ -83,6 +83,7 @@ export const controlApi = {
   revokeCatalogRuling: (input: any) => post("/api/catalog/ruling/revoke", input),
   setCatalogObjectDisposition: (input: any) => post("/api/catalog/object/disposition", input),
   refreshCatalog: () => post("/api/catalog/refresh"),
+  runActiveCatalogScan: (itemIds: string[] = []) => post("/api/catalog/scan", { itemIds }),
   exportCatalog,
   importCatalog: (snapshot: any) => post("/api/catalog/import", snapshot),
   acquireCatalogIcon: (objectId: string) => post("/api/catalog/icon/acquire", { objectId }),

@@ -26,6 +26,8 @@ const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./cat
 const { PauseGate } = require("./pause-gate");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
+const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
+const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -58,6 +60,10 @@ class AutomationRuntime {
     this.activeSessionId = null;
     this.activeRunPromise = null;
     this.actionBoundaryPending = false;
+    this.passiveCatalogState = null;
+    this.passiveCatalogDiffs = [];
+    this.passiveCatalogDrainPromise = null;
+    this.closing = false;
     this.buildCatalog = buildCatalog;
     this.dataDir = dataDir || path.join(rootDir, "data");
     fs.mkdirSync(this.dataDir, { recursive: true });
@@ -165,7 +171,8 @@ class AutomationRuntime {
   }
 
   getPlanningCatalog({ includeProvisional = false } = {}) {
-    return buildPlanningCatalogFromRepository(this.database, null, { includeProvisional });
+    const catalog = buildPlanningCatalogFromRepository(this.database, null, { includeProvisional });
+    return { ...catalog, evidence: buildCatalogEvidenceIndex(this.database) };
   }
 
   exportCatalog() {
@@ -252,23 +259,86 @@ class AutomationRuntime {
     return this.database.revokeCatalogRuling(input);
   }
 
-  async refreshCatalogFromRuntime() {
+  async captureCatalogFromRuntime(capturePrefix = "catalog-rescan") {
     const selection = await this.connect();
     const snapshot = await this.lab.snapshot(selection);
     const captureDir = path.join(this.dataDir, "catalog-captures");
     await fsp.mkdir(captureDir, { recursive: true });
-    const captureFile = `catalog-rescan-${Date.now()}.json`;
+    const captureFile = `${capturePrefix}-${Date.now()}.json`;
     snapshot.__captureFile = captureFile;
     await fsp.writeFile(path.join(captureDir, captureFile), JSON.stringify(snapshot, null, 2), "utf8");
     const scanned = this.buildCatalog([snapshot]);
     if (!scanned.chains.length) return { ok: false, reason: "selected-item-status-not-found", captureFile };
+    return { ok: true, captureFile, capturePath: path.join(captureDir, captureFile), scanned };
+  }
+
+  commitCatalogCaptures(captures, { evaluate = true } = {}) {
+    const observedObjectIds = [...new Set(captures.flatMap(({ scanned }) => [...(scanned.items || []).map((item) => String(item.id)), ...(scanned.producers || []).map((producer) => String(producer.itemId))]))];
     this.database.transaction(() => {
-      this.database.importCatalog(scanned, { sourceFile: path.join(captureDir, captureFile), sourceType: "runtime-capture" });
-      const observedObjectIds = [...new Set([...(scanned.items || []).map((item) => String(item.id)), ...(scanned.producers || []).map((producer) => String(producer.itemId))])];
-      const gateResults = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
-      for (const object of gateResults) this.emit("catalog-state-updated", { object });
+      for (const capture of captures) this.database.importCatalog(capture.scanned, { sourceFile: capture.capturePath, sourceType: "runtime-capture" });
+      if (evaluate) {
+        const gateResults = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
+        for (const object of gateResults) this.emit("catalog-state-updated", { object });
+      }
     });
-    return { ok: true, reason: "catalog-refreshed", captureFile, catalogView: this.getCatalogView() };
+    return observedObjectIds;
+  }
+
+  async refreshCatalogFromRuntime({ evaluate = true, capturePrefix = "catalog-rescan" } = {}) {
+    const capture = await this.captureCatalogFromRuntime(capturePrefix);
+    if (!capture.ok) return capture;
+    const observedObjectIds = this.commitCatalogCaptures([capture], { evaluate });
+    return { ok: true, reason: "catalog-refreshed", captureFile: capture.captureFile, observedObjectIds, catalogView: this.getCatalogView() };
+  }
+
+  async runActiveCatalogScan({ itemIds = [] } = {}) {
+    if (this.actionBoundaryPending) throw Object.assign(new Error("another safe-boundary task is running"), { code: "ACTIVE_CATALOG_SCAN_UNSAFE_BOUNDARY", statusCode: 409 });
+    if (this.running && !this.pauseGate.paused) throw Object.assign(new Error("active catalog scan requires paused or stopped automation"), { code: "ACTIVE_CATALOG_SCAN_UNSAFE_BOUNDARY", statusCode: 409 });
+    this.actionBoundaryPending = true;
+    try {
+      if (this.running) await this.pauseGate.waitForBoundary();
+      await this.iconService.waitForIdle();
+      const selection = await this.connect();
+      const before = await this.collectState();
+      if (before.scene !== "board") return { ok: false, reason: "active-catalog-scan-board-scene-required", before };
+      const currentPlan = buildOptimizationPlan({ catalog: this.getPlanningCatalog(), state: before });
+      const requested = (itemIds.length ? itemIds.map(String) : currentPlan.evidenceBlocks.flatMap((block) => block.blockers.map((blocker) => blocker.scanAction?.itemId).filter(Boolean))).slice(0, MAX_ACTIVE_CATALOG_SCAN_TARGETS);
+      const targets = [...new Set(requested)].filter((itemId) => before.board.grids.some((grid) => String(grid.itemId) === itemId));
+      if (!targets.length) return { ok: false, reason: "active-catalog-scan-target-not-on-board", evidenceBlocks: currentPlan.evidenceBlocks };
+      const contextId = selection.probe.context.id;
+      const selectedIndex = await this.lab.client.evaluate(READ_CATALOG_SCAN_SELECTION_EXPRESSION, contextId);
+      const selectedGrid = selectedIndex == null ? null : before.board.grids.find((grid) => Number(grid.index) === Number(selectedIndex));
+      if (selectedGrid && (Number(selectedGrid.produceCount || 0) > 0 || Number(selectedGrid.energyCost || 0) > 0)) return { ok: false, reason: "active-catalog-scan-initial-selection-unsafe", selectedIndex };
+      const scanner = new ActiveCatalogScanner({
+        collectState: () => this.collectState(),
+        readSelection: () => this.lab.client.evaluate(READ_CATALOG_SCAN_SELECTION_EXPRESSION, contextId),
+        inspectItem: async (itemId) => {
+          const grid = before.board.grids.find((candidate) => String(candidate.itemId) === String(itemId));
+          if (!grid) return null;
+          const inspected = await this.lab.client.evaluate(buildActiveCatalogInspectExpression(grid.index), contextId);
+          if (!inspected?.ok) return null;
+          await new Promise((resolve) => setTimeout(resolve, this.getSettings().settleMs));
+          return { itemId: String(itemId), gridIndex: grid.index, inspected };
+        },
+        restoreSelection: (selectedIndex) => this.lab.client.evaluate(buildRestoreCatalogSelectionExpression(selectedIndex), contextId),
+        collectEvidence: async (capture) => {
+          const staged = await this.captureCatalogFromRuntime(`active-catalog-scan-${capture.itemId}`);
+          capture.captureFile = staged.captureFile;
+          return staged.ok ? staged : null;
+        },
+        commitEvidence: (captures) => this.commitCatalogCaptures(captures, { evaluate: false }),
+        reevaluate: async (observedObjectIds) => {
+          const results = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
+          for (const object of results) this.emit("catalog-state-updated", { object });
+        },
+        replan: async () => buildOptimizationPlan({ catalog: this.getPlanningCatalog(), state: await this.collectState() }),
+      });
+      const result = await scanner.run(targets, { before, initialSelection: selectedIndex });
+      this.emit("active-catalog-scan-complete", { ...result, itemIds: targets });
+      return result;
+    } finally {
+      this.actionBoundaryPending = false;
+    }
   }
 
   connectionRouteStatus() { return this.connectionService.status(); }
@@ -338,9 +408,36 @@ class AutomationRuntime {
     let boardState = null;
     try { boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, selection.probe.context.id); } catch (_) {}
     const state = buildGameState({ state: summarizeSnapshot(snapshot), boardState });
+    this.queuePassiveCatalogEvidence({ state });
     this.lastState = state;
     this.database.logResourceSample({ sessionId: this.activeSessionId, coins: state.resources.coins, energy: state.resources.energy, diamonds: state.resources.diamonds, scene: state.scene, observedAt: state.collectedAt });
     return state;
+  }
+
+  queuePassiveCatalogEvidence({ state = null, actionDiff = null } = {}) {
+    if (this.closing) return;
+    if (state) this.passiveCatalogState = state;
+    if (actionDiff) {
+      this.passiveCatalogDiffs.push(actionDiff);
+      if (this.passiveCatalogDiffs.length > 16) this.passiveCatalogDiffs.splice(0, this.passiveCatalogDiffs.length - 16);
+    }
+    if (this.passiveCatalogDrainPromise) return;
+    this.passiveCatalogDrainPromise = new Promise((resolve) => setImmediate(() => {
+      const pendingState = this.passiveCatalogState;
+      const pendingDiffs = this.passiveCatalogDiffs.splice(0);
+      this.passiveCatalogState = null;
+      try {
+        const observed = new Set(collectPassiveCatalogEvidence(this.database, { state: pendingState }));
+        for (const diff of pendingDiffs) for (const objectId of collectPassiveCatalogEvidence(this.database, { actionDiff: diff })) observed.add(objectId);
+        if (observed.size) this.emit("catalog-passive-evidence", { objects: [...observed] });
+      } catch (error) {
+        this.emit("catalog-passive-evidence-error", { error: error.message });
+      } finally {
+        this.passiveCatalogDrainPromise = null;
+        resolve();
+        if (!this.closing && (this.passiveCatalogState || this.passiveCatalogDiffs.length)) this.queuePassiveCatalogEvidence();
+      }
+    }));
   }
 
   async dashboard() {
@@ -452,6 +549,7 @@ class AutomationRuntime {
       completeMapMission: ({ signal }) => mapCompleter.complete({ execute: true, signal }),
       onEvent: (event) => {
         if (sessionId) this.database.logAction({ sessionId, sequence: ++sequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
+        this.queuePassiveCatalogEvidence({ actionDiff: event.diff || event });
         this.emit("automation-action", { action: event });
       },
       waitIfPaused: (signal) => this.pauseGate.wait(signal),
@@ -555,6 +653,7 @@ class AutomationRuntime {
 
   resume() {
     if (!this.running) return { ok: false, reason: "automation-not-running", paused: false };
+    if (this.actionBoundaryPending) return { ok: false, reason: "safe-boundary-task-running", paused: true };
     const result = this.pauseGate.resume();
     this.emit("automation-status", { running: true, paused: false });
     return result;
@@ -563,6 +662,8 @@ class AutomationRuntime {
   async close() {
     this.stop();
     await this.activeRunPromise?.catch(() => {});
+    this.closing = true;
+    await this.passiveCatalogDrainPromise?.catch(() => {});
     await this.iconService?.waitForIdle().catch(() => {});
     await this.lab?.close?.().catch(() => {});
     await this.connectionService.stop().catch(() => {});

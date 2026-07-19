@@ -4,6 +4,7 @@ const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
+const { MAX_ACTIVE_CATALOG_SCAN_TARGETS } = require("./catalog-scan");
 const WebSocket = require("ws");
 
 const WS_PATH = "/ws";
@@ -226,6 +227,14 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/refresh") return writeJson(res, 200, await runtime.refreshCatalogFromRuntime());
+      if (route === "POST /api/catalog/scan") {
+        const body = await readJson(req);
+        if (body.itemIds != null && !Array.isArray(body.itemIds)) return writeJson(res, 400, { ok: false, error: "invalid-active-catalog-scan-request" });
+        if ((body.itemIds || []).length > MAX_ACTIVE_CATALOG_SCAN_TARGETS) return writeJson(res, 400, { ok: false, error: "active-catalog-scan-target-limit", limit: MAX_ACTIVE_CATALOG_SCAN_TARGETS });
+        const result = await runtime.runActiveCatalogScan({ itemIds: (body.itemIds || []).map(String) });
+        broadcast({ type: "active-catalog-scan-complete", ...result });
+        return writeJson(res, result.ok ? 200 : 409, result);
+      }
       if (route === "GET /api/connection") return writeJson(res, 200, await runtime.connectionRouteStatus());
       if (route === "POST /api/connection/start") return writeJson(res, 200, await runtime.startConnectionRoute(await readJson(req)));
       if (route === "POST /api/connection/stop") return writeJson(res, 200, await runtime.stopConnectionRoute());

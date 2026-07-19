@@ -20,7 +20,7 @@ function parseDraft(value: string) {
   try { return JSON.parse(value); } catch { return value; }
 }
 
-export function CatalogReviewWorkspace({ repository, onChanged }: { repository: any; onChanged: (catalog?: any) => void }) {
+export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: (catalog?: any) => void; focusObject?: { objectType: string; objectId: string } | null }) {
   const queue = repository?.reviewQueue || [];
   const objects = repository?.objects || [];
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -34,7 +34,8 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
   const iconUploadRef = useRef<HTMLInputElement>(null);
 
   const selectedSummary = useMemo(() => {
-    const candidates = queue.length ? queue : objects;
+    const queuedKeys = new Set(queue.map((item: any) => `${item.objectType}:${item.objectId}`));
+    const candidates = [...queue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
     return candidates.find((item: any) => `${item.objectType}:${item.objectId}` === selectedKey) || candidates[0] || null;
   }, [objects, queue, selectedKey]);
 
@@ -48,6 +49,7 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
   };
 
   useEffect(() => { loadDetail().catch((error) => setMessage(error.message)); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
+  useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
 
   const fields = useMemo(() => Array.from(new Set([
     ...Object.keys(detail?.algorithmCandidate || {}),
