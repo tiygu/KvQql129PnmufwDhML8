@@ -18,7 +18,7 @@ function selectWarehouseCandidate(state) {
 }
 
 class OrderCoinLoop {
-  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, loadWarehouseInventory = null, retrieveWarehouseItem = null, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
+  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, loadWarehouseInventory = null, retrieveWarehouseItem = null, switchProductionMode = null, allowProductionModeSwitch = true, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
     this.collectState = collectState;
     this.planOrders = planOrders;
     this.runBoardAction = runBoardAction;
@@ -27,10 +27,26 @@ class OrderCoinLoop {
     this.storeBoardItem = storeBoardItem;
     this.loadWarehouseInventory = loadWarehouseInventory;
     this.retrieveWarehouseItem = retrieveWarehouseItem;
+    this.switchProductionMode = switchProductionMode;
+    this.allowProductionModeSwitch = !!allowProductionModeSwitch;
     this.onEvent = onEvent;
     this.minEnergy = Math.max(0, Number(minEnergy) || 0);
     this.minEmptySpaces = Math.max(0, Number(minEmptySpaces) || 0);
     this.targetSlot = null;
+  }
+
+  async tryProductionModeSwitch({ target, state, plan, execute, signal, actions }) {
+    const action = target?.nextAction;
+    if (action?.type !== "switch-production-mode") return null;
+    if (!execute) return { result: { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: action, actions, state, plan } };
+    if (!this.allowProductionModeSwitch) return { result: { ok: true, executed: false, reason: "production-mode-switch-awaiting-execution-boundary", targetSlot: this.targetSlot, nextAction: action, actions, state, plan } };
+    if (!this.switchProductionMode) return { result: { ok: false, executed: false, reason: "production-mode-switch-executor-unavailable", targetSlot: this.targetSlot, nextAction: action, actions, state, plan } };
+    const switched = await this.switchProductionMode(action.producer, action.productionModeId, { signal, expectedCurrentModeId: action.currentModeId });
+    const recorded = { step: actions.length + 1, type: "switch-production-mode", producer: action.producer, producerItemId: action.producerItemId, previousModeId: action.currentModeId, productionModeId: action.productionModeId, ok: switched.ok, reason: switched.reason, before: switched.before, after: switched.after };
+    actions.push(recorded);
+    this.onEvent?.(recorded);
+    if (!switched.ok) return { result: { ok: false, executed: true, reason: switched.reason || "production-mode-switch-failed", targetSlot: this.targetSlot, actions, state, plan, productionMode: switched } };
+    return { continue: true };
   }
 
   async tryWarehouseRetrieve({ plan, state, execute, signal, actions }) {
@@ -150,6 +166,9 @@ class OrderCoinLoop {
         const reason = String(boundary).startsWith("waiting-") ? boundary : `waiting-${boundary}`;
         return { ok: true, executed: execute, reason, actions, state, plan };
       }
+      const modeSwitch = await this.tryProductionModeSwitch({ target, state, plan, execute, signal, actions });
+      if (modeSwitch?.continue) continue;
+      if (modeSwitch?.result) return modeSwitch.result;
       const order = state.orders.find((item) => String(item.slot) === this.targetSlot);
       if (order?.ready || target.ready) {
         if (!execute) return { ok: true, executed: false, reason: "order-ready", targetSlot: this.targetSlot, nextAction: { type: "submit-order", slot: this.targetSlot }, actions, state, plan };

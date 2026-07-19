@@ -5,11 +5,11 @@ const fsp = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
 const { MAX_ACTIVE_CATALOG_SCAN_TARGETS } = require("./catalog-scan");
+const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
 const WebSocket = require("ws");
 
 const WS_PATH = "/ws";
 const JSON_LIMIT_BYTES = 16 * 1024 * 1024;
-const CATALOG_OBJECT_TYPES = new Set(["item-identity", "merge-relation", "production-profile"]);
 
 const MIME_TYPES = Object.freeze({
   ".css": "text/css; charset=utf-8",

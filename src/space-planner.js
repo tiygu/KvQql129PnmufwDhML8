@@ -47,6 +47,9 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
       mergeTarget: grid.mergeTarget == null ? itemRecord(catalog, itemId)?.mergeTarget ?? null : String(grid.mergeTarget),
       produceCount: grid.produceCount == null ? null : Number(grid.produceCount),
       energyCost: grid.energyCost == null ? null : Number(grid.energyCost),
+      currentProductionModeId: grid.currentProductionModeId == null ? null : String(grid.currentProductionModeId),
+      availableProductionModes: (grid.availableProductionModes || []).map((mode) => ({ modeId: String(mode.modeId), unlocked: mode.unlocked !== false })),
+      productionModeSwitchEntry: grid.productionModeSwitchEntry ? { ...grid.productionModeSwitchEntry } : { status: "unknown", method: null },
       executable: !itemId || reasons.length === 0,
       unavailableReasons: reasons,
       protected: !!grid.taskNeed || requiredReservation || explicitProtected.has(itemId),
@@ -87,6 +90,11 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
       producers: (catalog.producers || []).map((producer) => ({
         itemId: String(producer.itemId), energyCost: Number(producer.energyCost || 0),
         drops: (producer.drops || []).map((drop) => ({ itemId: String(drop.itemId), probability: Number(drop.probability), baseUnits: Number(drop.baseUnits || 0) })),
+        modes: (producer.modes || []).map((mode) => ({
+          modeId: String(mode.modeId), energyCost: Number(mode.energyCost || 0), unlocked: mode.unlocked !== false,
+          humanLocked: !!mode.humanLocked, inferred: !!mode.inferred,
+          drops: (mode.drops || []).map((drop) => ({ itemId: String(drop.itemId), chainId: drop.chainId == null ? null : String(drop.chainId), level: Number(drop.level || 0), probability: Number(drop.probability), count: Number(drop.count ?? 1), baseUnits: Number(drop.baseUnits || 0) })),
+        })),
       })),
       evidence: (catalog.evidence?.objects || []).map((object) => ({ objectType: object.objectType, objectId: String(object.objectId), status: object.status, disposition: object.disposition })),
     },

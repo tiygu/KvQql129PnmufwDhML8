@@ -5,8 +5,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { canonicalJson } = require("./canonical-json");
+const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
 
-const CATALOG_OBJECT_TYPES = new Set(["item-identity", "merge-relation", "production-profile"]);
 const CATALOG_VERSION_STATES = new Set(["observed", "provisional", "active"]);
 const CATALOG_VERSION_ORIGINS = new Set(["user", "legacy-migration", "inference-gate", "observation", "unspecified"]);
 const CATALOG_DISPOSITIONS = new Set(["enabled", "paused", "rejected"]);
@@ -845,6 +845,19 @@ class AutomationDatabase {
       items = filtered;
     }
     const itemById = new Map(items.map((item) => [item.id, item]));
+    const productionModes = byType("production-mode").map((summary) => {
+      const mode = planningPayload(summary);
+      if (!mode || !itemById.has(String(mode.producerItemId)) || !(mode.outputs || []).every((output) => itemById.has(String(output.itemId)))) return null;
+      return {
+        producerItemId: String(mode.producerItemId), modeId: String(mode.modeId), energyCost: Number(mode.energyCost),
+        unlocked: mode.unlocked !== false, switchEntry: mode.switchEntry ? { ...mode.switchEntry } : { status: "unknown", method: null },
+        humanLocked: !!mode.humanLocked, inferred: summary.status === "provisional", repositoryRevision: summary.revision,
+        drops: (mode.outputs || []).map((output) => {
+          const item = itemById.get(String(output.itemId));
+          return { itemId: String(output.itemId), count: Number(output.count), probability: Number(output.probability), chainId: item.chainId, level: item.level, baseUnits: item.baseUnits };
+        }),
+      };
+    }).filter(Boolean);
     const producers = byType("production-profile").map((summary) => {
       const profile = planningPayload(summary);
       const planningDistribution = profile?.planningDistribution || profile?.theoreticalDistribution;
@@ -862,6 +875,7 @@ class AutomationDatabase {
         }),
         inferred: summary.status === "provisional",
         repositoryRevision: summary.revision,
+        modes: productionModes.filter((mode) => mode.producerItemId === String(profile.producerItemId)).sort((left, right) => left.modeId.localeCompare(right.modeId)),
       };
     }).filter(Boolean);
     const chains = [...new Set(items.map((item) => item.chainId).filter(Boolean))].sort().map((chainId) => {

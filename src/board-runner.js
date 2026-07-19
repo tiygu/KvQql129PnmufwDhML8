@@ -1,10 +1,12 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
+const { productionModeRuntimeHelpersPrelude } = require("./production-mode-runtime");
 
 const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
   ${runtimePrelude(false)}
   const safe = (fn, fallback = null) => { try { return fn(); } catch (_) { return fallback; } };
+  ${productionModeRuntimeHelpersPrelude()}
   const taskManager = (runtime?.mManagers || []).find((manager) => manager?.clientTaskDataMap instanceof Map);
   const orders = [];
   const requiredCounts = new Map();
@@ -40,7 +42,10 @@ const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
     level: safe(() => grid.item.itemConfig.Level, null),
     mergeTarget: safe(() => grid.item.itemConfig.MergeTarget, null),
     produceCount: safe(() => grid.item.produceCount, null),
-    energyCost: safe(() => grid.item.itemConfig.EnergyCost, null)
+    energyCost: safe(() => grid.item.itemConfig.EnergyCost, null),
+    currentProductionModeId: productionModeCurrentFor(grid),
+    availableProductionModes: productionModesFor(grid),
+    productionModeSwitchEntry: { status: productionModeSwitchMethod ? "available" : "unavailable", method: productionModeSwitchMethod }
   });
   const boardGrids = grids.map(describe);
   const groups = new Map();
@@ -106,14 +111,18 @@ function runtimePrelude(requireVisible = true) {
   `;
 }
 
-function buildAtomicProducerTouchExpression(index) {
+function buildAtomicProducerTouchExpression(index, expectedProductionModeId = null) {
   const gridIndex = Number(index);
   if (!Number.isInteger(gridIndex)) throw new Error("producer index must be an integer");
+  const expectedMode = JSON.stringify(expectedProductionModeId == null ? null : String(expectedProductionModeId));
   return `(() => {${runtimePrelude()}
     const grid = grids[${gridIndex}];
     if (!grid?.item || typeof grid.item.produceCount !== "number" || Number(grid.item.itemConfig?.EnergyCost || 0) <= 0) {
       return { ok: false, reason: "selected_grid_is_not_producer", index: ${gridIndex} };
     }
+    ${productionModeRuntimeHelpersPrelude()}
+    const expectedModeId=${expectedMode},currentModeId=productionModeCurrentFor(grid);
+    if(expectedModeId!=null&&currentModeId!==expectedModeId)return{ok:false,reason:"production_mode_mismatch",index:${gridIndex},expectedModeId,currentModeId};
     const selectedBefore = boardView._touchHandler?.currentSelectedBoardGrid?.index ?? null;
     boardView.onTouch(grid.center);
     return { ok: true, type: "producer-touch", index: grid.index, itemId: String(grid.itemId || ""), selectedBefore };
@@ -217,17 +226,21 @@ class BoardAutomationRunner {
         if (state.empty <= 0) { stopReason = "board_full"; break; }
         let touches = 1;
         const uncertainAction = { type: "producer-touch", producer: selectedProducer.index };
-        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index), uncertainAction, "producer_touch_rejected");
+        const expectedModeId = options.plannedAction?.productionModeId ?? null;
+        if (expectedModeId != null && String(selectedProducer.currentProductionModeId) !== String(expectedModeId)) return { ok: false, executed: false, reason: "production_mode_mismatch", expectedModeId: String(expectedModeId), currentModeId: selectedProducer.currentProductionModeId, actions };
+        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected");
         if (!firstExecution.ok) return { ...firstExecution.failure, actions };
         state = firstExecution.state;
         if (state.signature === before.signature) {
           touches = 2;
-          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index), uncertainAction, "producer_touch_rejected");
+          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected");
           if (!secondExecution.ok) return { ...secondExecution.failure, actions };
           state = secondExecution.state;
         }
         const verified = state.signature !== before.signature;
-        actions.push({ step: step + 1, type: "produce", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, touches, emptyBefore: before.empty, emptyAfter: state.empty, verified });
+        const previousItems = new Map(before.grids.map((grid) => [grid.index, String(grid.itemId || "")]));
+        const actualOutputItemIds = state.grids.filter((grid) => grid.index !== selectedProducer.index && grid.itemId && previousItems.get(grid.index) !== String(grid.itemId)).map((grid) => String(grid.itemId));
+        actions.push({ step: step + 1, type: "produce", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, productionModeId: expectedModeId ?? selectedProducer.currentProductionModeId ?? null, actualOutputItemIds, touches, emptyBefore: before.empty, emptyAfter: state.empty, verified });
         if (!verified) { stopReason = "no_state_change"; break; }
       }
       if (!state?.ok) { stopReason = state?.reason || "state_read_failed"; break; }

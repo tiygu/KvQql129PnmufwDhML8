@@ -277,3 +277,39 @@ test("failed warehouse retrieval performs no later board action", async () => {
   assert.equal(result.reason, "warehouse-retrieval-not-observed");
   assert.equal(boardActions, 0);
 });
+
+test("observation mode suggests a production-mode switch without executing it", async () => {
+  let switches = 0, productions = 0;
+  const action = { type: "switch-production-mode", producer: 4, producerItemId: "p", currentModeId: "single", productionModeId: "quad" };
+  const target = { slot: "a", feasible: true, actionable: true, nextAction: action, producerSteps: [{ gridIndex: 4, productionModeId: "quad" }] };
+  const loop = new OrderCoinLoop({
+    allowProductionModeSwitch: false,
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 3, mergeCandidates: [] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async () => ({ plans: [target], recommended: target }),
+    switchProductionMode: async () => { switches += 1; return { ok: true }; },
+    runBoardAction: async () => { productions += 1; return { ok: true, actions: [] }; }, submitOrder: async () => ({ ok: true }),
+  });
+  const result = await loop.run({ execute: true, maxActions: 1 });
+  assert.equal(result.reason, "production-mode-switch-awaiting-execution-boundary");
+  assert.deepEqual(result.nextAction, action);
+  assert.equal(switches, 0);
+  assert.equal(productions, 0);
+});
+
+test("verified production-mode switch replans while failed switch stops before production", async () => {
+  const action = { type: "switch-production-mode", producer: 4, producerItemId: "p", currentModeId: "single", productionModeId: "quad" };
+  const target = { slot: "a", feasible: true, actionable: true, nextAction: action, producerSteps: [{ gridIndex: 4, productionModeId: "quad" }] };
+  let switches = 0, productions = 0;
+  const loop = new OrderCoinLoop({
+    allowProductionModeSwitch: true,
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 3, mergeCandidates: [] }, orders: [{ slot: "a", ready: false }] }),
+    planOrders: async () => ({ plans: [target], recommended: target }),
+    switchProductionMode: async () => { switches += 1; return { ok: false, reason: "production-mode-switch-not-observed" }; },
+    runBoardAction: async () => { productions += 1; return { ok: true, actions: [{ type: "produce" }] }; }, submitOrder: async () => ({ ok: true }),
+  });
+  const result = await loop.run({ execute: true, maxActions: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "production-mode-switch-not-observed");
+  assert.equal(switches, 1);
+  assert.equal(productions, 0);
+});

@@ -25,6 +25,7 @@ const { migrateLegacyCatalog } = require("./catalog-migration");
 const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./catalog-review-gate");
 const { PauseGate } = require("./pause-gate");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
+const { ProductionModeExecutor } = require("./production-mode-actions");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
@@ -440,6 +441,10 @@ class AutomationRuntime {
       try {
         const observed = new Set(collectPassiveCatalogEvidence(this.database, { state: pendingState }));
         for (const diff of pendingDiffs) for (const objectId of collectPassiveCatalogEvidence(this.database, { actionDiff: diff })) observed.add(objectId);
+        const productionModeIds = [...observed].filter((key) => key.startsWith("production-mode:")).map((key) => key.slice("production-mode:".length));
+        if (productionModeIds.length) {
+          for (const object of this.catalogGate.evaluateAll({ objectIds: productionModeIds })) this.emit("catalog-state-updated", { object });
+        }
         if (observed.size) this.emit("catalog-passive-evidence", { objects: [...observed] });
       } catch (error) {
         this.emit("catalog-passive-evidence-error", { error: error.message });
@@ -556,7 +561,8 @@ class AutomationRuntime {
     const navigator = new SceneNavigator({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const mapCompleter = new MapMissionCompleter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs, onInventoryKnowledgeInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason) });
-    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation" }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }) });
+    const productionModes = new ProductionModeExecutor({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
+    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation" }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
     let sequence = 0;
     return new FullAutomationLoop({
       collectState,

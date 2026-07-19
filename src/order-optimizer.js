@@ -2,6 +2,7 @@
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
 const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates } = require("./space-planner");
+const { selectProductionMode } = require("./production-modes");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -38,6 +39,7 @@ const EVIDENCE_FIELDS = Object.freeze({
   "item-identity": ["itemId", "chainId", "level", "baseUnits"],
   "merge-relation": ["itemId", "chainId", "level", "mergeTarget"],
   "production-profile": ["producerItemId", "energyCost", "planningDistribution"],
+  "production-mode": ["producerItemId", "modeId", "energyCost", "outputs", "unlocked", "switchEntry", "humanLocked"],
 });
 
 function makeEvidenceBlocker(objectType, objectId, object = null) {
@@ -47,11 +49,11 @@ function makeEvidenceBlocker(objectType, objectId, object = null) {
     fields,
     requiredEvidence: ["structured-runtime", "human-ruling"],
     reviewTarget: { objectType, objectId: String(objectId) },
-    scanAction: { type: "active-catalog-scan", itemId: String(objectId) },
+    scanAction: { type: "active-catalog-scan", itemId: objectType === "production-mode" ? String(objectId).split(":")[0] : String(objectId) },
   };
 }
 
-function catalogEvidenceBlock(catalog, orderSlot, itemIds, producerItemIds = []) {
+function catalogEvidenceBlock(catalog, orderSlot, itemIds, producerItemIds = [], productionModeIds = []) {
   const objects = new Map((catalog.evidence?.objects || []).map((object) => [`${object.objectType}:${object.objectId}`, object]));
   const blockers = [];
   const add = (objectType, objectId) => {
@@ -66,6 +68,7 @@ function catalogEvidenceBlock(catalog, orderSlot, itemIds, producerItemIds = [])
     add("merge-relation", itemId);
   }
   for (const producerItemId of producerItemIds) add("production-profile", producerItemId);
+  for (const productionModeId of productionModeIds) add("production-mode", productionModeId);
   return blockers.length ? { orderSlot: String(orderSlot), blockers } : null;
 }
 
@@ -177,27 +180,59 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     }
     const remaining = new Map([...demands].map(([chainId, demand]) => [chainId, demand.deficitUnits]));
     const producerSteps = new Map();
+    const productionModeEvidenceGaps = new Set();
+    let productionModeLockBlocked = false;
     let guard = 0;
     while ([...remaining.values()].some((value) => value > 1e-9) && guard++ < 100000) {
       let best = null;
       for (const producer of boardProducers) {
+        const availableModeIds = new Set((producer.grid.availableProductionModes || []).filter((mode) => mode.unlocked !== false).map((mode) => String(mode.modeId)));
+        const switchTrusted = producer.grid.productionModeSwitchEntry?.status === "available";
+        const modeAwareRuntime = producer.grid.currentProductionModeId != null && availableModeIds.size > 0;
+        const configuredModes = producer.config.modes || [];
+        const hasHumanLock = configuredModes.some((mode) => mode.humanLocked);
+        const selectableModes = configuredModes
+          .filter((mode) => hasHumanLock ? mode.humanLocked : String(mode.modeId) === String(producer.grid.currentProductionModeId) || (switchTrusted && availableModeIds.has(String(mode.modeId))))
+          .map((mode) => {
+            const runtimeSelectable = String(mode.modeId) === String(producer.grid.currentProductionModeId) || (switchTrusted && availableModeIds.has(String(mode.modeId)));
+            return { ...mode, unlocked: mode.unlocked !== false && runtimeSelectable };
+          });
+        const modeDecision = selectProductionMode({
+          producer: { ...producer.config, modes: selectableModes }, currentModeId: producer.grid.currentProductionModeId,
+          demands: [...demands.values()].map((demand) => ({ ...demand, deficitUnits: remaining.get(demand.chainId) || 0 })),
+          board: normalizedState?.board || { occupied: observableGrids.length, capacity: observableGrids.length },
+        });
+        if (modeAwareRuntime && !modeDecision) {
+          productionModeEvidenceGaps.add(`${producer.config.itemId}:${producer.grid.currentProductionModeId}`);
+          continue;
+        }
+        if (modeDecision?.executable === false) {
+          if (modeDecision.reason === "human-mode-lock-infeasible") productionModeLockBlocked = true;
+          continue;
+        }
+        const effectiveConfig = modeDecision ? { ...producer.config, energyCost: modeDecision.mode.energyCost, drops: modeDecision.mode.drops } : producer.config;
         const contribution = new Map();
         let usefulUnits = 0;
-        for (const drop of producer.config.drops || []) {
+        for (const drop of effectiveConfig.drops || []) {
           const deficit = remaining.get(drop.chainId) || 0;
           if (deficit <= 0 || !drop.baseUnits) continue;
-          const expected = Number(drop.probability) * Number(drop.baseUnits);
+          const expected = Number(drop.probability) * Number(drop.count ?? drop.weight ?? 1) * Number(drop.baseUnits);
           contribution.set(drop.chainId, (contribution.get(drop.chainId) || 0) + expected);
           usefulUnits += Math.min(deficit, expected);
         }
-        const score = usefulUnits / Math.max(1, Number(producer.config.energyCost || 1));
-        if (score > 0 && (!best || score > best.score)) best = { producer, contribution, score };
+        const score = usefulUnits / Math.max(1, Number(effectiveConfig.energyCost || 1));
+        if (score > 0 && (!best || score > best.score)) best = { producer, contribution, score, modeDecision, effectiveConfig };
       }
       if (!best) break;
-      const key = `${best.producer.grid.index}:${best.producer.config.itemId}`;
-      const step = producerSteps.get(key) || { gridIndex: best.producer.grid.index, producerItemId: best.producer.config.itemId, clicks: 0, energy: 0 };
+      const key = `${best.producer.grid.index}:${best.producer.config.itemId}:${best.modeDecision?.mode.modeId ?? "current"}`;
+      const step = producerSteps.get(key) || {
+        gridIndex: best.producer.grid.index, producerItemId: best.producer.config.itemId, clicks: 0, energy: 0,
+        currentProductionModeId: best.producer.grid.currentProductionModeId,
+        productionModeId: best.modeDecision?.mode.modeId ?? best.producer.grid.currentProductionModeId ?? null,
+        productionModeDecision: best.modeDecision ? { metrics: best.modeDecision.metrics, reason: best.modeDecision.reason, shouldSwitch: best.modeDecision.shouldSwitch } : null,
+      };
       step.clicks += 1;
-      step.energy += Number(best.producer.config.energyCost || 1);
+      step.energy += Number(best.effectiveConfig.energyCost || 1);
       producerSteps.set(key, step);
       for (const [chainId, expected] of best.contribution) remaining.set(chainId, Math.max(0, (remaining.get(chainId) || 0) - expected));
     }
@@ -210,10 +245,11 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     const feasible = supplyFeasible && (steps.length > 0 || mergeAvailable);
     const hasUnavailableSupply = [...demands.values()].some((demand) => demand.unavailableUnits > 0 && demand.deficitUnits > 0);
     const unclassifiedProducerItemIds = executableGrids.filter((grid) => grid.produceCount != null && Number(grid.energyCost) > 0 && !producerById.has(String(grid.itemId))).map((grid) => String(grid.itemId));
-    let evidenceBlock = catalogEvidenceBlock(catalog, task.slot, missingCatalogItemIds, unresolvedChains.length ? unclassifiedProducerItemIds : []);
+    let evidenceBlock = catalogEvidenceBlock(catalog, task.slot, missingCatalogItemIds, unresolvedChains.length ? unclassifiedProducerItemIds : [], [...productionModeEvidenceGaps]);
     if (missingCatalogItemIds.length && !evidenceBlock) evidenceBlock = { orderSlot: String(task.slot), blockers: missingCatalogItemIds.map((itemId) => makeEvidenceBlocker("merge-relation", itemId)) };
     const blockingReason = feasible ? null
       : evidenceBlock ? "catalog-evidence-insufficient"
+        : productionModeLockBlocked ? "production-mode-human-lock-unavailable"
         : hasUnavailableSupply ? "inventory-unavailable"
           : unresolvedChains.length > 0 ? "no-executable-producer"
             : "no-executable-action";
@@ -249,12 +285,20 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       plan.boardSpaceFeasibility = spacePlan.boardSpaceFeasibility;
       plan.explanation = spacePlan.explanation;
       plan.pathScore = spacePlan.score || null;
+      if (plan.blockingReason === "production-mode-human-lock-unavailable") {
+        plan.nextAction = null;
+        plan.feasible = false;
+        plan.actionable = false;
+        plan.explanation = "Human Catalog Ruling locks a production mode that is not currently executable; algorithmic mode switching is blocked.";
+        continue;
+      }
       if (spacePlan.status === "planned") {
         plan.actionable = true;
         if (!plan.evidenceBlock && plan.blockingReason !== "inventory-unavailable") plan.feasible = true;
         if (!plan.ready && Number.isFinite(spacePlan.energyRequired)) {
-          plan.estimatedEnergy = spacePlan.energyRequired;
-          plan.efficiency = spacePlan.energyRequired > 0 ? plan.rewardCoins / spacePlan.energyRequired : 0;
+          const selectedModeEnergy = plan.producerSteps.some((step) => step.productionModeId) ? plan.producerSteps.reduce((sum, step) => sum + Number(step.energy || 0), 0) : null;
+          plan.estimatedEnergy = selectedModeEnergy ?? spacePlan.energyRequired;
+          plan.efficiency = plan.estimatedEnergy > 0 ? plan.rewardCoins / plan.estimatedEnergy : 0;
         }
       } else if (normalizedState.board.spaceKnown && spacePlan.reason === "board-space-deadlock") {
         plan.feasible = false;
@@ -277,6 +321,21 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
         plan.actionable = true;
         plan.blockingReason = null;
         plan.explanation = "Trusted warehouse supply can be retrieved through the native click path; replan after observing its actual landing.";
+      }
+      const modeStep = plan.producerSteps.find((step) => Number(step.gridIndex) === Number(plan.nextAction?.producer)) || plan.producerSteps[0];
+      if (modeStep?.productionModeDecision?.metrics && plan.boardSpaceFeasibility) {
+        plan.boardSpaceFeasibility.peakOccupied = Math.max(Number(plan.boardSpaceFeasibility.peakOccupied || 0), Number(modeStep.productionModeDecision.metrics.peakOccupied || 0));
+      }
+      if (!retrieveCandidates.length && modeStep?.productionModeId && (plan.nextAction?.type === "produce" || (!plan.nextAction && plan.feasible))) {
+        if (String(modeStep.currentProductionModeId) !== String(modeStep.productionModeId)) {
+          plan.nextAction = {
+            type: "switch-production-mode", producer: modeStep.gridIndex, producerItemId: modeStep.producerItemId,
+            currentModeId: modeStep.currentProductionModeId, productionModeId: modeStep.productionModeId,
+            decision: modeStep.productionModeDecision,
+          };
+        } else if (plan.nextAction?.type === "produce") {
+          plan.nextAction = { ...plan.nextAction, productionModeId: modeStep.productionModeId, productionModeDecision: modeStep.productionModeDecision };
+        }
       }
     }
   }

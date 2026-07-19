@@ -50,6 +50,23 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
   };
   for (const grid of state?.board?.grids || []) addObservedItem(grid.itemId, grid, "board-state");
   for (const order of state?.orders || []) for (const item of order.items || []) addObservedItem(item.itemId, item, "order-state");
+  for (const producer of state?.producers || []) {
+    const producerItemId = String(producer.itemId || "");
+    if (!producerItemId) continue;
+    for (const mode of producer.availableProductionModes || []) {
+      const modeId = String(mode.modeId);
+      const current = String(producer.currentProductionModeId) === modeId;
+      addObservation({
+        objectType: "production-mode", objectId: `${producerItemId}:${modeId}`,
+        payload: {
+          producerItemId, modeId, energyCost: current ? Number(producer.energyCost) : null, outputs: [],
+          unlocked: mode.unlocked !== false, current,
+          switchEntry: producer.productionModeSwitchEntry || { status: "unknown", method: null },
+        },
+        sourceType: "passive-runtime", sourceRef: `board-production-mode:${producer.index}:${modeId}`, countDuplicate: false,
+      });
+    }
+  }
 
   if (actionDiff?.type === "merge" && actionDiff.itemId != null && actionDiff.actualTarget != null) {
     addObservedItem(actionDiff.itemId, actionDiff, "action-diff:merge-source");
@@ -71,6 +88,20 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
       objectType: "production-profile", objectId: producerItemId,
       payload: { ...(existing?.effectiveValue || existing?.algorithmCandidate || {}), producerItemId, latestObservedOutputItemId: outputItemId },
       sourceType: "passive-action-diff", sourceRef: "verified-production", countDuplicate: false,
+    });
+  }
+  if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.producerItemId != null && actionDiff.productionModeId != null && actionDiff.actualOutputItemIds?.length) {
+    const producerItemId = String(actionDiff.producerItemId), modeId = String(actionDiff.productionModeId);
+    const counts = new Map(actionDiff.actualOutputItemIds.map(String).map((itemId) => [itemId, 0]));
+    for (const itemId of actionDiff.actualOutputItemIds.map(String)) counts.set(itemId, (counts.get(itemId) || 0) + 1);
+    const existing = existingObject("production-mode", `${producerItemId}:${modeId}`);
+    addObservation({
+      objectType: "production-mode", objectId: `${producerItemId}:${modeId}`,
+      payload: {
+        ...(existing?.effectiveValue || existing?.algorithmCandidate || {}), producerItemId, modeId,
+        outputs: [...counts].map(([itemId, count]) => ({ itemId, count, probability: 1 })),
+      },
+      sourceType: "verified-production-mode", sourceRef: `verified-production-mode:${producerItemId}:${modeId}`,
     });
   }
   if (!observations.length) return [];

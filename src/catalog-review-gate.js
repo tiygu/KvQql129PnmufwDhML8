@@ -6,6 +6,7 @@ const { canonicalJson } = require("./canonical-json");
 const STRUCTURED_SOURCES = new Set(["runtime-capture", "structured-runtime", "legacy-migration"]);
 const STRUCTURAL_INFERENCE_SOURCES = new Set(["structural-inference"]);
 const VISUAL_EVIDENCE_SOURCES = new Set(["visual-evidence", "screenshot-evidence"]);
+const VERIFIED_MODE_SOURCE = "verified-production-mode";
 
 function currentPayload(object) {
   return object?.activeVersion?.payload || object?.candidateVersion?.payload || object?.versions?.at(-1)?.payload || {};
@@ -44,6 +45,20 @@ function profilePayload(payload) {
   };
 }
 
+function modePayload(payload) {
+  return {
+    producerItemId: String(payload.producerItemId ?? payload.itemId ?? ""),
+    modeId: String(payload.modeId ?? ""),
+    energyCost: Number(payload.energyCost),
+    outputs: (payload.outputs || payload.drops || []).map((output) => ({
+      itemId: String(output.itemId ?? ""), count: Number(output.count ?? output.weight ?? 0), probability: Number(output.probability ?? 1),
+    })),
+    unlocked: payload.unlocked !== false,
+    switchEntry: payload.switchEntry ? { status: payload.switchEntry.status || "unknown", method: payload.switchEntry.method ?? null } : { status: "unknown", method: null },
+    humanLocked: !!payload.humanLocked,
+  };
+}
+
 class CatalogReviewGate {
   constructor(database) {
     this.database = database;
@@ -54,19 +69,20 @@ class CatalogReviewGate {
   }
 
   _structuredEvidence(evidence) {
-    return [...evidence].reverse().find((item) => STRUCTURED_SOURCES.has(item.sourceType)) || null;
+    return [...evidence].reverse().find((item) => STRUCTURED_SOURCES.has(item.sourceType) || (item.sourceType === VERIFIED_MODE_SOURCE && Number(item.observationCount) >= 2)) || null;
   }
 
   _provisionalEvidence(evidence) {
     return [...evidence].reverse().find((item) => STRUCTURAL_INFERENCE_SOURCES.has(item.sourceType))
       || [...evidence].reverse().find((item) => VISUAL_EVIDENCE_SOURCES.has(item.sourceType))
+      || [...evidence].reverse().find((item) => item.sourceType === VERIFIED_MODE_SOURCE)
       || null;
   }
 
   _recordEvidenceConflict(object, evidence) {
     const normalize = object.objectType === "item-identity" ? identityPayload
       : object.objectType === "merge-relation" ? relationPayload
-        : profilePayload;
+        : object.objectType === "production-mode" ? modePayload : profilePayload;
     const latestBySourceType = new Map();
     for (const item of evidence) latestBySourceType.set(item.sourceType, item);
     const payloads = new Map();
@@ -127,6 +143,23 @@ class CatalogReviewGate {
       return { status: "observed", payload, reason: "relation-inconsistent" };
     }
 
+    if (object.objectType === "production-mode") {
+      const payload = modePayload(selected.payload);
+      const objectMatches = object.objectId === `${payload.producerItemId}:${payload.modeId}`;
+      const producerIdentity = this.database.getCatalogObject("item-identity", payload.producerItemId);
+      const outputsActive = payload.outputs.every((output) => {
+        const identity = this.database.getCatalogObject("item-identity", output.itemId);
+        return identity?.status === "active" && identity.disposition === "enabled";
+      });
+      const valid = objectMatches && payload.producerItemId && payload.modeId && Number.isFinite(payload.energyCost) && payload.energyCost >= 0
+        && payload.outputs.length > 0 && payload.outputs.every((output) => output.itemId && Number.isFinite(output.count) && output.count > 0 && Number.isFinite(output.probability) && output.probability > 0 && output.probability <= 1)
+        && ["available", "unavailable"].includes(payload.switchEntry.status);
+      const dependenciesActive = producerIdentity?.status === "active" && producerIdentity.disposition === "enabled" && outputsActive;
+      if (structured && valid && dependenciesActive) return { status: "active", payload, reason: "structured-runtime-consistent:production-mode" };
+      if ((provisional || selected.sourceType === "historic-action") && valid) return { status: "provisional", payload, reason: `provisional-only-source:${selected.sourceType}` };
+      return { status: "observed", payload, reason: valid ? "production-mode-dependencies-inactive" : "production-mode-inconsistent" };
+    }
+
     const payload = profilePayload(selected.payload);
     const outcomes = Array.isArray(payload.theoreticalDistribution?.outcomes) ? payload.theoreticalDistribution.outcomes : [];
     const sampleSize = Number(payload.theoreticalDistribution?.sampleSpaceSize);
@@ -182,4 +215,4 @@ function buildPlanningCatalogFromRepository(database, legacyCatalog, { includePr
   return database.getCatalogProjection({ includeProvisional });
 }
 
-module.exports = { CatalogReviewGate, buildPlanningCatalogFromRepository, identityPayload, relationPayload, profilePayload };
+module.exports = { CatalogReviewGate, buildPlanningCatalogFromRepository, identityPayload, relationPayload, profilePayload, modePayload };
