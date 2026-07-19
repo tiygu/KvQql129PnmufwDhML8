@@ -53,6 +53,7 @@ class FullAutomationLoop {
       if (result.ok && (result.reason === "evidence-waiting" || String(result.reason || "").startsWith("waiting-"))) {
         return { ok: true, executed: true, reason: result.reason, state, actions, orderCycle: result };
       }
+      if (result.ok && result.reason === "energy-depleted") return { ok: true, executed: true, reason: "energy-depleted", state, actions, orderCycle: result };
       const action = result.actions?.[0] || { type: "order-cycle", ok: result.ok, reason: result.reason };
       actions.push(action);
       this.onEvent?.(action);

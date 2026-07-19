@@ -96,6 +96,7 @@ export const controlApi = {
   stopConnection: () => post("/api/connection/stop"),
   preview: (options: any) => post("/api/automation/preview", options),
   start: (options: any) => post("/api/automation/start", options),
+  startIdle: (options: any) => post("/api/automation/idle/start", options),
   stop: () => post("/api/automation/stop"),
   pause: () => post("/api/automation/pause"),
   resume: () => post("/api/automation/resume"),

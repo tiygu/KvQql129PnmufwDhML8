@@ -1257,6 +1257,12 @@ class AutomationDatabase {
     this.db.prepare("UPDATE automation_sessions SET ended_at=?, status=? WHERE id=?").run(new Date().toISOString(), String(status), Number(sessionId));
   }
 
+  listSessions(limit = 50) {
+    return this.db.prepare("SELECT * FROM automation_sessions ORDER BY id DESC LIMIT ?").all(Math.max(1, Math.min(500, Number(limit) || 50))).map((row) => ({
+      id: Number(row.id), mode: row.mode, startedAt: row.started_at, endedAt: row.ended_at, status: row.status, settings: JSON.parse(row.settings_json || "{}"),
+    }));
+  }
+
   setSetting(key, value) {
     this.db.prepare("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at")
       .run(String(key), JSON.stringify(value), new Date().toISOString());

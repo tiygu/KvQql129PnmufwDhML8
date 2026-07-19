@@ -28,6 +28,7 @@ const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { ProductionModeExecutor } = require("./production-mode-actions");
 const { SaleActionExecutor } = require("./sale-actions");
 const { normalizeSalePolicy } = require("./sale-policy");
+const { IdleAutomationSession } = require("./idle-automation-session");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
@@ -63,6 +64,8 @@ class AutomationRuntime {
     this.pauseGate = new PauseGate();
     this.activeSessionId = null;
     this.activeRunPromise = null;
+    this.idleSession = null;
+    this.sessionKind = null;
     this.actionBoundaryPending = false;
     this.passiveCatalogState = null;
     this.passiveCatalogDiffs = [];
@@ -488,12 +491,15 @@ class AutomationRuntime {
       connected,
       connectionError,
       running: this.running,
+      sessionKind: this.sessionKind,
+      idle: this.sessionKind === "idle",
       paused: this.pauseGate.paused,
       state,
       plan,
       catalog: { revision: planningCatalog.revision, ...planningCatalog.stats },
       catalogView: this.getCatalogView({ includeRepositoryObjects: false }),
       actions: this.database.listRecentActions(60),
+      sessions: this.database.listSessions(30),
       resourceSamples: this.database.listResourceSamples(120),
       connectionRoute,
     };
@@ -660,6 +666,7 @@ class AutomationRuntime {
     this.pauseGate.reset();
     this.abortController = new AbortController();
     const sessionId = this.database.startSession("automatic", options);
+    this.sessionKind = "bounded";
     this.activeSessionId = sessionId;
     this.emit("automation-status", { running: true, paused: false, sessionId });
     try {
@@ -675,6 +682,7 @@ class AutomationRuntime {
       this.abortController = null;
       this.pauseGate.reset();
       this.activeSessionId = null;
+      this.sessionKind = null;
       this.emit("automation-status", { running: false, paused: false, sessionId });
     }
   }
@@ -698,9 +706,58 @@ class AutomationRuntime {
     return { ok: true, accepted: true, reason: "automation-started" };
   }
 
+  async startIdle(options = {}) {
+    if (this.running || this.actionBoundaryPending) throw new Error("automation task is already running");
+    const settings = { ...this.getSettings(), ...options, mode: options.mode === "observation" ? "assisted" : options.mode || "assisted" };
+    this.running = true;
+    this.sessionKind = "idle";
+    this.pauseGate.reset();
+    this.abortController = new AbortController();
+    const sessionId = this.database.startSession("idle", { explicitUserAction: true, persistence: "process-local", ...settings });
+    this.activeSessionId = sessionId;
+    let idleSequence = 0;
+    this.idleSession = new IdleAutomationSession({
+      ensureConnection: () => this.connect(),
+      collectState: () => this.collectState(),
+      planState: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }),
+      runBoundedSession: ({ signal }) => this.createRuntime(settings, sessionId).run({ execute: true, maxActions: null, signal }),
+      waitIfPaused: (signal) => this.pauseGate.wait(signal),
+      onEvent: (event) => {
+        this.database.logAction({ sessionId, sequence: ++idleSequence, type: event.type, reason: event.reason, ok: event.ok, details: event });
+        this.emit(event.type, event);
+      },
+    });
+    this.emit("automation-status", { running: true, paused: false, idle: true, sessionKind: "idle", sessionId });
+    try {
+      const result = await this.idleSession.run({ signal: this.abortController.signal });
+      this.database.endSession(sessionId, result.reason === "aborted" ? "stopped" : result.ok ? "complete" : "failed");
+      return result;
+    } catch (error) {
+      this.database.endSession(sessionId, "error");
+      throw error;
+    } finally {
+      this.running = false;
+      this.abortController = null;
+      this.idleSession = null;
+      this.pauseGate.reset();
+      this.activeSessionId = null;
+      this.sessionKind = null;
+      this.emit("automation-status", { running: false, paused: false, idle: false, sessionKind: null, sessionId });
+    }
+  }
+
+  startIdleInBackground(options = {}) {
+    if (this.activeRunPromise || this.running) return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
+    this.activeRunPromise = this.startIdle(options).then((result) => { this.emit("automation-complete", { result }); return result; })
+      .catch((error) => { this.emit("automation-error", { error: error?.message || String(error) }); return { ok: false, reason: "automation-error", error: error?.message || String(error) }; })
+      .finally(() => { this.activeRunPromise = null; });
+    return { ok: true, accepted: true, reason: "idle-automation-started" };
+  }
+
   stop() {
     if (!this.abortController) return { ok: true, alreadyStopped: true };
     this.pauseGate.resume();
+    this.idleSession?.interruptWait("stop");
     this.abortController.abort();
     return { ok: true, alreadyStopped: false };
   }
@@ -708,6 +765,7 @@ class AutomationRuntime {
   pause() {
     if (!this.running) return { ok: false, reason: "automation-not-running", paused: false };
     const result = this.pauseGate.pause();
+    this.idleSession?.interruptWait("pause");
     this.emit("automation-status", { running: true, paused: true });
     return result;
   }
@@ -716,6 +774,7 @@ class AutomationRuntime {
     if (!this.running) return { ok: false, reason: "automation-not-running", paused: false };
     if (this.actionBoundaryPending) return { ok: false, reason: "safe-boundary-task-running", paused: true };
     const result = this.pauseGate.resume();
+    this.idleSession?.interruptWait("resume");
     this.emit("automation-status", { running: true, paused: false });
     return result;
   }
