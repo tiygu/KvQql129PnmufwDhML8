@@ -20,6 +20,7 @@ function identityPayload(item) {
     chainId: String(item.chainId),
     iconResourceIdentifier: item.iconResource ?? null,
     iconEvidenceStatus: "missing",
+    saleValue: Number(item.saleValue ?? item.price ?? 0),
     ...(item.inferred ? { inferenceBasis: inferenceBasis(item) } : {}),
   };
 }

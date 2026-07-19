@@ -26,6 +26,8 @@ const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./cat
 const { PauseGate } = require("./pause-gate");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { ProductionModeExecutor } = require("./production-mode-actions");
+const { SaleActionExecutor } = require("./sale-actions");
+const { normalizeSalePolicy } = require("./sale-policy");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
@@ -481,7 +483,7 @@ class AutomationRuntime {
       this.ensureConnectionRoute().catch((error) => this.emit("connection-route-error", { error: error.message }));
     }
     const planningCatalog = this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode });
-    const plan = buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot });
+    const plan = buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode });
     return {
       connected,
       connectionError,
@@ -506,6 +508,7 @@ class AutomationRuntime {
       strategy: "efficiency",
       prioritySlot: null,
       fontScale: 1.1,
+      salePolicy: { automaticEnabled: false, rules: [] },
     };
     const merged = { ...defaults, ...this.database.getSetting("automation", {}) };
     delete merged.maxActions;
@@ -521,6 +524,7 @@ class AutomationRuntime {
       strategy: ["efficiency", "min-energy", "fastest", "specified"].includes(settings.strategy) ? settings.strategy : "efficiency",
       prioritySlot: settings.prioritySlot == null || settings.prioritySlot === "" ? null : String(settings.prioritySlot),
       fontScale: Math.max(0.9, Math.min(1.4, Number(settings.fontScale) || 1.1)),
+      salePolicy: normalizeSalePolicy(settings.salePolicy || {}),
     };
     this.database.setSetting("automation", normalized);
     this.emit("settings-updated", { settings: normalized });
@@ -565,7 +569,7 @@ class AutomationRuntime {
     const mapCompleter = new MapMissionCompleter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs, onInventoryKnowledgeInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason) });
     const productionModes = new ProductionModeExecutor({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
+    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot, salePolicy: options.salePolicy, executionMode: options.mode }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
     let sequence = 0;
     return new FullAutomationLoop({
       collectState,
@@ -587,6 +591,36 @@ class AutomationRuntime {
     await this.connect();
     const loop = this.createRuntime(options);
     return loop.run({ execute: false, maxActions: 1 });
+  }
+
+  async executeSaleSuggestion({ sourceIndex, itemId, expectedCoins, confirmed = false } = {}) {
+    const settings = this.getSettings();
+    if (settings.mode !== "assisted") return { ok: false, executed: false, reason: "sale-assisted-mode-required" };
+    if (!confirmed) return { ok: false, executed: false, reason: "sale-confirmation-required" };
+    if (this.running || this.actionBoundaryPending) return { ok: false, executed: false, reason: "automation-action-boundary-busy" };
+    this.actionBoundaryPending = true;
+    try {
+      await this.connect();
+      const before = await this.collectState();
+      const catalog = this.getPlanningCatalog({ executionMode: "assisted" });
+      const plan = buildOptimizationPlan({ catalog, state: before, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: "assisted" });
+      const suggestion = (plan.saleSuggestions || []).find((candidate) => Number(candidate.sourceIndex) === Number(sourceIndex) && String(candidate.itemId) === String(itemId) && Number(candidate.expectedCoins) === Number(expectedCoins));
+      if (!suggestion) return { ok: false, executed: false, reason: "sale-suggestion-stale-or-unavailable" };
+      const executor = new SaleActionExecutor({ client: this.lab.client, contextId: this.selection.probe.context.id, collectState: () => this.collectState(), settleMs: settings.settleMs });
+      const sessionId = this.database.startSession("assisted-sale", { explicitUserConfirmation: true, suggestion });
+      try {
+        const result = await executor.execute(suggestion, { confirmed: true });
+        this.database.logAction({ sessionId, sequence: 1, type: "sell-item", reason: result.reason, ok: result.ok, before: result.before, after: result.after, details: { suggestion, verification: result.verification } });
+        this.database.endSession(sessionId, result.ok ? "complete" : "failed");
+        this.emit("automation-action", { action: { type: "sell-item", ok: result.ok, reason: result.reason, suggestion } });
+        return result;
+      } catch (error) {
+        this.database.endSession(sessionId, "error");
+        throw error;
+      }
+    } finally {
+      this.actionBoundaryPending = false;
+    }
   }
 
   async completeCurrentMapMission() {

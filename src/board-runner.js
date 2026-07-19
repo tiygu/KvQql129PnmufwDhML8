@@ -43,6 +43,7 @@ const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
     mergeTarget: safe(() => grid.item.itemConfig.MergeTarget, null),
     produceCount: safe(() => grid.item.produceCount, null),
     energyCost: safe(() => grid.item.itemConfig.EnergyCost, null),
+    saleValue: safe(() => grid.item.itemConfig.Price, null),
     currentProductionModeId: productionModeCurrentFor(grid),
     availableProductionModes: productionModesFor(grid),
     productionModeSwitchEntry: { status: productionModeSwitchMethod ? "available" : "unavailable", method: productionModeSwitchMethod }

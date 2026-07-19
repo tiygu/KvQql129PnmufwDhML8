@@ -99,6 +99,7 @@ export const controlApi = {
   stop: () => post("/api/automation/stop"),
   pause: () => post("/api/automation/pause"),
   resume: () => post("/api/automation/resume"),
+  executeSale: (suggestion: any) => post("/api/sale/execute", { ...suggestion, confirmed: true }),
   completeMapMission: () => post("/api/map/complete"),
   getSettings: () => request("/api/settings"),
   saveSettings: (settings: any) => post("/api/settings", settings),

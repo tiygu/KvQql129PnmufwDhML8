@@ -1,9 +1,10 @@
 "use strict";
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
-const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates } = require("./space-planner");
+const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates, buildMergeCandidates } = require("./space-planner");
 const { selectProductionMode, selectableProductionModes } = require("./production-modes");
 const { planStochasticOrder } = require("./stochastic-beam-search");
+const { buildSaleSuggestions, normalizeSalePolicy } = require("./sale-policy");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -73,7 +74,7 @@ function catalogEvidenceBlock(catalog, orderSlot, itemIds, producerItemIds = [],
   return blockers.length ? { orderSlot: String(orderSlot), blockers } : null;
 }
 
-function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficiency", prioritySlot = null }) {
+function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficiency", prioritySlot = null, salePolicy = null, executionMode = "observation" }) {
   const gameState = state?.schemaVersion === 1;
   const tasks = gameState ? (state.orders || []) : (state.tasks || []);
   const grids = gameState ? (state.board?.grids || []) : (boardScan?.grids || []);
@@ -361,6 +362,12 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       : plans.find((plan) => plan.blockingReason === "inventory-unavailable")?.blockingReason
       || plans.find((plan) => plan.blockingReason)?.blockingReason
       || "no-feasible-order";
+  const saleSuggestions = normalizedState ? buildSaleSuggestions(normalizedState, {
+    policy: normalizeSalePolicy(salePolicy || {}),
+    spacePressureUnresolved: !recommended && ["board-space-deadlock", "stochastic-space-risk"].includes(boundaryReason),
+    safeMergeAvailable: buildMergeCandidates(normalizedState).length > 0,
+    warehouseBufferAvailable: warehouseStoreCandidates.length > 0 && normalizedState.warehouse.inventoryKnowledge.exchangeCapacity !== 0,
+  }) : [];
   return {
     generatedAt: new Date().toISOString(),
     energyAvailable: Number.isFinite(energyAvailable) ? energyAvailable : null,
@@ -388,6 +395,8 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     warehouseRetrieveCandidates,
     warehouseInventoryLoadRequired,
     warehouseLoadRequest,
+    saleSuggestions,
+    saleExecutionPolicy: { mode: executionMode, confirmationRequired: true, automaticEnabled: false },
     plans,
     status: allCatalogBlocked ? "evidence-waiting" : recommended ? "ready" : "waiting",
     evidenceBlocks,

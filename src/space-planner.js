@@ -47,6 +47,7 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
       mergeTarget: grid.mergeTarget == null ? itemRecord(catalog, itemId)?.mergeTarget ?? null : String(grid.mergeTarget),
       produceCount: grid.produceCount == null ? null : Number(grid.produceCount),
       energyCost: grid.energyCost == null ? null : Number(grid.energyCost),
+      saleValue: grid.saleValue == null ? null : Number(grid.saleValue),
       currentProductionModeId: grid.currentProductionModeId == null ? null : String(grid.currentProductionModeId),
       availableProductionModes: (grid.availableProductionModes || []).map((mode) => ({ modeId: String(mode.modeId), unlocked: mode.unlocked !== false })),
       productionModeSwitchEntry: grid.productionModeSwitchEntry ? { ...grid.productionModeSwitchEntry } : { status: "unknown", method: null },

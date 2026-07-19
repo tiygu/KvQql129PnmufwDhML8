@@ -21,6 +21,7 @@ function identityPayload(payload) {
     baseUnits: Number(payload.baseUnits ?? (level > 0 ? 2 ** (level - 1) : 0)),
     iconResourceIdentifier: payload.iconResourceIdentifier ?? payload.iconResource ?? null,
     iconEvidenceStatus: payload.iconEvidenceStatus || "missing",
+    saleValue: Number(payload.saleValue ?? payload.price ?? 0),
   };
 }
 

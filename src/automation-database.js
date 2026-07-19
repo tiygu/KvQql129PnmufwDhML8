@@ -935,6 +935,7 @@ class AutomationDatabase {
         iconHash: selectedIcon?.assetHash || null,
         descriptionKey: identity.descriptionKey ?? null,
         itemType: identity.itemType ?? null,
+        saleValue: Number(identity.saleValue || 0),
         inferred: summary.status === "provisional",
         repositoryRevision: summary.revision,
       };

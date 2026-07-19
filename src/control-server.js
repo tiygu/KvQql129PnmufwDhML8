@@ -243,6 +243,7 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/automation/stop") return writeJson(res, 200, runtime.stop());
       if (route === "POST /api/automation/pause") return writeJson(res, 200, runtime.pause());
       if (route === "POST /api/automation/resume") return writeJson(res, 200, runtime.resume());
+      if (route === "POST /api/sale/execute") return writeJson(res, 200, await runtime.executeSaleSuggestion(await readJson(req)));
       if (route === "POST /api/map/complete") return writeJson(res, 200, await runtime.completeCurrentMapMission());
       if (route === "GET /api/settings") return writeJson(res, 200, runtime.getSettings());
       if (route === "POST /api/settings") return writeJson(res, 200, runtime.saveSettings(await readJson(req)));
