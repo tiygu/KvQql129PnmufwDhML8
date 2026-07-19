@@ -11,7 +11,10 @@ const WAREHOUSE_REASONS = Object.freeze({
 });
 
 function unknownWarehouseInventoryKnowledge(reason = null) {
-  return { status: "unknown", totalSlots: null, unlockedSlots: null, occupiedSlots: null, exchangeCapacity: null, reason };
+  return {
+    status: "unknown", totalSlots: null, unlockedSlots: null, occupiedSlots: null, exchangeCapacity: null,
+    revision: null, slots: [], items: [], retrievalPath: { status: "unknown", type: "native-click" }, reason,
+  };
 }
 
 function normalizeWarehouseState(warehouse) {
@@ -23,14 +26,36 @@ function normalizeWarehouseState(warehouse) {
   const unlockedSlots = requestedLoaded ? numberOrNull(explicit?.unlockedSlots ?? warehouse.unlockedSlots) : null;
   const occupiedSlots = requestedLoaded ? numberOrNull(explicit?.occupiedSlots ?? warehouse.occupiedSlots) : null;
   const loaded = requestedLoaded && totalSlots != null && unlockedSlots != null && occupiedSlots != null;
+  const slots = loaded ? (explicit?.slots || warehouse.slots || []).map((slot) => ({
+    slotId: String(slot.slotId ?? slot.gridId ?? ""), itemId: String(slot.itemId ?? slot.item?.itemId ?? ""),
+    occupied: slot.occupied == null ? !!(slot.itemId ?? slot.item) : !!slot.occupied,
+  })) : [];
+  const slotCounts = new Map();
+  for (const slot of slots) if (slot.occupied && slot.itemId) slotCounts.set(slot.itemId, (slotCounts.get(slot.itemId) || 0) + 1);
+  const items = loaded && explicit?.items?.length
+    ? explicit.items.map((item) => ({ itemId: String(item.itemId), count: Math.max(0, Number(item.count) || 0) }))
+    : [...slotCounts].map(([itemId, count]) => ({ itemId, count }));
   return {
     visible: !!warehouse.visible,
     inventoryKnowledge: loaded ? {
       status: "loaded", totalSlots, unlockedSlots, occupiedSlots,
-      exchangeCapacity: Math.max(0, unlockedSlots - occupiedSlots), reason: explicit?.reason ?? null,
+      exchangeCapacity: Math.max(0, unlockedSlots - occupiedSlots),
+      revision: explicit?.revision == null ? null : String(explicit.revision),
+      slots,
+      items,
+      retrievalPath: explicit?.retrievalPath ? { ...explicit.retrievalPath } : { status: "unknown", type: "native-click" },
+      reason: explicit?.reason ?? null,
     } : unknownWarehouseInventoryKnowledge(explicit?.reason ?? null),
     storeAvailability: warehouse.storeAvailability ? { ...warehouse.storeAvailability } : { status: "unknown" },
   };
+}
+
+function warehouseInventoryKnowledgeFromNative(value) {
+  if (!value?.ok) return unknownWarehouseInventoryKnowledge(value?.reason || "warehouse-inventory-unavailable");
+  return normalizeWarehouseState({ inventoryKnowledge: {
+    status: "loaded", totalSlots: value.totalSlots, unlockedSlots: value.unlockedSlots, occupiedSlots: value.occupiedSlots,
+    revision: value.revision, slots: value.slots || [], retrievalPath: { status: "trusted", type: "native-click" },
+  } }).inventoryKnowledge;
 }
 
 function warehouseGridEligibility(grid, { requiredItemIds = null, catalogItemKnown = true } = {}) {
@@ -43,4 +68,4 @@ function warehouseGridEligibility(grid, { requiredItemIds = null, catalogItemKno
   return { eligible: true, reason: null, unavailableReasons: [] };
 }
 
-module.exports = { WAREHOUSE_REASONS, normalizeWarehouseState, unknownWarehouseInventoryKnowledge, warehouseGridEligibility };
+module.exports = { WAREHOUSE_REASONS, normalizeWarehouseState, unknownWarehouseInventoryKnowledge, warehouseGridEligibility, warehouseInventoryKnowledgeFromNative };

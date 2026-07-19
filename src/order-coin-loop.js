@@ -18,17 +18,47 @@ function selectWarehouseCandidate(state) {
 }
 
 class OrderCoinLoop {
-  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
+  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, loadWarehouseInventory = null, retrieveWarehouseItem = null, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
     this.collectState = collectState;
     this.planOrders = planOrders;
     this.runBoardAction = runBoardAction;
     this.submitOrder = submitOrder;
     this.preflightStore = preflightStore;
     this.storeBoardItem = storeBoardItem;
+    this.loadWarehouseInventory = loadWarehouseInventory;
+    this.retrieveWarehouseItem = retrieveWarehouseItem;
     this.onEvent = onEvent;
     this.minEnergy = Math.max(0, Number(minEnergy) || 0);
     this.minEmptySpaces = Math.max(0, Number(minEmptySpaces) || 0);
     this.targetSlot = null;
+  }
+
+  async tryWarehouseRetrieve({ plan, state, execute, signal, actions }) {
+    let planningState = state;
+    let loadedInventory = false;
+    if (plan.warehouseInventoryLoadRequired) {
+      if (!this.loadWarehouseInventory) return null;
+      if (!execute) return { result: { ok: true, executed: false, reason: "planned", nextAction: { type: "load-warehouse-inventory", ...plan.warehouseLoadRequest }, actions, state, plan } };
+      const loaded = await this.loadWarehouseInventory({ signal });
+      if (!loaded.ok) return { result: { ok: false, executed: true, reason: loaded.reason || "warehouse-inventory-load-failed", actions, state, plan, warehouse: loaded } };
+      planningState = loaded.state;
+      plan = await this.planOrders(planningState);
+      loadedInventory = true;
+    }
+    const target = this.targetSlot == null
+      ? plan.recommended
+      : plan.plans?.find((item) => String(item.slot) === this.targetSlot) || plan.recommended;
+    const action = target?.nextAction;
+    if (action?.type !== "retrieve-from-warehouse") return loadedInventory ? { result: { ok: true, executed: execute, reason: "waiting-warehouse-item-unavailable", actions, state: planningState, plan } } : null;
+    this.targetSlot = String(target.slot);
+    if (!execute) return { result: { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: action, actions, state: planningState, plan } };
+    if (!this.retrieveWarehouseItem) return { result: { ok: false, executed: false, reason: "warehouse-retrieval-executor-unavailable", actions, state: planningState, plan } };
+    const retrieved = await this.retrieveWarehouseItem(action, { signal, inventory: planningState.warehouse?.inventoryKnowledge, before: planningState });
+    const recorded = { step: actions.length + 1, type: "retrieve-from-warehouse", warehouseSlotId: action.warehouseSlotId, itemId: action.itemId, ok: retrieved.ok, reason: retrieved.reason, actualBoardIndex: retrieved.actualBoardIndex ?? null, before: retrieved.before, after: retrieved.after };
+    actions.push(recorded);
+    this.onEvent?.(recorded);
+    if (!retrieved.ok) return { result: { ok: false, executed: true, reason: retrieved.reason || "warehouse-retrieval-failed", targetSlot: this.targetSlot, actions, state: planningState, plan, warehouse: retrieved } };
+    return { continue: true };
   }
 
   async tryWarehouseStore({ plan, state, execute, signal, actions }) {
@@ -96,7 +126,10 @@ class OrderCoinLoop {
       if (Number.isFinite(energy) && energy <= this.minEnergy) {
         return { ok: true, executed: execute, reason: "energy-depleted", targetSlot: this.targetSlot, actions, state };
       }
-      const plan = await this.planOrders(state);
+      let plan = await this.planOrders(state);
+      const retrieval = await this.tryWarehouseRetrieve({ plan, state, execute, signal, actions });
+      if (retrieval?.continue) continue;
+      if (retrieval?.result) return retrieval.result;
       let target = this.targetSlot == null ? null : plan.plans.find((item) => String(item.slot) === this.targetSlot);
       const actionContext = { hasMergeCandidate: (state.board?.mergeCandidates || []).length > 0 };
       const actionable = (candidate) => isPlanActionable(candidate, actionContext);

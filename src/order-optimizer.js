@@ -1,7 +1,7 @@
 "use strict";
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
-const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates } = require("./space-planner");
+const { normalizePlannerState, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates } = require("./space-planner");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -93,6 +93,16 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     return inferred;
   };
   const producerById = new Map((catalog.producers || []).map((producer) => [String(producer.itemId), producer]));
+  const normalizedState = gameState ? normalizePlannerState({ state, catalog }) : null;
+  const warehouseKnowledge = normalizedState?.warehouse.inventoryKnowledge;
+  const activePlanningItemIds = new Set((normalizedState?.catalog.items || []).filter((item) => item.evidenceSufficient).map((item) => item.id));
+  const concreteWarehouseSlots = warehouseKnowledge?.status === "loaded" ? (warehouseKnowledge.slots || []).filter((slot) => slot.occupied && slot.itemId) : [];
+  const trustedWarehouseSlots = warehouseKnowledge?.retrievalPath?.status === "trusted"
+    ? (warehouseKnowledge.slots || []).filter((slot) => slot.occupied && slot.itemId && activePlanningItemIds.has(String(slot.itemId)))
+    : [];
+  const trustedWarehouseKeys = new Set(trustedWarehouseSlots.map((slot) => `${slot.slotId}:${slot.itemId}`));
+  const unavailableWarehouseSlots = concreteWarehouseSlots.filter((slot) => !trustedWarehouseKeys.has(`${slot.slotId}:${slot.itemId}`));
+  const warehouseCounts = countBy(trustedWarehouseSlots, (slot) => slot.itemId);
   const observableGrids = grids.filter((grid) => grid.itemId);
   const classifiedGrids = observableGrids.map((grid) => ({ grid, reasons: gridUnavailabilityReasons(grid) }));
   const executableGrids = classifiedGrids.filter((entry) => entry.reasons.length === 0).map((entry) => entry.grid);
@@ -102,6 +112,9 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     .map(({ grid, reasons }) => ({ index: grid.index, itemId: String(grid.itemId), reasons }));
   const inventoryCounts = countBy(executableGrids, (grid) => grid.itemId);
   const unavailableCounts = countBy(unavailableGrids, (grid) => grid.itemId);
+  const unavailableWarehouseCounts = countBy(unavailableWarehouseSlots, (slot) => slot.itemId);
+  const allUnavailableCounts = new Map(unavailableCounts);
+  for (const [itemId, count] of unavailableWarehouseCounts) allUnavailableCounts.set(itemId, (allUnavailableCounts.get(itemId) || 0) + count);
   const reservedCounts = countBy(tasks.flatMap((task) => task.items.filter((item) => item.complete)), (item) => item.itemId);
   const availableCounts = new Map(inventoryCounts);
   for (const [itemId, count] of reservedCounts) availableCounts.set(itemId, Math.max(0, (availableCounts.get(itemId) || 0) - count));
@@ -140,19 +153,27 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       demands.set(item.chainId, current);
     }
     for (const demand of demands.values()) {
-      let supply = 0;
+      let boardSupply = 0;
+      let warehouseSupply = 0;
       let unavailableSupply = 0;
       for (const [itemId, count] of availableCounts) {
         const item = itemById.get(itemId);
-        if (item?.chainId === demand.chainId && item.level <= demand.maxTargetLevel) supply += count * Number(item.baseUnits || 0);
+        if (item?.chainId === demand.chainId && item.level <= demand.maxTargetLevel) boardSupply += count * Number(item.baseUnits || 0);
       }
-      for (const [itemId, count] of unavailableCounts) {
+      for (const [itemId, count] of warehouseCounts) {
+        const item = itemById.get(itemId);
+        if (item?.chainId === demand.chainId && item.level <= demand.maxTargetLevel) warehouseSupply += count * Number(item.baseUnits || 0);
+      }
+      for (const [itemId, count] of allUnavailableCounts) {
         const item = itemById.get(itemId);
         if (item?.chainId === demand.chainId && item.level <= demand.maxTargetLevel) unavailableSupply += count * Number(item.baseUnits || 0);
       }
-      demand.availableUnits = supply;
+      demand.boardSupplyUnits = boardSupply;
+      demand.warehouseSupplyUnits = warehouseSupply;
+      demand.unavailableSupplyUnits = unavailableSupply;
+      demand.availableUnits = boardSupply + warehouseSupply;
       demand.unavailableUnits = unavailableSupply;
-      demand.deficitUnits = Math.max(0, demand.units - supply);
+      demand.deficitUnits = Math.max(0, demand.units - boardSupply - warehouseSupply);
     }
     const remaining = new Map([...demands].map(([chainId, demand]) => [chainId, demand.deficitUnits]));
     const producerSteps = new Map();
@@ -217,10 +238,9 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     };
   });
 
-  let normalizedState = null;
   let warehouseStoreCandidates = [];
+  let warehouseRetrieveCandidates = [];
   if (gameState) {
-    normalizedState = normalizePlannerState({ state, catalog });
     warehouseStoreCandidates = buildWarehouseStoreCandidates(normalizedState);
     const hasStochasticProduction = (catalog.producers || []).some((producer) => producer.drops?.length !== 1 || Number(producer.drops?.[0]?.probability) !== 1);
     for (const plan of plans) {
@@ -249,6 +269,15 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
         plan.actionable = false;
         plan.blockingReason = "deterministic-path-not-found";
       }
+      const retrieveCandidates = buildWarehouseRetrieveCandidates(normalizedState, plan.slot);
+      warehouseRetrieveCandidates.push(...retrieveCandidates.map((candidate) => ({ ...candidate, orderSlot: String(plan.slot) })));
+      if (!plan.ready && retrieveCandidates.length) {
+        plan.nextAction = retrieveCandidates[0];
+        plan.feasible = true;
+        plan.actionable = true;
+        plan.blockingReason = null;
+        plan.explanation = "Trusted warehouse supply can be retrieved through the native click path; replan after observing its actual landing.";
+      }
     }
   }
 
@@ -258,6 +287,12 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
   const lowestEnergy = [...feasible].sort((a, b) => a.estimatedEnergy - b.estimatedEnergy || b.rewardCoins - a.rewardCoins)[0] || null;
   const evidenceBlocks = plans.map((plan) => plan.evidenceBlock).filter(Boolean);
   const allCatalogBlocked = plans.length > 0 && plans.every((plan) => !!plan.evidenceBlock);
+  const warehouseInventoryLoadRequired = warehouseKnowledge?.status !== "loaded" && plans.some((plan) => !plan.ready && !plan.feasible && !plan.evidenceBlock);
+  const warehouseLoadRequest = warehouseInventoryLoadRequired ? {
+    reason: "concrete-order-supply-required",
+    orderSlots: plans.filter((plan) => !plan.ready && !plan.feasible && !plan.evidenceBlock).map((plan) => String(plan.slot)),
+    itemIds: [...new Set(plans.filter((plan) => !plan.ready && !plan.feasible && !plan.evidenceBlock).flatMap((plan) => plan.missingItems.map(String)))],
+  } : null;
   const boundaryReason = recommended ? null
     : allCatalogBlocked ? "evidence-waiting"
       : plans.find((plan) => plan.blockingReason === "inventory-unavailable")?.blockingReason
@@ -273,6 +308,13 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       observable: { total: observableGrids.length, counts: countsObject(observableGrids) },
       executable: { total: executableGrids.length, counts: countsObject(executableGrids) },
       unavailable: { total: unavailableItems.length, counts: countsObject(unavailableGrids), items: unavailableItems },
+      boardSupply: { total: executableGrids.length, counts: countsObject(executableGrids) },
+      warehouseSupply: { total: trustedWarehouseSlots.length, counts: countsObject(trustedWarehouseSlots) },
+      unavailableSupply: {
+        total: unavailableItems.length + unavailableWarehouseSlots.length,
+        counts: Object.fromEntries(allUnavailableCounts),
+        items: [...unavailableItems, ...unavailableWarehouseSlots.map((slot) => ({ warehouseSlotId: slot.slotId, itemId: slot.itemId, reasons: [warehouseKnowledge?.retrievalPath?.status === "trusted" ? "catalog-evidence-insufficient" : "warehouse-retrieval-path-untrusted"] }))],
+      },
     },
     warehouse: normalizedState ? {
       inventoryKnowledge: normalizedState.warehouse.inventoryKnowledge,
@@ -280,6 +322,9 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       exchangeCapacity: normalizedState.warehouse.inventoryKnowledge.exchangeCapacity,
     } : null,
     warehouseStoreCandidates,
+    warehouseRetrieveCandidates,
+    warehouseInventoryLoadRequired,
+    warehouseLoadRequest,
     plans,
     status: allCatalogBlocked ? "evidence-waiting" : recommended ? "ready" : "waiting",
     evidenceBlocks,

@@ -1,13 +1,28 @@
 "use strict";
 
 const { setTimeout: delay } = require("node:timers/promises");
-const { WAREHOUSE_REASONS, unknownWarehouseInventoryKnowledge, warehouseGridEligibility } = require("./warehouse-domain");
+const { WAREHOUSE_REASONS, unknownWarehouseInventoryKnowledge, warehouseGridEligibility, warehouseInventoryKnowledgeFromNative } = require("./warehouse-domain");
 
 function warehouseRuntimePrelude() {
   return `const cc=globalThis.cc||globalThis.GameGlobal?.cc,scene=cc?.director?.getScene?.(),entry=scene?.getChildByName?.("Entry")||scene?.children?.find?.(node=>node?.name==="Entry"),runtime=(entry?._components||[]).find(component=>Array.isArray(component?.mControllers)),controller=runtime?.mControllers?.find(item=>item?._controllerClazzName==="UserBoardViewController"),boardView=controller?.view?._boardView,gameBoardView=boardView?._gameBoardView,grids=gameBoardView?._boardStore?._state?._gameBoard?.__private_95_grids;`;
 }
 
 const OPEN_WAREHOUSE_EXPRESSION = `(() => {${warehouseRuntimePrelude()}const bottom=boardView?._bottomView;if(!controller?.isViewVisible||!bottom)return{ok:false,reason:"board_not_visible"};if(typeof bottom.checkWarehouseUnlock==="function"&&!bottom.checkWarehouseUnlock())return{ok:false,reason:"warehouse_locked"};if(typeof bottom.onWarehouseButtonHandle!=="function")return{ok:false,reason:"warehouse_open_handler_not_found"};bottom.onWarehouseButtonHandle();return{ok:true,type:"open-warehouse"};})()`;
+
+function warehouseInventoryRuntimePrelude() {
+  return `const cc=globalThis.cc||globalThis.GameGlobal?.cc,scene=cc?.director?.getScene?.(),entry=scene?.getChildByName?.("Entry")||scene?.children?.find?.(node=>node?.name==="Entry"),runtime=(entry?._components||[]).find(component=>Array.isArray(component?.mControllers)),warehouseController=runtime?.mControllers?.find(item=>item?._controllerClazzName==="WarehouseViewController"),warehouseView=warehouseController?.view,gridTypeMap=warehouseView?._warehouseData?._gridTypeMap,itemIdOf=data=>String(data?.itemId??data?.id??data?.itemConfig?.Id??data?.itemConfig?.ID??"");const slots=[];if(gridTypeMap instanceof Map)for(const[type,grids]of gridTypeMap.entries())for(const grid of Array.isArray(grids)?grids:[])slots.push({slotId:String(grid?.id??""),type:Number(type),unlocked:!!grid?.unlocked,occupied:grid?.itemData!=null,itemId:itemIdOf(grid?.itemData)});const revision=slots.map(slot=>slot.slotId+":"+slot.itemId+":"+Number(slot.unlocked)).join("|");`;
+}
+
+const WAREHOUSE_INVENTORY_EXPRESSION = `(() => {${warehouseInventoryRuntimePrelude()}if(!warehouseController?.isViewVisible||!(gridTypeMap instanceof Map))return{ok:false,reason:"warehouse-inventory-not-loaded"};return{ok:true,type:"native-warehouse-inventory",totalSlots:slots.length,unlockedSlots:slots.filter(slot=>slot.unlocked).length,occupiedSlots:slots.filter(slot=>slot.occupied).length,slots,revision,retrievalPath:{status:"trusted",type:"native-click"}};})()`;
+
+const BOARD_AFTER_RETRIEVAL_EXPRESSION = `(() => {${warehouseRuntimePrelude()}if(!Array.isArray(grids))return{ok:false,reason:"board-state-unavailable"};const safe=(fn,fallback=null)=>{try{return fn()}catch(_){return fallback}},values=grids.map(grid=>({index:Number(grid.index),itemId:String(safe(()=>grid.itemId,"")),empty:!!safe(()=>grid.isEmpty,true),normal:!!safe(()=>grid.isNormal,false),moveable:!!safe(()=>grid.isMoveable,false),locked:!!grid.isLocking,frozen:!!safe(()=>grid.isFrozen,false),taskNeed:!!safe(()=>grid.item?.taskNeed,false),level:safe(()=>grid.item.itemConfig.Level,null),mergeTarget:safe(()=>grid.item.itemConfig.MergeTarget,null),produceCount:safe(()=>grid.item.produceCount,null),energyCost:safe(()=>grid.item.itemConfig.EnergyCost,null)}));return{ok:true,type:"board-after-warehouse-retrieval",signature:values.map(grid=>grid.itemId).join("|"),occupied:values.filter(grid=>!grid.empty).length,empty:values.filter(grid=>grid.empty).length,grids:values};})()`;
+
+function buildWarehouseRetrieveExpression(slotId, expectedItemId, expectedRevision) {
+  const targetSlot = JSON.stringify(String(slotId));
+  const targetItem = JSON.stringify(String(expectedItemId));
+  const targetRevision = JSON.stringify(String(expectedRevision));
+  return `(() => {${warehouseInventoryRuntimePrelude()}if(!warehouseController?.isViewVisible)return{ok:false,reason:"warehouse-not-visible"};const expectedRevision=${targetRevision};if(revision!==expectedRevision)return{ok:false,reason:"warehouse-revision-changed",expectedRevision,actualRevision:revision};const slotId=${targetSlot},expectedItemId=${targetItem},slot=slots.find(value=>value.slotId===slotId),grid=[...gridTypeMap.values()].flat().find(value=>String(value?.id??"")===slotId);if(!slot||!grid||!slot.occupied||slot.itemId!==expectedItemId)return{ok:false,reason:"warehouse-slot-item-changed",slotId,expectedItemId,actualItemId:slot?.itemId??null};const entries=warehouseView?._itemViewMap instanceof Map?[...warehouseView._itemViewMap.entries()]:[],itemView=entries.find(([key,value])=>key===grid||key===grid.itemData||String(key?.id??key??"")===slotId||String(value?.grid?.id??value?.data?.id??value?.itemData?.id??"")===slotId)?.[1]||warehouseView?._gridViewMap?.get?.(grid),node=itemView?.mNode||itemView?.node;if(!node||typeof node.emit!=="function")return{ok:false,reason:"warehouse-native-click-path-not-found",slotId};node.emit("click");return{ok:true,type:"native-warehouse-retrieve",slotId,itemId:expectedItemId};})()`;
+}
 
 function sourceValidationExpression(gridIndex) {
   return `if(!controller?.isViewVisible||!boardView||!gameBoardView||!Array.isArray(grids))return{ok:false,reason:"board-not-visible"};const grid=grids[${gridIndex}];if(!grid||grid.isEmpty||!grid.isItemValid||!grid.item)return{ok:false,reason:"${WAREHOUSE_REASONS.invalidSource}",index:${gridIndex}};if(!grid.isNormal||!grid.isMoveable||grid.isLocking||grid.isFrozen)return{ok:false,reason:"${WAREHOUSE_REASONS.unavailableSource}",index:${gridIndex}};if(grid.item.taskNeed)return{ok:false,reason:"${WAREHOUSE_REASONS.reservedSource}",index:${gridIndex}};if(typeof grid.item.produceCount==="number")return{ok:false,reason:"${WAREHOUSE_REASONS.producerSource}",index:${gridIndex}};`;
@@ -90,6 +105,69 @@ class WarehouseActionExecutor {
     return { ok, executed: true, reason: ok ? "warehouse-opened" : "warehouse-open-not-observed", acknowledgement, before, after };
   }
 
+  async loadInventory({ execute = false, signal = null } = {}) {
+    const before = await this.collectState();
+    let visibleState = before;
+    if (before.scene !== "warehouse" && !before.warehouse?.visible) {
+      if (!execute) return { ok: true, executed: false, reason: "warehouse-inventory-load-required", before, nextAction: { type: "load-warehouse-inventory" } };
+      const opened = await this.open({ execute: true, signal });
+      if (!opened.ok) return opened;
+      visibleState = opened.after || before;
+    }
+    if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before };
+    const acknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION);
+    if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-inventory-load-failed", acknowledgement, before, after: visibleState };
+    const inventoryKnowledge = warehouseInventoryKnowledgeFromNative(acknowledgement);
+    const state = JSON.parse(JSON.stringify(visibleState));
+    state.scene = before.scene;
+    state.board = before.board;
+    state.orders = before.orders;
+    state.resources = before.resources;
+    state.warehouse = { ...(state.warehouse || {}), visible: true, inventoryKnowledge };
+    return { ok: true, executed: execute, reason: "warehouse-inventory-loaded", acknowledgement, before, after: visibleState, state, inventoryKnowledge };
+  }
+
+  async retrieve(action, { execute = false, signal = null, inventory = null, before = null } = {}) {
+    const checkedBefore = before || await this.collectState();
+    const knowledge = inventory?.status === "loaded" ? inventory : warehouseInventoryKnowledgeFromNative(inventory);
+    if (knowledge.status !== "loaded" || knowledge.retrievalPath?.status !== "trusted") return { ok: false, executed: false, reason: "warehouse-retrieval-path-untrusted", before: checkedBefore };
+    if (String(knowledge.revision) !== String(action.inventoryRevision)) return { ok: false, executed: false, reason: "warehouse-revision-changed", before: checkedBefore, inventoryKnowledge: knowledge };
+    const target = knowledge.slots.find((slot) => String(slot.slotId) === String(action.warehouseSlotId));
+    if (!target?.occupied || String(target.itemId) !== String(action.itemId)) return { ok: false, executed: false, reason: "warehouse-slot-item-changed", before: checkedBefore, inventoryKnowledge: knowledge };
+    if (!execute) return { ok: true, executed: false, reason: "ready-to-retrieve-warehouse-item", before: checkedBefore, inventoryKnowledge: knowledge, nextAction: action };
+    if (signal?.aborted) return { ok: false, executed: false, reason: "aborted", before: checkedBefore };
+    const acknowledgement = await this.evaluate(buildWarehouseRetrieveExpression(action.warehouseSlotId, action.itemId, action.inventoryRevision));
+    if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "warehouse-retrieval-failed", acknowledgement, before: checkedBefore };
+    await delay(this.settleMs);
+    const after = await this.collectState();
+    if (!(after.board?.grids || []).length && (checkedBefore.board?.grids || []).length) {
+      const boardAcknowledgement = await this.evaluate(BOARD_AFTER_RETRIEVAL_EXPRESSION);
+      if (boardAcknowledgement?.ok) after.board = { ...(after.board || {}), ...boardAcknowledgement };
+    }
+    const inventoryAcknowledgement = await this.evaluate(WAREHOUSE_INVENTORY_EXPRESSION);
+    const afterKnowledge = warehouseInventoryKnowledgeFromNative(inventoryAcknowledgement);
+    const beforeItemCount = (checkedBefore.board?.grids || []).filter((grid) => String(grid.itemId) === String(action.itemId) && !grid.empty).length;
+    const afterItems = (after.board?.grids || []).filter((grid) => String(grid.itemId) === String(action.itemId) && !grid.empty);
+    const beforeByIndex = new Map((checkedBefore.board?.grids || []).map((grid) => [Number(grid.index), grid]));
+    const landing = afterItems.find((grid) => String(beforeByIndex.get(Number(grid.index))?.itemId || "") !== String(action.itemId));
+    const targetAfter = afterKnowledge.slots.find((slot) => String(slot.slotId) === String(action.warehouseSlotId));
+    const slotCleared = !!targetAfter && !targetAfter.occupied;
+    const itemAdded = afterItems.length === beforeItemCount + 1 && !!landing;
+    const emptyReduced = Number(after.board?.empty) === Number(checkedBefore.board?.empty) - 1;
+    const occupiedIncreased = Number(after.board?.occupied) === Number(checkedBefore.board?.occupied) + 1;
+    const signatureChanged = after.board?.signature !== checkedBefore.board?.signature;
+    const revisionChanged = afterKnowledge.status === "loaded" && afterKnowledge.revision !== knowledge.revision;
+    const resourcesStable = JSON.stringify(after.resources || {}) === JSON.stringify(checkedBefore.resources || {});
+    const ordersStable = JSON.stringify(after.orders || []) === JSON.stringify(checkedBefore.orders || []);
+    const ok = slotCleared && itemAdded && emptyReduced && occupiedIncreased && signatureChanged && revisionChanged && resourcesStable && ordersStable;
+    const resynchronized = { board: after.board, warehouse: afterKnowledge };
+    return {
+      ok, executed: true, reason: ok ? "warehouse-item-retrieved" : "warehouse-retrieval-not-observed", acknowledgement,
+      actualBoardIndex: landing?.index ?? null, inventoryKnowledge: afterKnowledge, before: checkedBefore, after, resynchronized,
+      verification: { slotCleared, itemAdded, emptyReduced, occupiedIncreased, signatureChanged, revisionChanged, resourcesStable, ordersStable },
+    };
+  }
+
   async preflight(index, { signal = null } = {}) {
     const gridIndex = Number(index);
     if (!Number.isInteger(gridIndex)) return { ok: false, executed: false, reason: "warehouse-index-invalid" };
@@ -132,4 +210,4 @@ class WarehouseActionExecutor {
   }
 }
 
-module.exports = { OPEN_WAREHOUSE_EXPRESSION, buildWarehouseStorePreflightExpression, buildMoveToWarehouseExpression, WarehouseActionExecutor };
+module.exports = { OPEN_WAREHOUSE_EXPRESSION, WAREHOUSE_INVENTORY_EXPRESSION, buildWarehouseStorePreflightExpression, buildMoveToWarehouseExpression, buildWarehouseRetrieveExpression, WarehouseActionExecutor };

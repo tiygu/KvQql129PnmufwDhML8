@@ -57,11 +57,12 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
   const normalizedItems = (catalog.items || []).map((item) => {
     const inferredTarget = (catalog.items || []).find((candidate) => String(candidate.chainId) === String(item.chainId) && Number(candidate.level) === Number(item.level) + 1);
     const relevantEvidence = (catalog.evidence?.objects || []).filter((object) => String(object.objectId) === String(item.id) && ["item-identity", "merge-relation"].includes(object.objectType));
+    const mergeEvidenceActive = ["item-identity", "merge-relation"].every((objectType) => relevantEvidence.some((object) => object.objectType === objectType && object.status === "active" && object.disposition === "enabled"));
     const evidenceSufficient = !item.inferred && (relevantEvidence.length === 0 || ["item-identity", "merge-relation"].every((objectType) => relevantEvidence.some((object) => object.objectType === objectType && object.status === "active" && object.disposition === "enabled")));
     return {
       id: String(item.id), chainId: item.chainId == null ? null : String(item.chainId), level: Number(item.level || 0),
       baseUnits: Number(item.baseUnits || 0), saleValue: Number(item.saleValue || item.sellValue || 0),
-      evidenceSufficient,
+      evidenceSufficient, mergeEvidenceActive,
       mergeTarget: item.mergeTarget == null || item.mergeTarget === "" ? (inferredTarget ? String(inferredTarget.id) : null) : String(item.mergeTarget),
     };
   });
@@ -317,6 +318,54 @@ function buildWarehouseStoreCandidates(state) {
   return candidates.sort((left, right) => left.opportunityCost - right.opportunityCost || left.sourceIndex - right.sourceIndex);
 }
 
+function buildWarehouseRetrieveCandidates(state, orderSlot) {
+  const knowledge = state.warehouse.inventoryKnowledge;
+  if (knowledge.status !== "loaded" || knowledge.retrievalPath?.status !== "trusted" || !knowledge.revision) return [];
+  if (state.board.empty <= 0) return [];
+  const order = state.orders.find((entry) => String(entry.slot) === String(orderSlot));
+  if (!order) return [];
+  const missingTargets = order.items.filter((item) => !item.complete).map((item) => catalogItem(state, item.itemId)).filter(Boolean);
+  const demands = new Map();
+  for (const target of missingTargets) {
+    const demand = demands.get(target.chainId) || { units: 0, maxTargetLevel: 0 };
+    demand.units += Number(target.baseUnits || 0);
+    demand.maxTargetLevel = Math.max(demand.maxTargetLevel, Number(target.level || 0));
+    demands.set(target.chainId, demand);
+  }
+  for (const grid of state.board.grids) {
+    if (grid.empty || !grid.executable || grid.protected) continue;
+    const item = catalogItem(state, grid.itemId), demand = demands.get(item?.chainId);
+    if (demand && item.level <= demand.maxTargetLevel) demand.units = Math.max(0, demand.units - Number(item.baseUnits || 0));
+  }
+  const eligibleSlots = [];
+  for (const slot of knowledge.slots || []) {
+    const item = catalogItem(state, slot.itemId), demand = demands.get(item?.chainId);
+    if (slot.occupied && item?.evidenceSufficient && demand?.units > 0 && item.level <= demand.maxTargetLevel) eligibleSlots.push({ slot, item, demand });
+  }
+  for (const demand of demands.values()) {
+    const available = eligibleSlots.filter((entry) => entry.demand === demand).reduce((sum, entry) => sum + Number(entry.item.baseUnits || 0), 0);
+    if (available + 1e-9 < demand.units) demand.insufficientWarehouseSupply = true;
+  }
+  const candidates = [];
+  const selectedUnits = new Map();
+  for (const { slot, item, demand } of eligibleSlots.sort((left, right) => Number(right.item.baseUnits || 0) - Number(left.item.baseUnits || 0))) {
+    if (demand.insufficientWarehouseSupply || (selectedUnits.get(item.chainId) || 0) >= demand.units) continue;
+    let bufferPolicy = "preserve-one-buffer";
+    if (state.board.empty === 1) {
+      const immediatelyMergeable = item.mergeEvidenceActive && !!item.mergeTarget && state.board.grids.some((grid) => !grid.empty && grid.executable && !grid.protected && grid.itemId === item.id);
+      if (!immediatelyMergeable) continue;
+      bufferPolicy = "verified-immediate-merge";
+    }
+    candidates.push({
+      type: "retrieve-from-warehouse", warehouseSlotId: String(slot.slotId), itemId: item.id,
+      inventoryRevision: knowledge.revision, bufferPolicy,
+      opportunityValue: Math.min(Number(item.baseUnits || 0), demand.units),
+    });
+    selectedUnits.set(item.chainId, (selectedUnits.get(item.chainId) || 0) + Number(item.baseUnits || 0));
+  }
+  return candidates.sort((left, right) => right.opportunityValue - left.opportunityValue || left.warehouseSlotId.localeCompare(right.warehouseSlotId));
+}
+
 function comparePathScores(a, b) {
   return Number(!a.safe) - Number(!b.safe)
     || Number(!a.boardSpaceFeasible) - Number(!b.boardSpaceFeasible)
@@ -431,4 +480,4 @@ function planDeterministicOrder(state, orderSlot, { maxStates = 768, maxDepth = 
   };
 }
 
-module.exports = { normalizePlannerState, simulateDeterministicTransition, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates };
+module.exports = { normalizePlannerState, simulateDeterministicTransition, planDeterministicOrder, comparePathScores, buildWarehouseStoreCandidates, buildWarehouseRetrieveCandidates };

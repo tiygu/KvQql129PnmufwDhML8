@@ -234,3 +234,46 @@ test("an explicit empty evidence-gated candidate list never falls back to raw bo
   assert.equal(result.reason, "waiting-board-space");
   assert.equal(preflights, 0);
 });
+
+test("warehouse retrieval loads inventory on demand, executes one slot click, then replans from the actual landing", async () => {
+  let stateRead = 0, loads = 0, retrievals = 0, boardActions = 0;
+  const initial = { schemaVersion: 1, resources: { energy: 10 }, warehouse: { inventoryKnowledge: { status: "unknown" } }, board: { empty: 2, signature: "p||", mergeCandidates: [], grids: [] }, orders: [{ slot: "a", ready: false }] };
+  const landed = { ...initial, warehouse: { inventoryKnowledge: { status: "unknown" } }, board: { empty: 1, signature: "p|a1|", mergeCandidates: [{ from: 1, to: 2 }], grids: [] } };
+  const loadedState = { ...initial, warehouse: { inventoryKnowledge: { status: "loaded", revision: "rev-1", retrievalPath: { status: "trusted" }, slots: [{ slotId: "w1", itemId: "a1" }] } } };
+  const retrieve = { type: "retrieve-from-warehouse", warehouseSlotId: "w1", itemId: "a1", inventoryRevision: "rev-1" };
+  const loop = new OrderCoinLoop({
+    collectState: async () => stateRead++ === 0 ? initial : landed,
+    planOrders: async (current) => {
+      if (current === initial) return { plans: [], recommended: null, warehouseInventoryLoadRequired: true, warehouseLoadRequest: { itemIds: ["a2"] } };
+      if (current === loadedState) return { plans: [{ slot: "a", feasible: true, nextAction: retrieve }], recommended: { slot: "a", feasible: true, nextAction: retrieve }, warehouseInventoryLoadRequired: false };
+      const target = { slot: "a", feasible: true, nextAction: { type: "merge", from: 1, to: 2 }, boardSpaceFeasibility: { feasible: true } };
+      return { plans: [target], recommended: target };
+    },
+    loadWarehouseInventory: async () => { loads += 1; return { ok: true, state: loadedState, inventoryKnowledge: loadedState.warehouse.inventoryKnowledge }; },
+    retrieveWarehouseItem: async (action) => { retrievals += 1; assert.equal(action.warehouseSlotId, "w1"); return { ok: true, reason: "warehouse-item-retrieved", actualBoardIndex: 1, before: loadedState, after: landed }; },
+    runBoardAction: async () => { boardActions += 1; return { ok: true, actions: [{ type: "merge" }], stopReason: "max_actions_reached" }; },
+    submitOrder: async () => ({ ok: true }),
+  });
+  const result = await loop.run({ execute: true, maxActions: 2 });
+  assert.equal(result.reason, "max-actions-reached");
+  assert.equal(loads, 1);
+  assert.equal(retrievals, 1);
+  assert.equal(boardActions, 1);
+  assert.deepEqual(result.actions.map((action) => action.type), ["retrieve-from-warehouse", "merge"]);
+});
+
+test("failed warehouse retrieval performs no later board action", async () => {
+  let boardActions = 0;
+  const retrieve = { type: "retrieve-from-warehouse", warehouseSlotId: "w1", itemId: "a1", inventoryRevision: "rev-1" };
+  const state = { resources: { energy: 10 }, board: { empty: 2, mergeCandidates: [] }, warehouse: { inventoryKnowledge: { status: "loaded" } }, orders: [{ slot: "a", ready: false }] };
+  const target = { slot: "a", feasible: true, nextAction: retrieve };
+  const loop = new OrderCoinLoop({
+    collectState: async () => state, planOrders: async () => ({ plans: [target], recommended: target }),
+    retrieveWarehouseItem: async () => ({ ok: false, reason: "warehouse-retrieval-not-observed", resynchronized: { board: state.board, warehouse: { revision: "rev-1" } } }),
+    runBoardAction: async () => { boardActions += 1; return { ok: true, actions: [] }; }, submitOrder: async () => ({ ok: true }),
+  });
+  const result = await loop.run({ execute: true, maxActions: 2 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "warehouse-retrieval-not-observed");
+  assert.equal(boardActions, 0);
+});

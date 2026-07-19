@@ -96,6 +96,10 @@ function printStatusReport(report, output = console) {
       ? `\n仓库：已占用 ${knowledge?.occupiedSlots ?? report.warehouse.occupiedSlots ?? 0} / 已解锁 ${knowledge?.unlockedSlots ?? report.warehouse.unlockedSlots ?? 0} / 总格数 ${knowledge?.totalSlots ?? report.warehouse.totalSlots ?? 0}`
       : "\n仓库：清单知识未知；具体物品仍可通过原生预检判断存入可用性");
   }
+  if (report.warehouse?.inventoryKnowledge?.status === "loaded") {
+    const knowledge = report.warehouse.inventoryKnowledge;
+    output.log(`Warehouse revision: ${knowledge.revision || "unknown"}; concrete items: ${(knowledge.items || []).map((item) => `${item.itemId} x${item.count}`).join(", ") || "none"}; retrieval path: ${knowledge.retrievalPath?.status || "unknown"}`);
+  }
   if (report.selectedItem?.selected) output.log(`选中物品：${report.selectedItem.name || "unknown"}${report.selectedItem.price != null ? `（价格 ${report.selectedItem.price}）` : ""}`);
 }
 
