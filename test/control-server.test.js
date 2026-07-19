@@ -14,6 +14,9 @@ function createRuntime() {
     getCatalogView: () => ({ revision: "db-revision-3", stats: { items: 3 }, repository: { summary: { states: { observed: 1, provisional: 1, active: 1 } }, objects: [{ objectType: "item-identity", objectId: "i", status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }] } }),
     exportCatalog: () => ({ schemaVersion: 1, source: { type: "sqlite-catalog-repository", revision: "db-revision-3" }, objects: [] }),
     importCatalog: (snapshot, options) => ({ imported: snapshot.objects.length, preserved: 0, sourceFile: options.sourceFile, revision: "db-revision-4" }),
+    acquireCatalogIcon: (itemId) => ({ status: "queued", taskId: 17, itemId }),
+    getCatalogIconTask: (taskId) => ({ status: "complete", taskId: Number(taskId), itemId: "i" }),
+    getCatalogIconAsset: () => null,
     getCatalogObject: (type, id) => ({ objectType: type, objectId: id, status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }),
     setCatalogObjectDisposition: (type, id, disposition, reason, expectedRevision) => {
       if (expectedRevision !== 3) throw Object.assign(new Error("catalog revision conflict"), { statusCode: 409 });
@@ -113,6 +116,31 @@ test("control server 从同一 SQLite revision 导出并导入 Catalog JSON", as
   } finally {
     await server.close();
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("control server 按需排队图标任务并提供内容哈希资源", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-icon-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const iconPath = path.join(root, "icon.png");
+  fs.writeFileSync(iconPath, "png-fixture");
+  const runtime = createRuntime();
+  const hash = "a".repeat(64);
+  runtime.getCatalogIconAsset = (requestedHash) => requestedHash === hash ? { hash, mimeType: "image/png", filePath: iconPath } : null;
+  const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  try {
+    const queued = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/acquire`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ objectId: "i" }) });
+    assert.equal(queued.status, 202);
+    assert.deepEqual(await queued.json(), { status: "queued", taskId: 17, itemId: "i" });
+    const task = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/task?id=17`);
+    assert.deepEqual(await task.json(), { status: "complete", taskId: 17, itemId: "i" });
+    const icon = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/${hash}`);
+    assert.equal(icon.headers.get("content-type"), "image/png");
+    assert.equal(await icon.text(), "png-fixture");
+  } finally {
+    await server.close(); fs.rmSync(root, { recursive: true, force: true });
   }
 });
 

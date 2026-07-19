@@ -185,6 +185,31 @@ class AutomationDatabase {
         created_at TEXT NOT NULL,
         FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT
       );
+      CREATE TABLE IF NOT EXISTS catalog_icon_assets (
+        hash TEXT PRIMARY KEY,
+        mime_type TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER NOT NULL,
+        byte_size INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS catalog_icon_candidates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_id INTEGER NOT NULL,
+        asset_hash TEXT NOT NULL,
+        cache_key TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        resource_url TEXT,
+        runtime_identifier TEXT,
+        texture_uuid TEXT,
+        crop_json TEXT NOT NULL,
+        selected INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE(object_id,cache_key),
+        FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
+        FOREIGN KEY(asset_hash) REFERENCES catalog_icon_assets(hash) ON DELETE RESTRICT
+      );
       CREATE TABLE IF NOT EXISTS automation_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, started_at TEXT NOT NULL,
         ended_at TEXT, status TEXT NOT NULL, settings_json TEXT
@@ -221,6 +246,9 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_conflicts_status ON catalog_repository_conflicts(status, object_type);
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_transitions_object ON catalog_repository_transitions(object_id, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_rulings_object_field ON catalog_repository_rulings(object_id, field_path, id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_object ON catalog_icon_candidates(object_id, selected, id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_asset ON catalog_icon_candidates(asset_hash);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_icon_candidates_one_selected ON catalog_icon_candidates(object_id) WHERE selected=1;
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
     `);
     const versionColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_versions)").all().map((column) => column.name));
@@ -318,7 +346,7 @@ class AutomationDatabase {
     for (const conflict of this.db.prepare("SELECT conflict_type,details_json FROM catalog_repository_conflicts WHERE object_type=? AND object_id=? AND status='open' ORDER BY id").all(row.object_type, row.object_id)) {
       reasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
     }
-    if (row.object_type === "item-identity" && (algorithmCandidate.iconEvidenceStatus === "missing" || (!algorithmCandidate.iconResourceIdentifier && !algorithmCandidate.iconResource))) {
+    if (row.object_type === "item-identity" && !this._selectedIconCandidate(row.id)) {
       reasons.push({ type: "icon-gap", fieldPath: "iconResourceIdentifier", message: "缺少物品图标证据" });
     }
     for (const ruling of activeRulings.values()) {
@@ -357,6 +385,10 @@ class AutomationDatabase {
       origin: version.origin, payload: parseJson(version.payload_json), evidenceSummary: parseJson(version.evidence_summary_json), createdAt: version.created_at,
     }));
     result.transitions = this.db.prepare("SELECT * FROM catalog_repository_transitions WHERE object_id=? ORDER BY id").all(row.id).map((transition) => this._catalogTransition(transition));
+    if (row.object_type === "item-identity") {
+      result.iconCandidates = this._iconCandidates(row.id);
+      result.selectedIcon = this._selectedIconCandidate(row.id);
+    }
     result.algorithmCandidate = this._catalogAlgorithmCandidate(row);
     const activeRulings = this._activeCatalogRulings(row.id);
     result.humanValues = Object.fromEntries(activeRulings);
@@ -613,6 +645,83 @@ class AutomationDatabase {
       .filter((entry) => entry.reasons.length > 0);
   }
 
+  _iconCandidate(row) {
+    return row ? {
+      id: Number(row.id), itemId: row.object_key, assetHash: row.asset_hash, cacheKey: row.cache_key,
+      sourceType: row.source_type, resourceUrl: row.resource_url, runtimeIdentifier: row.runtime_identifier,
+      textureUuid: row.texture_uuid, crop: parseJson(row.crop_json), selected: !!row.selected,
+      mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size),
+      filePath: row.file_path, createdAt: row.created_at,
+    } : null;
+  }
+
+  _iconCandidates(repositoryObjectId) {
+    return this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
+      WHERE candidate.object_id=? ORDER BY candidate.id`).all(repositoryObjectId).map((row) => this._iconCandidate(row));
+  }
+
+  _selectedIconCandidate(repositoryObjectId) {
+    const row = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
+      WHERE candidate.object_id=? AND candidate.selected=1 ORDER BY candidate.id DESC LIMIT 1`).get(repositoryObjectId);
+    const candidate = this._iconCandidate(row);
+    return candidate && fs.existsSync(candidate.filePath) ? candidate : null;
+  }
+
+  saveIconCandidate({ itemId, cacheKey, sourceType, resourceUrl = null, runtimeIdentifier = null, textureUuid = null, crop = {}, asset }) {
+    if (!asset?.hash || !asset.mimeType || !Number.isInteger(Number(asset.width)) || !Number.isInteger(Number(asset.height)) || !asset.filePath) throw new TypeError("complete icon asset metadata is required");
+    return this.transaction(() => {
+      const object = this._catalogObjectRow("item-identity", String(itemId));
+      if (!object) throw new Error(`catalog object not found: item-identity/${itemId}`);
+      const now = new Date().toISOString();
+      this.db.prepare(`INSERT INTO catalog_icon_assets(hash,mime_type,width,height,byte_size,file_path,created_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(hash) DO NOTHING`).run(String(asset.hash), String(asset.mimeType), Number(asset.width), Number(asset.height), Number(asset.byteSize), String(asset.filePath), now);
+      const existing = this.db.prepare("SELECT * FROM catalog_icon_candidates WHERE object_id=? AND cache_key=?").get(object.id, String(cacheKey));
+      if (existing?.selected) return this._selectedIconCandidate(object.id);
+      this.db.prepare("UPDATE catalog_icon_candidates SET selected=0 WHERE object_id=?").run(object.id);
+      this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,selected,created_at)
+        VALUES(?,?,?,?,?,?,?,?,1,?) ON CONFLICT(object_id,cache_key) DO UPDATE SET asset_hash=excluded.asset_hash,source_type=excluded.source_type,resource_url=excluded.resource_url,runtime_identifier=excluded.runtime_identifier,texture_uuid=excluded.texture_uuid,crop_json=excluded.crop_json,selected=1`)
+        .run(object.id, String(asset.hash), String(cacheKey), String(sourceType), resourceUrl, runtimeIdentifier, textureUuid, canonicalJson(crop || {}), now);
+      this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
+      const after = this._catalogObjectRow("item-identity", String(itemId));
+      this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: `icon-candidate-selected:${asset.hash}`, evidenceRevision: after.revision });
+      return this._selectedIconCandidate(object.id);
+    });
+  }
+
+  findIconAcquisition(cacheKey) {
+    const row = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
+      WHERE candidate.cache_key=? ORDER BY candidate.id LIMIT 1`).get(String(cacheKey));
+    return this._iconCandidate(row);
+  }
+
+  listIconCandidates(itemId) {
+    const object = this._catalogObjectRow("item-identity", String(itemId));
+    return object ? this._iconCandidates(object.id) : [];
+  }
+
+  getSelectedIconCandidate(itemId) {
+    const object = this._catalogObjectRow("item-identity", String(itemId));
+    return object ? this._selectedIconCandidate(object.id) : null;
+  }
+
+  listIconAssets() {
+    return this.db.prepare("SELECT * FROM catalog_icon_assets ORDER BY hash").all().map((row) => ({ hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at }));
+  }
+
+  getIconAsset(hash) {
+    const row = this.db.prepare("SELECT * FROM catalog_icon_assets WHERE hash=?").get(String(hash));
+    return row ? { hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at } : null;
+  }
+
   getCatalogRevision() {
     const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,revision FROM catalog_repository_objects ORDER BY object_type,object_id").all();
     const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
@@ -633,6 +742,7 @@ class AutomationDatabase {
       const identity = planningPayload(summary);
       const relation = relations.get(summary.objectId);
       if (!identity || !relation) return null;
+      const selectedIcon = this.getSelectedIconCandidate(summary.objectId);
       return {
         id: String(identity.itemId ?? summary.objectId),
         chainId: identity.chainId == null ? null : String(identity.chainId),
@@ -640,6 +750,7 @@ class AutomationDatabase {
         baseUnits: Number(identity.baseUnits),
         mergeTarget: relation.mergeTarget == null || relation.mergeTarget === "" ? null : String(relation.mergeTarget),
         iconResource: identity.iconResourceIdentifier ?? identity.iconResource ?? null,
+        iconHash: selectedIcon?.assetHash || null,
         descriptionKey: identity.descriptionKey ?? null,
         itemType: identity.itemType ?? null,
         inferred: summary.status === "provisional",
@@ -683,14 +794,24 @@ class AutomationDatabase {
   }
 
   exportCatalogSnapshot() {
+    const portableCandidate = (candidate) => {
+      if (!candidate) return candidate;
+      const { filePath, ...portable } = candidate;
+      return portable;
+    };
     return {
       schemaVersion: 1,
       exportedAt: new Date().toISOString(),
       source: { type: "sqlite-catalog-repository", revision: this.getCatalogRevision() },
       projection: this.getCatalogProjection({ includeProvisional: true }),
       repository: this.getCatalogRepositorySummary(),
-      objects: this.listCatalogObjects().map((summary) => this.getCatalogObject(summary.objectType, summary.objectId)),
+      objects: this.listCatalogObjects().map((summary) => {
+        const object = this.getCatalogObject(summary.objectType, summary.objectId);
+        if (object.objectType !== "item-identity") return object;
+        return { ...object, iconCandidates: object.iconCandidates.map(portableCandidate), selectedIcon: portableCandidate(object.selectedIcon) };
+      }),
       conflicts: this.listCatalogConflicts({ status: null }),
+      icons: { assets: this.listIconAssets().map(({ filePath, ...asset }) => ({ ...asset, contentBase64: fs.readFileSync(filePath).toString("base64") })) },
     };
   }
 
@@ -725,12 +846,28 @@ class AutomationDatabase {
       this.db.prepare(`INSERT INTO catalog_repository_transitions(object_id,from_status,to_status,from_disposition,to_disposition,reason,evidence_revision,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(repositoryObjectId, transition.fromStatus, transition.toStatus, transition.fromDisposition, transition.toDisposition, transition.reason, Number(transition.evidenceRevision), transition.createdAt || createdAt);
     }
+    const iconCandidates = exported.iconCandidates || [];
+    if (iconCandidates.filter((candidate) => candidate.selected).length > 1) throw new TypeError(`catalog snapshot has multiple selected icons: ${identity.objectId}`);
+    for (const candidate of iconCandidates) {
+      this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,selected,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, candidate.assetHash, candidate.cacheKey, candidate.sourceType, candidate.resourceUrl, candidate.runtimeIdentifier, candidate.textureUuid, canonicalJson(candidate.crop || {}), candidate.selected ? 1 : 0, candidate.createdAt || createdAt);
+    }
   }
 
   importCatalogSnapshot(snapshot, { sourceFile = null } = {}) {
     if (!snapshot || Number(snapshot.schemaVersion) !== 1 || snapshot.source?.type !== "sqlite-catalog-repository" || !Array.isArray(snapshot.objects)) throw new TypeError("unsupported catalog snapshot format");
     return this.transaction(() => {
       if (this.getCatalogRepositorySummary().objects === 0) {
+        for (const asset of snapshot.icons?.assets || []) {
+          const bytes = Buffer.from(String(asset.contentBase64 || ""), "base64");
+          if (!bytes.length || crypto.createHash("sha256").update(bytes).digest("hex") !== asset.hash) throw new TypeError(`catalog snapshot icon content hash mismatch: ${asset.hash}`);
+          const directory = path.join(path.dirname(this.filePath), "icon-cache", String(asset.hash).slice(0, 2));
+          const filePath = path.join(directory, `${asset.hash}.png`);
+          fs.mkdirSync(directory, { recursive: true });
+          if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, bytes);
+          this.db.prepare(`INSERT INTO catalog_icon_assets(hash,mime_type,width,height,byte_size,file_path,created_at)
+            VALUES(?,?,?,?,?,?,?)`).run(asset.hash, asset.mimeType, Number(asset.width), Number(asset.height), Number(asset.byteSize), filePath, asset.createdAt);
+        }
         for (const exported of snapshot.objects) this._restoreCatalogObjectSnapshot(exported);
         for (const conflict of snapshot.conflicts || []) {
           const detailsJson = canonicalJson(conflict.details || {});

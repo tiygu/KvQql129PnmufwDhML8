@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Check, History, Pause, Play, RotateCcw, Save } from "lucide-react";
+import { AlertTriangle, Check, History, Image, Pause, Play, RotateCcw, Save } from "lucide-react";
 import { controlApi } from "./control-api";
 
 const reasonLabels: Record<string, string> = {
@@ -135,6 +135,16 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
     } finally { setBusy(false); }
   };
 
+  const acquireIcon = async () => {
+    if (!detail || detail.objectType !== "item-identity") return;
+    setBusy(true);
+    try {
+      const task = await controlApi.acquireCatalogIcon(detail.objectId);
+      setMessage(`图标采集任务 ${task.taskId} 已进入后台队列`);
+    } catch (error: any) { setMessage(error.message); }
+    finally { setBusy(false); }
+  };
+
   return <section className="catalog-review-workspace">
     <div className="panel review-queue">
       <div className="panel-head"><div><span className="eyebrow">Catalog Review Queue</span><h2>审核队列</h2></div><b>{queue.length}</b></div>
@@ -146,7 +156,8 @@ export function CatalogReviewWorkspace({ repository, onChanged }: { repository: 
     </div>
     <div className="panel review-detail">
       {!detail ? <div className="empty-state"><History/><span>从审核队列选择对象</span></div> : <>
-        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{detail.objectType} · {detail.status} · r{detail.revision}</small></div><button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div>
+        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{detail.objectType} · {detail.status} · r{detail.revision}</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
+        {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt={`${detail.objectId} icon`}/> : <Image/>}<div><strong>{detail.selectedIcon ? "精确运行时图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.assetHash} · ${detail.selectedIcon.width}×${detail.selectedIcon.height}` : "缺失仅影响视觉核对，不影响其他 Active 字段参与规划"}</span></div></div>}
         {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reasonLabels[reason.type] || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
         <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <button className={`field-row ${fieldPath === field ? "active" : ""}`} key={field} onClick={() => selectField(field)}><strong>{field}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></button>)}</div>
         <div className="ruling-editor"><label><span>字段</span><select value={fieldPath} onChange={(event) => selectField(event.target.value)}>{fields.map((field) => <option key={field}>{field}</option>)}</select></label><label className="wide"><span>人工值（JSON 或文本）</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)}/></label><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录判断依据"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => commit("confirm")}><Check size={15}/>确认候选</button><button disabled={busy} onClick={() => commit("modify")}><Save size={15}/>保存修改</button><button disabled={busy || !detail.humanValues?.[fieldPath]} onClick={revoke}><RotateCcw size={15}/>撤销裁决</button></div>{message && <p className="review-message">{message}</p>}</div>

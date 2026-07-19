@@ -129,6 +129,15 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
     try {
       const requestUrl = new URL(req.url || "/", "http://127.0.0.1");
       const route = `${req.method || "GET"} ${requestUrl.pathname}`;
+      const iconAssetMatch = /^\/api\/catalog\/icon\/([a-f0-9]{64})$/.exec(requestUrl.pathname);
+      if ((req.method || "GET") === "GET" && iconAssetMatch) {
+        const asset = runtime.getCatalogIconAsset(iconAssetMatch[1]);
+        const stat = asset ? await fsp.stat(asset.filePath).catch(() => null) : null;
+        if (!asset || !stat?.isFile()) return writeJson(res, 404, { ok: false, error: "catalog-icon-not-found" });
+        res.writeHead(200, { "cache-control": "public, max-age=31536000, immutable", "content-length": stat.size, "content-type": asset.mimeType });
+        fs.createReadStream(asset.filePath).pipe(res);
+        return;
+      }
       if (route === "GET /api/health") return writeJson(res, 200, { ok: true, wsPath: WS_PATH });
       if (route === "GET /api/dashboard") return writeJson(res, 200, await dashboard());
       if (route === "GET /api/catalog") return writeJson(res, 200, runtime.getCatalogView());
@@ -148,6 +157,17 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         const result = runtime.importCatalog(await readJson(req), { sourceFile: "control-api" });
         broadcast({ type: "catalog-repository-imported", revision: result.revision, imported: result.imported, preserved: result.preserved });
         return writeJson(res, 200, result);
+      }
+      if (route === "POST /api/catalog/icon/acquire") {
+        const body = await readJson(req);
+        if (!body.objectId) return writeJson(res, 400, { ok: false, error: "catalog-item-id-required" });
+        const task = runtime.acquireCatalogIcon(String(body.objectId));
+        broadcast({ type: "icon-acquisition-queued", itemId: String(body.objectId), taskId: task.taskId });
+        return writeJson(res, 202, task);
+      }
+      if (route === "GET /api/catalog/icon/task") {
+        const task = runtime.getCatalogIconTask(requestUrl.searchParams.get("id"));
+        return writeJson(res, task ? 200 : 404, task || { ok: false, error: "icon-task-not-found" });
       }
       if (route === "GET /api/catalog/object") {
         const objectType = requestUrl.searchParams.get("type");

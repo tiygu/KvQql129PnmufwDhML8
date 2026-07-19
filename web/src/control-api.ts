@@ -85,6 +85,8 @@ export const controlApi = {
   refreshCatalog: () => post("/api/catalog/refresh"),
   exportCatalog,
   importCatalog: (snapshot: any) => post("/api/catalog/import", snapshot),
+  acquireCatalogIcon: (objectId: string) => post("/api/catalog/icon/acquire", { objectId }),
+  getCatalogIconTask: (taskId: number) => request(`/api/catalog/icon/task?id=${encodeURIComponent(taskId)}`),
   getConnectionStatus: () => request("/api/connection"),
   startConnection: (options?: any) => post("/api/connection/start", options || {}),
   stopConnection: () => post("/api/connection/stop"),

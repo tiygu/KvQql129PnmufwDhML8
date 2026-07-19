@@ -25,6 +25,7 @@ const { migrateLegacyCatalog } = require("./catalog-migration");
 const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./catalog-review-gate");
 const { PauseGate } = require("./pause-gate");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
+const { IconEvidenceService, resolveCocosSpriteFrame, readCdpResource } = require("./icon-evidence");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -56,6 +57,7 @@ class AutomationRuntime {
     this.pauseGate = new PauseGate();
     this.activeSessionId = null;
     this.activeRunPromise = null;
+    this.actionBoundaryPending = false;
     this.buildCatalog = buildCatalog;
     this.dataDir = dataDir || path.join(rootDir, "data");
     fs.mkdirSync(this.dataDir, { recursive: true });
@@ -110,6 +112,20 @@ class AutomationRuntime {
       throw empty;
     }
     this.catalogGate = new CatalogReviewGate(this.database);
+    this.iconService = new IconEvidenceService({
+      database: this.database,
+      cacheDir: path.join(this.dataDir, "icon-cache"),
+      concurrency: 2,
+      resolveSpriteFrame: async ({ itemId, itemIdentity }) => {
+        const selection = await this.connect();
+        return resolveCocosSpriteFrame({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity });
+      },
+      readResource: async ({ resourceUrl, mimeType }) => {
+        await this.connect();
+        return readCdpResource({ client: this.lab.client, resourceUrl, mimeType });
+      },
+      onEvent: (event) => this.emit(event.type, event),
+    });
   }
 
   emit(type, payload = {}) { this.onEvent?.({ type, at: new Date().toISOString(), ...payload }); }
@@ -127,14 +143,17 @@ class AutomationRuntime {
       stats: projection.stats,
       coverage: projection.coverage,
       chains: projection.chains,
-      items: projection.items,
+      items: projection.items.map((item) => ({ ...item, iconUrl: item.iconHash ? `/api/catalog/icon/${item.iconHash}` : null })),
       producers: projection.producers,
       repository,
     };
   }
 
   getCatalogObject(objectType, objectId) {
-    return this.database.getCatalogObject(objectType, objectId);
+    const object = this.database.getCatalogObject(objectType, objectId);
+    if (!object || objectType !== "item-identity") return object;
+    const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
+    return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
   }
 
   getPlanningCatalog({ includeProvisional = false } = {}) {
@@ -153,6 +172,21 @@ class AutomationRuntime {
       recordSourceEvidence: true,
     });
     return { imported: result.migrated, preserved: 0, revision: this.database.getCatalogRevision(), repository: result.repository };
+  }
+
+  acquireCatalogIcon(itemId) {
+    if (this.running || this.actionBoundaryPending) throw Object.assign(new Error("icon acquisition requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
+    const object = this.database.getCatalogObject("item-identity", String(itemId));
+    if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
+    return this.iconService.request(String(itemId), { itemIdentity: { itemId: String(itemId), ...(object.effectiveValue || object.algorithmCandidate || {}) } });
+  }
+
+  getCatalogIconTask(taskId) {
+    return this.iconService.getTask(taskId);
+  }
+
+  getCatalogIconAsset(hash) {
+    return this.database.getIconAsset(hash);
   }
 
   setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {
@@ -388,26 +422,39 @@ class AutomationRuntime {
   }
 
   async completeCurrentMapMission() {
-    await this.connect();
-    const contextId = this.selection.probe.context.id;
-    const completer = new MapMissionCompleter({ client: this.lab.client, contextId, collectState: () => this.collectState(), settleMs: 1800 });
-    const sessionId = this.database.startSession("map-mission", { explicitUserAction: true });
+    if (this.running || this.actionBoundaryPending) throw new Error("another automation action is already entering its execution boundary");
+    this.actionBoundaryPending = true;
     try {
-      const result = await completer.complete({ execute: true });
-      this.database.logAction({ sessionId, sequence: 1, type: "complete-map-mission", reason: result.reason, ok: result.ok, before: result.before, after: result.after, details: { missionBefore: result.missionBefore, missionAfter: result.missionAfter } });
-      this.database.endSession(sessionId, result.ok ? "complete" : "failed");
-      this.emit("automation-action", { action: { type: "complete-map-mission", ok: result.ok, reason: result.reason } });
-      return result;
-    } catch (error) {
-      this.database.endSession(sessionId, "error");
-      throw error;
+      await this.iconService.waitForIdle();
+      await this.connect();
+      const contextId = this.selection.probe.context.id;
+      const completer = new MapMissionCompleter({ client: this.lab.client, contextId, collectState: () => this.collectState(), settleMs: 1800 });
+      const sessionId = this.database.startSession("map-mission", { explicitUserAction: true });
+      try {
+        const result = await completer.complete({ execute: true });
+        this.database.logAction({ sessionId, sequence: 1, type: "complete-map-mission", reason: result.reason, ok: result.ok, before: result.before, after: result.after, details: { missionBefore: result.missionBefore, missionAfter: result.missionAfter } });
+        this.database.endSession(sessionId, result.ok ? "complete" : "failed");
+        this.emit("automation-action", { action: { type: "complete-map-mission", ok: result.ok, reason: result.reason } });
+        return result;
+      } catch (error) {
+        this.database.endSession(sessionId, "error");
+        throw error;
+      }
+    } finally {
+      this.actionBoundaryPending = false;
     }
   }
 
   async start(options = {}) {
-    if (this.running) throw new Error("自动化任务已在运行");
-    await this.connect();
-    this.running = true;
+    if (this.running || this.actionBoundaryPending) throw new Error("自动化任务已在运行");
+    this.actionBoundaryPending = true;
+    try {
+      await this.iconService.waitForIdle();
+      await this.connect();
+      this.running = true;
+    } finally {
+      this.actionBoundaryPending = false;
+    }
     this.pauseGate.reset();
     this.abortController = new AbortController();
     const sessionId = this.database.startSession("automatic", options);
@@ -473,6 +520,7 @@ class AutomationRuntime {
   async close() {
     this.stop();
     await this.activeRunPromise?.catch(() => {});
+    await this.iconService?.waitForIdle().catch(() => {});
     await this.lab?.close?.().catch(() => {});
     await this.connectionService.stop().catch(() => {});
     this.database.close();

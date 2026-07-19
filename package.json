@@ -1,0 +1,63 @@
+{
+  "name": "mini-game-adapter-lab",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Independent CDP runtime inspection and adapter lab for mini games",
+  "scripts": {
+    "start": "node run.cjs",
+    "console": "node run.cjs --external-cdp --no-open",
+    "web:dev": "concurrently -k \"node run.cjs --external-cdp --no-open\" \"vite --config web/vite.config.ts --host 127.0.0.1\"",
+    "web:build": "vite build --config web/vite.config.ts",
+    "wx:cdp": "node wmpf/src/index.js",
+    "wx:cdp:debug": "node wmpf/src/index.js --debug-main --debug-frida",
+    "wx:verify": "node scripts/inspect-app-runtime.cjs --verify",
+    "state:report": "node scripts/summarize-target-snapshot.cjs",
+    "captures:analyze": "node scripts/analyze-gameplay-captures.cjs",
+    "orders:analyze": "node scripts/analyze-order-captures.cjs",
+    "map-task:analyze": "node scripts/analyze-map-task-captures.cjs",
+    "catalog:build": "node scripts/build-item-catalog.cjs",
+    "inspect": "node src/cli.js inspect",
+    "status": "node src/cli.js status",
+    "board:scan": "node src/cli.js board-scan",
+    "board:merge": "node src/cli.js board-merge",
+    "board:auto": "node src/cli.js board-auto",
+    "order:submit": "node src/cli.js order-submit",
+    "map:complete": "node src/cli.js map-complete",
+    "warehouse:open": "node src/cli.js warehouse-open",
+    "warehouse:store": "node src/cli.js warehouse-store",
+    "orders:auto": "node src/cli.js orders-auto",
+    "auto": "node src/cli.js auto-loop",
+    "db:init": "node src/cli.js db-init",
+    "catalog:import": "node src/cli.js catalog-import",
+    "plan": "node src/cli.js plan",
+    "watch": "node src/cli.js watch",
+    "test": "node --test",
+    "check": "node --check run.cjs && node --check src/control-server.js && node --check src/automation-runtime.js && node --check wmpf/src/index.js && node --check wmpf/src/cdp_automation.js && npm run web:build && node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "archiver": "^8.0.0",
+    "echarts": "^6.1.0",
+    "frida": "17.15.5",
+    "jpeg-js": "^0.4.4",
+    "lucide-react": "^1.25.0",
+    "pngjs": "^7.0.0",
+    "protobufjs": "^7.5.4",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
+  }
+}
