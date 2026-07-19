@@ -10,11 +10,13 @@ const MODE_SCORE_DIMENSIONS = Object.freeze([
 
 function modeMetrics(mode, demands, board) {
   const relevant = new Map((demands || []).filter((demand) => Number(demand.deficitUnits) > 0).map((demand) => [String(demand.chainId), demand]));
-  let usefulUnitsPerClick = 0, outputCountPerClick = 0;
+  let usefulUnitsPerClick = 0;
+  const projectedOutputCount = Number(mode.planningDistribution?.feasibilityOutcomesPerAction);
+  let outputCountPerClick = Number.isFinite(projectedOutputCount) && projectedOutputCount > 0 ? projectedOutputCount : 0;
   const targetLevelHits = new Set();
   for (const drop of mode.drops || []) {
     const probability = Number(drop.probability ?? 1), count = Number(drop.count ?? drop.weight ?? 1);
-    outputCountPerClick += probability * count;
+    if (!(Number.isFinite(projectedOutputCount) && projectedOutputCount > 0)) outputCountPerClick += probability * count;
     const demand = relevant.get(String(drop.chainId));
     if (!demand || Number(drop.level || 0) > Number(demand.maxTargetLevel || Infinity)) continue;
     usefulUnitsPerClick += probability * count * Number(drop.baseUnits || 0);

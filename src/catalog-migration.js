@@ -34,9 +34,11 @@ function relationPayload(item) {
   };
 }
 
-function distributionFromDrops(drops, sampleSize) {
+function distributionFromDrops(drops, sampleSize, { configVersion = "unknown", extractionSource = "CreateData" } = {}) {
   return {
     source: "CreateData",
+    configVersion: String(configVersion),
+    extractionSource: String(extractionSource),
     sampleSpaceSize: Number(sampleSize || (drops || []).reduce((sum, drop) => sum + Number(drop.count || 0), 0)),
     outcomes: (drops || []).map((drop) => ({
       itemId: String(drop.itemId),
@@ -197,7 +199,10 @@ function migrateLegacyCatalogInTransaction(database, catalog, { sourceFile = nul
       chainId: producer.chainId == null ? null : String(producer.chainId),
       level: producer.level ?? null,
       energyCost: Number(producer.energyCost ?? 0),
-      theoreticalDistribution: distributionFromDrops(producer.drops || [], producer.sampleSize),
+      theoreticalDistribution: distributionFromDrops(producer.drops || [], producer.sampleSize, {
+        configVersion: catalog.schemaVersion ?? catalog.version ?? "legacy-unknown",
+        extractionSource: sourceFile ? `CreateData:${sourceFile}` : "CreateData",
+      }),
       observedDistribution: observedDistribution(actions),
       ...(producer.inferred ? { inferenceBasis: inferenceBasis(producer) } : {}),
     };

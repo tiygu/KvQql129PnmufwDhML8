@@ -1,5 +1,7 @@
 "use strict";
 
+const crypto = require("node:crypto");
+
 function buildCatalogEvidenceIndex(database) {
   return {
     objects: database.listCatalogObjects().map((summary) => ({
@@ -27,6 +29,10 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
     observationKeys.add(key);
     observations.push(observation);
   };
+  const recordProductionObservation = (observation) => database.recordProductionActionObservation?.({
+    ...observation,
+    actionId: String(observation.actionId || `production:${crypto.randomUUID()}`),
+  });
   const addIdentity = (itemId, detail = {}, sourceRef = "live-state") => {
     if (itemId == null || String(itemId) === "") return;
     const id = String(itemId);
@@ -65,6 +71,20 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
         },
         sourceType: "passive-runtime", sourceRef: `board-production-mode:${producer.index}:${modeId}`, countDuplicate: false,
       });
+      if (typeof database.upsertTheoreticalProductionDistribution === "function") {
+        const theoretical = mode.theoreticalDistribution || mode.productionDistribution;
+        if (theoretical?.outcomes?.length) {
+          database.upsertTheoreticalProductionDistribution({
+            producerItemId,
+            modeId,
+            theoreticalDistribution: {
+              ...theoretical,
+              configVersion: theoretical.configVersion || "runtime-unknown",
+              extractionSource: theoretical.extractionSource || theoretical.source || "runtime-production-mode",
+            },
+          });
+        }
+      }
     }
   }
 
@@ -102,6 +122,16 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
         outputs: [...counts].map(([itemId, count]) => ({ itemId, count, probability: 1 })),
       },
       sourceType: "verified-production-mode", sourceRef: `verified-production-mode:${producerItemId}:${modeId}`,
+    });
+    recordProductionObservation({ actionId: actionDiff.actionId, producerItemId, modeId, outcomeItemIds: actionDiff.actualOutputItemIds, attributable: true });
+  }
+  if (actionDiff?.uncertain === true || actionDiff?.type === "producer-touch" && actionDiff?.attributable === false) {
+    recordProductionObservation({
+      actionId: actionDiff.actionId,
+      producerItemId: actionDiff.producerItemId ?? null,
+      modeId: actionDiff.productionModeId ?? null,
+      attributable: false,
+      reason: actionDiff.reason || "production-action-uncertain",
     });
   }
   if (!observations.length) return [];

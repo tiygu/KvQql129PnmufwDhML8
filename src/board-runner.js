@@ -225,8 +225,8 @@ class BoardAutomationRunner {
       } else {
         if (state.empty <= 0) { stopReason = "board_full"; break; }
         let touches = 1;
-        const uncertainAction = { type: "producer-touch", producer: selectedProducer.index };
         const expectedModeId = options.plannedAction?.productionModeId ?? null;
+        const uncertainAction = { type: "producer-touch", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, productionModeId: expectedModeId ?? selectedProducer.currentProductionModeId ?? null, attributable: false, uncertain: true };
         if (expectedModeId != null && String(selectedProducer.currentProductionModeId) !== String(expectedModeId)) return { ok: false, executed: false, reason: "production_mode_mismatch", expectedModeId: String(expectedModeId), currentModeId: selectedProducer.currentProductionModeId, actions };
         const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected");
         if (!firstExecution.ok) return { ...firstExecution.failure, actions };

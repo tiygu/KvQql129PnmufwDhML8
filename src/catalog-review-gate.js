@@ -211,8 +211,8 @@ class CatalogReviewGate {
   }
 }
 
-function buildPlanningCatalogFromRepository(database, legacyCatalog, { includeProvisional = false } = {}) {
-  return database.getCatalogProjection({ includeProvisional });
+function buildPlanningCatalogFromRepository(database, legacyCatalog, { includeProvisional = false, executionMode = "assisted" } = {}) {
+  return database.getCatalogProjection({ includeProvisional, executionMode });
 }
 
 module.exports = { CatalogReviewGate, buildPlanningCatalogFromRepository, identityPayload, relationPayload, profilePayload, modePayload };

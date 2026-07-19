@@ -149,12 +149,15 @@ class AutomationRuntime {
   emit(type, payload = {}) { this.onEvent?.({ type, at: new Date().toISOString(), ...payload }); }
 
   getCatalogView({ includeRepositoryObjects = true } = {}) {
-    const projection = this.database.getCatalogProjection({ includeProvisional: true });
+    const executionMode = this.getSettings().mode;
+    const projection = this.database.getCatalogProjection({ includeProvisional: true, executionMode });
     const repository = { summary: this.database.getCatalogRepositorySummary() };
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
       repository.reviewQueue = this.database.getCatalogReviewQueue();
+      repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
+      repository.uncertainProductionActions = this.database.listUncertainProductionActions();
     }
     return {
       revision: projection.revision,
@@ -174,8 +177,8 @@ class AutomationRuntime {
     return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
   }
 
-  getPlanningCatalog({ includeProvisional = false } = {}) {
-    const catalog = buildPlanningCatalogFromRepository(this.database, null, { includeProvisional });
+  getPlanningCatalog({ includeProvisional = false, executionMode = "assisted" } = {}) {
+    const catalog = buildPlanningCatalogFromRepository(this.database, null, { includeProvisional, executionMode });
     return { ...catalog, evidence: buildCatalogEvidenceIndex(this.database) };
   }
 
@@ -477,7 +480,7 @@ class AutomationRuntime {
     if (this.connectionAutoStartEnabled && !connectionRoute.listening && !connectionRoute.starting) {
       this.ensureConnectionRoute().catch((error) => this.emit("connection-route-error", { error: error.message }));
     }
-    const planningCatalog = this.getPlanningCatalog({ includeProvisional: settings.mode === "observation" });
+    const planningCatalog = this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode });
     const plan = buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot });
     return {
       connected,
@@ -562,7 +565,7 @@ class AutomationRuntime {
     const mapCompleter = new MapMissionCompleter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
     const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs, onInventoryKnowledgeInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason) });
     const productionModes = new ProductionModeExecutor({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation" }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
+    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
     let sequence = 0;
     return new FullAutomationLoop({
       collectState,
@@ -571,8 +574,9 @@ class AutomationRuntime {
       runOrderCycle: (runOptions) => orderLoop.run(runOptions),
       completeMapMission: ({ signal }) => mapCompleter.complete({ execute: true, signal }),
       onEvent: (event) => {
-        if (sessionId) this.database.logAction({ sessionId, sequence: ++sequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
-        this.queuePassiveCatalogEvidence({ actionDiff: event.diff || event });
+        const actionSequence = ++sequence;
+        if (sessionId) this.database.logAction({ sessionId, sequence: actionSequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
+        this.queuePassiveCatalogEvidence({ actionDiff: { ...(event.diff || event), actionId: `${sessionId || "runtime"}:${actionSequence}`, reason: event.reason } });
         this.emit("automation-action", { action: event });
       },
       waitIfPaused: (signal) => this.pauseGate.wait(signal),

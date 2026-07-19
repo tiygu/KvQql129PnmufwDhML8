@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { canonicalJson } = require("./canonical-json");
 const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
+const { createDistributionState, updateDistributionState, replaceTheory, projectPlanningDistribution } = require("./production-distributions");
 
 const CATALOG_VERSION_STATES = new Set(["observed", "provisional", "active"]);
 const CATALOG_VERSION_ORIGINS = new Set(["user", "legacy-migration", "inference-gate", "observation", "unspecified"]);
@@ -255,6 +256,21 @@ class AutomationDatabase {
         coins REAL, energy REAL, diamonds REAL, scene TEXT, observed_at TEXT NOT NULL,
         FOREIGN KEY(session_id) REFERENCES automation_sessions(id)
       );
+      CREATE TABLE IF NOT EXISTS production_distribution_states (
+        producer_item_id TEXT NOT NULL, mode_id TEXT NOT NULL,
+        state_json TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL,
+        PRIMARY KEY(producer_item_id, mode_id)
+      );
+      CREATE TABLE IF NOT EXISTS production_action_observations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, action_id TEXT NOT NULL UNIQUE,
+        producer_item_id TEXT, mode_id TEXT, attributable INTEGER NOT NULL,
+        outcome_json TEXT NOT NULL, reason TEXT, observed_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS production_distribution_review_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, producer_item_id TEXT NOT NULL, mode_id TEXT NOT NULL,
+        event_type TEXT NOT NULL, fingerprint TEXT NOT NULL UNIQUE, details_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_actions_session_sequence ON actions(session_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_observations_entity ON catalog_observations(entity_type, entity_id);
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_state ON catalog_repository_objects(status, object_type);
@@ -268,6 +284,8 @@ class AutomationDatabase {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_icon_candidates_one_selected ON catalog_icon_candidates(object_id) WHERE selected=1;
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_selection_history_object ON catalog_icon_selection_history(object_id,id);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
+      CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
+      CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);
     `);
     const versionColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_versions)").all().map((column) => column.name));
     if (!versionColumns.has("origin")) this.db.exec("ALTER TABLE catalog_repository_versions ADD COLUMN origin TEXT NOT NULL DEFAULT 'unspecified'");
@@ -806,10 +824,93 @@ class AutomationDatabase {
   getCatalogRevision() {
     const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,revision FROM catalog_repository_objects ORDER BY object_type,object_id").all();
     const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
-    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts })).digest("hex");
+    const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
+    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions })).digest("hex");
   }
 
-  getCatalogProjection({ includeProvisional = false } = {}) {
+  upsertTheoreticalProductionDistribution({ producerItemId, modeId, theoreticalDistribution, observedAt = new Date().toISOString() }) {
+    const producer = String(producerItemId || ""), mode = String(modeId || "");
+    if (!producer || !mode) throw new TypeError("producerItemId and modeId are required");
+    return this.transaction(() => {
+      const row = this.db.prepare("SELECT * FROM production_distribution_states WHERE producer_item_id=? AND mode_id=?").get(producer, mode);
+      let state = row
+        ? replaceTheory(parseJson(row.state_json), theoreticalDistribution)
+        : createDistributionState({ producerItemId: producer, modeId: mode, theoreticalDistribution });
+      if (row && canonicalJson(parseJson(row.state_json).theoreticalDistribution) === canonicalJson(state.theoreticalDistribution)) return this.getProductionDistribution(producer, mode);
+      if (!row) {
+        const pending = this.db.prepare(`SELECT action_id,outcome_json FROM production_action_observations
+          WHERE attributable=1 AND producer_item_id=? AND mode_id=? ORDER BY id`).all(producer, mode);
+        for (const action of pending) state = updateDistributionState(state, { actionId: action.action_id, outcomeItemIds: parseJson(action.outcome_json), attributable: true });
+      }
+      this.db.prepare(`INSERT INTO production_distribution_states(producer_item_id,mode_id,state_json,revision,updated_at)
+        VALUES(?,?,?,?,?) ON CONFLICT(producer_item_id,mode_id) DO UPDATE SET state_json=excluded.state_json,revision=production_distribution_states.revision+1,updated_at=excluded.updated_at`)
+        .run(producer, mode, JSON.stringify(state), 1, observedAt);
+      this._recordProductionDistributionReview(state, observedAt);
+      return this.getProductionDistribution(producer, mode);
+    });
+  }
+
+  recordProductionActionObservation({ actionId, producerItemId = null, modeId = null, outcomeItemIds = [], attributable = false, reason = null, observedAt = new Date().toISOString() }) {
+    const normalizedActionId = String(actionId || "");
+    if (!normalizedActionId) throw new TypeError("production observation actionId is required");
+    return this.transaction(() => {
+      const duplicate = this.db.prepare("SELECT id FROM production_action_observations WHERE action_id=?").get(normalizedActionId);
+      if (duplicate) return { duplicate: true, state: producerItemId != null && modeId != null ? this.getProductionDistribution(producerItemId, modeId) : null };
+      const attributableAction = attributable === true;
+      const producer = attributableAction ? String(producerItemId || "") : (producerItemId == null ? null : String(producerItemId));
+      const mode = attributableAction ? String(modeId || "") : (modeId == null ? null : String(modeId));
+      const assignedOutcomes = attributableAction ? outcomeItemIds.map(String).filter(Boolean) : [];
+      if (attributableAction && (!producer || !mode || !assignedOutcomes.length)) throw new TypeError("attributable production observations require producer, mode, and outcomes");
+      this.db.prepare(`INSERT INTO production_action_observations(action_id,producer_item_id,mode_id,attributable,outcome_json,reason,observed_at)
+        VALUES(?,?,?,?,?,?,?)`).run(normalizedActionId, producer, mode, attributableAction ? 1 : 0, JSON.stringify(assignedOutcomes), reason, observedAt);
+      if (!attributableAction) return { duplicate: false, uncertain: true, state: null };
+      const row = this.db.prepare("SELECT * FROM production_distribution_states WHERE producer_item_id=? AND mode_id=?").get(producer, mode);
+      if (!row) return { duplicate: false, uncertain: false, pendingTheory: true, state: null };
+      const previous = parseJson(row.state_json);
+      const state = updateDistributionState(previous, { actionId: normalizedActionId, outcomeItemIds: assignedOutcomes, attributable: true });
+      this.db.prepare("UPDATE production_distribution_states SET state_json=?,revision=revision+1,updated_at=? WHERE producer_item_id=? AND mode_id=?")
+        .run(JSON.stringify(state), observedAt, producer, mode);
+      this._recordProductionDistributionReview(state, observedAt);
+      return { duplicate: false, uncertain: false, state };
+    });
+  }
+
+  _recordProductionDistributionReview(state, observedAt) {
+    if (!state.confidence.reviewRequired) return null;
+    const details = { theoreticalDistribution: state.theoreticalDistribution, observedDistribution: state.observedDistribution, confidence: state.confidence };
+    const fingerprint = crypto.createHash("sha256").update(canonicalJson({ producer: state.producerItemId, mode: state.modeId, configVersion: state.theoreticalDistribution.configVersion, extractionSource: state.theoreticalDistribution.extractionSource })).digest("hex");
+    return this.db.prepare(`INSERT INTO production_distribution_review_events(producer_item_id,mode_id,event_type,fingerprint,details_json,status,created_at)
+      VALUES(?,?,?,?,?,'open',?) ON CONFLICT(fingerprint) DO UPDATE SET details_json=excluded.details_json,status='open'`)
+      .run(state.producerItemId, state.modeId, "theory-observation-conflict", fingerprint, JSON.stringify(details), observedAt);
+  }
+
+  getProductionDistribution(producerItemId, modeId, { executionMode = null } = {}) {
+    const row = this.db.prepare("SELECT * FROM production_distribution_states WHERE producer_item_id=? AND mode_id=?").get(String(producerItemId), String(modeId));
+    if (!row) return null;
+    const state = parseJson(row.state_json);
+    return { ...state, revision: Number(row.revision), updatedAt: row.updated_at, ...(executionMode ? { planningDistribution: projectPlanningDistribution(state, executionMode) } : {}) };
+  }
+
+  listProductionDistributions({ executionMode = null } = {}) {
+    return this.db.prepare("SELECT producer_item_id,mode_id FROM production_distribution_states ORDER BY producer_item_id,mode_id").all()
+      .map((row) => this.getProductionDistribution(row.producer_item_id, row.mode_id, { executionMode }));
+  }
+
+  listUncertainProductionActions() {
+    return this.db.prepare("SELECT * FROM production_action_observations WHERE attributable=0 ORDER BY id").all().map((row) => ({
+      id: Number(row.id), actionId: row.action_id, producerItemId: row.producer_item_id, modeId: row.mode_id,
+      attributable: false, assignedOutcomeItemIds: parseJson(row.outcome_json), reason: row.reason, observedAt: row.observed_at,
+    }));
+  }
+
+  listProductionDistributionReviewEvents({ status = "open" } = {}) {
+    const rows = status == null
+      ? this.db.prepare("SELECT * FROM production_distribution_review_events ORDER BY id").all()
+      : this.db.prepare("SELECT * FROM production_distribution_review_events WHERE status=? ORDER BY id").all(String(status));
+    return rows.map((row) => ({ id: Number(row.id), producerItemId: row.producer_item_id, modeId: row.mode_id, eventType: row.event_type, details: parseJson(row.details_json), status: row.status, createdAt: row.created_at }));
+  }
+
+  getCatalogProjection({ includeProvisional = false, executionMode = "assisted" } = {}) {
     const objects = this.listCatalogObjects();
     const byType = (objectType) => objects.filter((object) => object.objectType === objectType);
     const planningPayload = (summary) => {
@@ -847,14 +948,25 @@ class AutomationDatabase {
     const itemById = new Map(items.map((item) => [item.id, item]));
     const productionModes = byType("production-mode").map((summary) => {
       const mode = planningPayload(summary);
-      if (!mode || !itemById.has(String(mode.producerItemId)) || !(mode.outputs || []).every((output) => itemById.has(String(output.itemId)))) return null;
+      if (!mode || !itemById.has(String(mode.producerItemId))) return null;
+      const distributionState = this.getProductionDistribution(mode.producerItemId, mode.modeId, { executionMode });
+      const planningDistribution = distributionState?.planningDistribution || null;
+      const proposedOutputs = planningDistribution?.outcomes || mode.outputs || [];
+      const outputs = proposedOutputs.filter((output) => itemById.has(String(output.itemId)));
+      if (!outputs.length || (!planningDistribution && outputs.length !== proposedOutputs.length)) return null;
+      const unavailableOutcomeMass = proposedOutputs.filter((output) => !itemById.has(String(output.itemId))).reduce((sum, output) => sum + Number(output.probability || 0), 0);
       return {
         producerItemId: String(mode.producerItemId), modeId: String(mode.modeId), energyCost: Number(mode.energyCost),
         unlocked: mode.unlocked !== false, switchEntry: mode.switchEntry ? { ...mode.switchEntry } : { status: "unknown", method: null },
         humanLocked: !!mode.humanLocked, inferred: summary.status === "provisional", repositoryRevision: summary.revision,
-        drops: (mode.outputs || []).map((output) => {
+        theoreticalDistribution: distributionState?.theoreticalDistribution || null,
+        observedDistribution: distributionState?.observedDistribution || null,
+        planningDistribution,
+        confidence: distributionState?.confidence || null,
+        uncertaintyMass: planningDistribution ? Math.min(1, Number(planningDistribution.uncertaintyMass || 0) + unavailableOutcomeMass) : null,
+        drops: outputs.map((output) => {
           const item = itemById.get(String(output.itemId));
-          return { itemId: String(output.itemId), count: Number(output.count), probability: Number(output.probability), chainId: item.chainId, level: item.level, baseUnits: item.baseUnits };
+          return { itemId: String(output.itemId), count: Number(output.count ?? 1), probability: Number(output.probability), expectedProbability: Number(output.expectedProbability ?? output.probability), uncertainty: output.uncertainty || null, chainId: item.chainId, level: item.level, baseUnits: item.baseUnits };
         }),
       };
     }).filter(Boolean);

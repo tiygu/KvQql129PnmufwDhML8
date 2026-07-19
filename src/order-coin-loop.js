@@ -195,7 +195,7 @@ class OrderCoinLoop {
       if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: plannedAction || { type: state.board.mergeCandidates.length ? "merge" : "produce", producer }, actions, state, plan };
       const boardResult = await this.runBoardAction({ producer, merge: plannedAction?.type === "merge" ? plannedAction : null, plannedAction, signal });
       const verified = boardResult.ok && (boardResult.actions?.length > 0 || boardResult.stopReason === "order_ready");
-      actions.push({ step: actions.length + 1, type: boardResult.actions?.[0]?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff: boardResult.actions?.[0] || null });
+      actions.push({ step: actions.length + 1, type: boardResult.actions?.[0]?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff: boardResult.actions?.[0] || boardResult.uncertainAction || null });
       this.onEvent?.(actions.at(-1));
       if (!verified) return { ok: false, executed: true, reason: boardResult.reason || boardResult.stopReason || "board-action-failed", targetSlot: this.targetSlot, actions, boardResult };
     }
