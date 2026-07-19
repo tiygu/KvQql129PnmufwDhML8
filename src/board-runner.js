@@ -1,0 +1,292 @@
+"use strict";
+
+const { setTimeout: delay } = require("node:timers/promises");
+
+const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
+  ${runtimePrelude(false)}
+  const safe = (fn, fallback = null) => { try { return fn(); } catch (_) { return fallback; } };
+  const taskManager = (runtime?.mManagers || []).find((manager) => manager?.clientTaskDataMap instanceof Map);
+  const orders = [];
+  const requiredCounts = new Map();
+  const root = taskManager?.clientTaskDataMap;
+  if (root instanceof Map) {
+    for (const nested of root.values()) {
+      if (!(nested instanceof Map)) continue;
+      for (const [slot, task] of nested.entries()) {
+        const items = (Array.isArray(task?.itemInfos) ? task.itemInfos : []).map((item) => ({
+          itemId: String(safe(() => item.itemId, "")),
+          complete: !!safe(() => item.isComplete, false)
+        }));
+        for (const item of items) if (item.itemId) requiredCounts.set(item.itemId, (requiredCounts.get(item.itemId) || 0) + 1);
+        orders.push({
+          slot: String(slot),
+          taskId: safe(() => task.taskId, null),
+          rewardCoins: safe(() => task.rewards?.find?.((reward) => Number(reward.type) === 1)?.count, null),
+          items,
+          ready: items.length > 0 && items.every((item) => item.complete)
+        });
+      }
+    }
+  }
+  const describe = (grid) => ({
+    index: grid.index,
+    itemId: String(safe(() => grid.itemId, "")),
+    empty: !!safe(() => grid.isEmpty, true),
+    normal: !!safe(() => grid.isNormal, false),
+    moveable: !!safe(() => grid.isMoveable, false),
+    locked: !!grid.isLocking,
+    frozen: !!safe(() => grid.isFrozen, false),
+    taskNeed: !!safe(() => grid.item?.taskNeed, false),
+    level: safe(() => grid.item.itemConfig.Level, null),
+    mergeTarget: safe(() => grid.item.itemConfig.MergeTarget, null),
+    produceCount: safe(() => grid.item.produceCount, null),
+    energyCost: safe(() => grid.item.itemConfig.EnergyCost, null)
+  });
+  const boardGrids = grids.map(describe);
+  const groups = new Map();
+  for (const grid of grids) {
+    const itemId = String(safe(() => grid.itemId, ""));
+    if (!itemId || !safe(() => grid.isNormal, false) || !safe(() => grid.isMoveable, false) || grid.isLocking || safe(() => grid.isFrozen, false)) continue;
+    if (typeof safe(() => grid.item?.produceCount) === "number" && Number(safe(() => grid.item?.itemConfig?.EnergyCost, 0)) > 0) continue;
+    if (!groups.has(itemId)) groups.set(itemId, []);
+    groups.get(itemId).push(grid);
+  }
+  const mergeCandidates = [];
+  for (const [itemId, values] of groups) {
+    values.sort((left, right) => Number(!!safe(() => left.item?.taskNeed, false)) - Number(!!safe(() => right.item?.taskNeed, false)));
+    const usable = values.slice(0, Math.max(0, values.length - (requiredCounts.get(itemId) || 0)));
+    for (let index = 0; index + 1 < usable.length; index += 2) {
+      const source = usable[index], target = usable[index + 1];
+      if (!safe(() => boardView._operatorCenter.itemCanMergeWith(source.item, target.item), false)) continue;
+      mergeCandidates.push({
+        itemId,
+        from: source.index,
+        to: target.index,
+        mergeTarget: safe(() => source.item.itemConfig.MergeTarget, null),
+        level: safe(() => source.item.itemConfig.Level, null),
+        predictedResult: safe(() => boardView._dragHandler.predictDragResult(source, target), null)
+      });
+    }
+  }
+  const producers = grids.filter((grid) =>
+    grid.item && typeof safe(() => grid.item.produceCount) === "number" &&
+    Number(safe(() => grid.item.itemConfig.EnergyCost, 0)) > 0 &&
+    Number(safe(() => grid.item.produceCount, 0)) > 0 && !grid.isLocking
+  ).map(describe);
+  return {
+    ok: true,
+    boardVisible: !!controller.isViewVisible,
+    width: safe(() => gameBoard.size.width),
+    height: safe(() => gameBoard.size.height),
+    signature: boardGrids.map((grid) => grid.itemId).join("|"),
+    occupied: boardGrids.filter((grid) => !grid.empty).length,
+    empty: boardGrids.filter((grid) => grid.empty).length,
+    grids: boardGrids,
+    orders,
+    readyOrders: orders.filter((order) => order.ready),
+    requiredItemCounts: Object.fromEntries(requiredCounts),
+    mergeCandidates,
+    producers
+  };
+})()`;
+
+function runtimePrelude(requireVisible = true) {
+  return `
+    const G = globalThis;
+    const cc = G.cc || G.GameGlobal?.cc;
+    const scene = cc?.director?.getScene?.();
+    const entry = scene?.getChildByName?.("Entry") || scene?.children?.find?.((node) => node?.name === "Entry");
+    const runtime = (entry?._components || []).find((component) => Array.isArray(component?.mControllers));
+    const controller = runtime?.mControllers?.find((item) => item?._controllerClazzName === "UserBoardViewController");
+    const boardView = controller?.view?._boardView?._gameBoardView;
+    const gameBoard = boardView?._boardStore?._state?._gameBoard;
+    const grids = gameBoard?.__private_95_grids;
+    if (!controller || !boardView || !Array.isArray(grids)) return { ok: false, reason: "board_runtime_not_found" };
+    ${requireVisible ? "if (!controller.isViewVisible) return { ok: false, reason: \"board_not_visible\" };" : ""}
+  `;
+}
+
+function buildAtomicProducerTouchExpression(index) {
+  const gridIndex = Number(index);
+  if (!Number.isInteger(gridIndex)) throw new Error("producer index must be an integer");
+  return `(() => {${runtimePrelude()}
+    const grid = grids[${gridIndex}];
+    if (!grid?.item || typeof grid.item.produceCount !== "number" || Number(grid.item.itemConfig?.EnergyCost || 0) <= 0) {
+      return { ok: false, reason: "selected_grid_is_not_producer", index: ${gridIndex} };
+    }
+    const selectedBefore = boardView._touchHandler?.currentSelectedBoardGrid?.index ?? null;
+    boardView.onTouch(grid.center);
+    return { ok: true, type: "producer-touch", index: grid.index, itemId: String(grid.itemId || ""), selectedBefore };
+  })()`;
+}
+
+function buildAtomicMergeExpression(from, to) {
+  const sourceIndex = Number(from);
+  const targetIndex = Number(to);
+  if (!Number.isInteger(sourceIndex) || !Number.isInteger(targetIndex) || sourceIndex === targetIndex) throw new Error("merge indexes must be distinct integers");
+  return `(async () => {${runtimePrelude()}
+    const source = grids[${sourceIndex}], target = grids[${targetIndex}];
+    if (!source || !target) return { ok: false, reason: "grid_not_found", from: ${sourceIndex}, to: ${targetIndex} };
+    const canMerge = !!boardView._operatorCenter.itemCanMergeWith(source.item, target.item);
+    if (!canMerge) return { ok: false, reason: "pair_not_mergeable", from: ${sourceIndex}, to: ${targetIndex} };
+    const before = { sourceItemId: String(source.itemId || ""), targetItemId: String(target.itemId || ""), expectedTarget: source.item?.itemConfig?.MergeTarget ?? null };
+    boardView.onDragStart(source.center);
+    boardView.onDragMove(source.center, target.center);
+    await Promise.resolve(boardView.onDragEnd(source.center, target.center));
+    return { ok: true, type: "merge", from: source.index, to: target.index, before };
+  })()`;
+}
+
+class BoardAutomationRunner {
+  constructor(options) {
+    this.client = options.client;
+    this.contextId = options.contextId;
+    this.delayMs = Math.max(300, Math.min(5000, Number(options.delayMs ?? 1200)));
+    this.evaluateTimeoutMs = Math.max(5000, Number(options.evaluateTimeoutMs ?? 10000));
+  }
+
+  evaluate(expression) {
+    return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs });
+  }
+
+  readState() {
+    return this.evaluate(BOARD_CONTROL_STATE_EXPRESSION);
+  }
+
+  async waitForSettle() {
+    await delay(this.delayMs);
+  }
+
+  async executeAtomicAndRead(expression, uncertainAction, rejectedReason) {
+    let acknowledgement;
+    try {
+      acknowledgement = await this.evaluate(expression);
+    } catch (error) {
+      return { ok: false, failure: { ok: false, executed: true, reason: "atomic_action_error", error: error.message, uncertainAction } };
+    }
+    if (!acknowledgement?.ok) return { ok: false, failure: { ok: false, executed: true, reason: acknowledgement?.reason || rejectedReason, failedAction: acknowledgement } };
+    await this.waitForSettle();
+    try {
+      return { ok: true, acknowledgement, state: await this.readState() };
+    } catch (error) {
+      return { ok: false, failure: { ok: false, executed: true, reason: "verification_read_error", error: error.message, uncertainAction } };
+    }
+  }
+
+  async run(options = {}) {
+    const maxActions = Math.max(1, Math.min(100, Number(options.maxActions ?? 10)));
+    const requestedProducer = options.producer == null || options.producer === "" ? null : Number(options.producer);
+    if (requestedProducer != null && !Number.isInteger(requestedProducer)) throw new Error("board-auto requires an integer --producer index");
+    const requestedMerge = options.merge == null ? null : { from: Number(options.merge.from), to: Number(options.merge.to) };
+    if (requestedMerge && (!Number.isInteger(requestedMerge.from) || !Number.isInteger(requestedMerge.to) || requestedMerge.from === requestedMerge.to)) throw new Error("board-auto requires distinct integer merge indexes");
+    const execute = !!options.execute;
+    let state;
+    try {
+      state = await this.readState();
+    } catch (error) {
+      return { ok: false, executed: false, reason: "state_read_error", error: error.message };
+    }
+    if (!state?.ok) return { ok: false, executed: false, reason: state?.reason || "state_read_failed" };
+    const selectedProducer = requestedProducer == null ? state.producers[0] : state.producers.find((item) => item.index === requestedProducer);
+    const preview = { candidates: state.mergeCandidates, producers: state.producers, selectedProducer: selectedProducer || null, empty: state.empty };
+    if (!execute) return { ok: true, executed: false, maxActions, delayMs: this.delayMs, preview };
+    if (!state.boardVisible) return { ok: false, executed: false, reason: "board_not_visible", preview };
+    if (!selectedProducer && (!state.mergeCandidates.length || options.plannedAction?.type === "produce")) return { ok: false, executed: false, reason: "producer_not_found", preview };
+    if (requestedMerge && !state.mergeCandidates.some((candidate) => Number(candidate.from) === requestedMerge.from && Number(candidate.to) === requestedMerge.to)) return { ok: false, executed: false, reason: "planned_merge_not_available", preview, requestedMerge };
+
+    const actions = [];
+    let stopReason = "max_actions_reached";
+    for (let step = 0; step < maxActions; step += 1) {
+      if (options.signal?.aborted) { stopReason = "aborted"; break; }
+      if (!state.boardVisible) { stopReason = "board_not_visible"; break; }
+      if (state.readyOrders.length) { stopReason = "order_ready"; break; }
+      const before = state;
+      if (state.mergeCandidates.length && options.plannedAction?.type !== "produce") {
+        const candidate = requestedMerge
+          ? state.mergeCandidates.find((entry) => Number(entry.from) === requestedMerge.from && Number(entry.to) === requestedMerge.to)
+          : state.mergeCandidates[0];
+        const execution = await this.executeAtomicAndRead(buildAtomicMergeExpression(candidate.from, candidate.to), { type: "merge", from: candidate.from, to: candidate.to }, "merge_rejected");
+        if (!execution.ok) return { ...execution.failure, actions };
+        state = execution.state;
+        const source = state.grids.find((grid) => grid.index === candidate.from), target = state.grids.find((grid) => grid.index === candidate.to);
+        const changed = state.signature !== before.signature;
+        const verified = changed && source?.empty && (!candidate.mergeTarget || String(target?.itemId) === String(candidate.mergeTarget));
+        actions.push({ step: step + 1, type: "merge", from: candidate.from, to: candidate.to, itemId: candidate.itemId, expectedTarget: candidate.mergeTarget, actualTarget: target?.itemId ?? null, verified });
+        if (!verified) { stopReason = changed ? "merge_verification_failed" : "no_state_change"; break; }
+      } else {
+        if (state.empty <= 0) { stopReason = "board_full"; break; }
+        let touches = 1;
+        const uncertainAction = { type: "producer-touch", producer: selectedProducer.index };
+        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index), uncertainAction, "producer_touch_rejected");
+        if (!firstExecution.ok) return { ...firstExecution.failure, actions };
+        state = firstExecution.state;
+        if (state.signature === before.signature) {
+          touches = 2;
+          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index), uncertainAction, "producer_touch_rejected");
+          if (!secondExecution.ok) return { ...secondExecution.failure, actions };
+          state = secondExecution.state;
+        }
+        const verified = state.signature !== before.signature;
+        actions.push({ step: step + 1, type: "produce", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, touches, emptyBefore: before.empty, emptyAfter: state.empty, verified });
+        if (!verified) { stopReason = "no_state_change"; break; }
+      }
+      if (!state?.ok) { stopReason = state?.reason || "state_read_failed"; break; }
+      if (state.readyOrders.length) { stopReason = "order_ready"; break; }
+    }
+    return {
+      ok: actions.every((action) => action.verified),
+      executed: true,
+      producer: selectedProducer,
+      actions,
+      stopReason,
+      completedBoundary: state.readyOrders,
+      final: { empty: state.empty, remainingCandidates: state.mergeCandidates.length, signature: state.signature }
+    };
+  }
+}
+
+function printBoardRunnerResult(result, output = console) {
+  if (!result?.ok) {
+    output.log(`链式自动化未完成：${result?.reason || result?.stopReason || "unknown"}`);
+    if (result?.actions?.length) output.table(formatActions(result.actions));
+    return;
+  }
+  if (!result.executed) {
+    output.log(`链式预检：空格 ${result.preview.empty}，安全合成组合 ${result.preview.candidates.length}，可用产出物 ${result.preview.producers.length}`);
+    output.table(result.preview.producers.map((item) => ({ 格子: item.index, 物品ID: item.itemId, 剩余产出: item.produceCount, 体力消耗: item.energyCost })));
+    if (result.preview.selectedProducer) output.log(`默认产出物：格 ${result.preview.selectedProducer.index}（${result.preview.selectedProducer.itemId}）`);
+    output.log("加入 --execute true 后开始Node侧单步循环。");
+    return;
+  }
+  output.log(`链式自动化完成：执行 ${result.actions.length} 步，停止原因 ${result.stopReason}`);
+  output.table(formatActions(result.actions));
+  output.log(`最终空格：${result.final.empty}；剩余安全合成组合：${result.final.remainingCandidates}`);
+  if (result.completedBoundary?.length) {
+    output.log("已达到订单边界（订单物品全部满足，等待提交）：");
+    output.table(result.completedBoundary.map((order) => ({ 槽位: order.slot, 订单ID: order.taskId, 奖励金币: order.rewardCoins, 物品ID: order.items.map((item) => item.itemId).join(", ") })));
+  }
+}
+
+function formatActions(actions) {
+  return actions.map((action) => action.type === "merge" ? {
+    步骤: action.step,
+    操作: "合成",
+    来源: `${action.from}:${action.itemId}`,
+    结果: `${action.to}:${action.actualTarget ?? "unknown"}`,
+    验证: action.verified ? "通过" : "失败",
+  } : {
+    步骤: action.step,
+    操作: "点击产出物",
+    来源: `${action.producer}:${action.producerItemId}`,
+    结果: `触摸${action.touches}次，空格 ${action.emptyBefore}→${action.emptyAfter}`,
+    验证: action.verified ? "通过" : "失败",
+  });
+}
+
+module.exports = {
+  BOARD_CONTROL_STATE_EXPRESSION,
+  buildAtomicProducerTouchExpression,
+  buildAtomicMergeExpression,
+  BoardAutomationRunner,
+  printBoardRunnerResult,
+};

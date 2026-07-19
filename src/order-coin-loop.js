@@ -69,8 +69,10 @@ class OrderCoinLoop {
         this.onEvent?.(actions.at(-1));
         return { ok: submitted.ok, executed: true, reason: submitted.reason, targetSlot: this.targetSlot, actions, submission: submitted };
       }
-      const mergeAvailable = (state.board?.mergeCandidates || []).length > 0;
-      if (!mergeAvailable && Number(state.board?.empty ?? Infinity) <= this.minEmptySpaces) {
+      const plannedAction = target.nextAction || null;
+      const mergeAvailable = plannedAction?.type === "merge" || (state.board?.mergeCandidates || []).length > 0;
+      const plannedSpaceSafe = !!plannedAction && target.boardSpaceFeasibility?.feasible === true;
+      if (!mergeAvailable && !plannedSpaceSafe && Number(state.board?.empty ?? Infinity) <= this.minEmptySpaces) {
         const warehouseCandidate = this.storeBoardItem ? selectWarehouseCandidate(state) : null;
         if (warehouseCandidate) {
           if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: { type: "move-to-warehouse", index: warehouseCandidate.index, itemId: warehouseCandidate.itemId }, actions, state, plan };
@@ -83,14 +85,14 @@ class OrderCoinLoop {
         }
         return { ok: true, executed: execute, reason: "waiting-board-space", targetSlot: this.targetSlot, actions, state, plan };
       }
-      const producer = target.producerSteps?.[0]?.gridIndex;
+      const producer = plannedAction?.type === "produce" ? plannedAction.producer : target.producerSteps?.[0]?.gridIndex;
       if (producer == null && !mergeAvailable) {
         const boundary = target.blockingReason || plan.boundaryReason || "no-executable-action";
         const reason = String(boundary).startsWith("waiting-") ? boundary : `waiting-${boundary}`;
         return { ok: true, executed: execute, reason, targetSlot: this.targetSlot, actions, state, plan };
       }
-      if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: { type: state.board.mergeCandidates.length ? "merge" : "produce", producer }, actions, state, plan };
-      const boardResult = await this.runBoardAction({ producer, signal });
+      if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: plannedAction || { type: state.board.mergeCandidates.length ? "merge" : "produce", producer }, actions, state, plan };
+      const boardResult = await this.runBoardAction({ producer, merge: plannedAction?.type === "merge" ? plannedAction : null, plannedAction, signal });
       const verified = boardResult.ok && (boardResult.actions?.length > 0 || boardResult.stopReason === "order_ready");
       actions.push({ step: actions.length + 1, type: boardResult.actions?.[0]?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff: boardResult.actions?.[0] || null });
       this.onEvent?.(actions.at(-1));

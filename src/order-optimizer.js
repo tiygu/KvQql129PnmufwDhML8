@@ -1,6 +1,7 @@
 "use strict";
 
 const { gridUnavailabilityReasons } = require("./inventory-availability");
+const { normalizePlannerState, planDeterministicOrder, comparePathScores } = require("./space-planner");
 
 function countBy(values, keyOf) {
   const result = new Map();
@@ -17,13 +18,18 @@ function countsObject(grids) {
 
 function rankPlans(plans, strategy = "efficiency", prioritySlot = null) {
   const feasible = plans.filter((plan) => plan.feasible);
-  const common = (a, b) => Number(b.ready) - Number(a.ready) || Number(b.mergeOnly) - Number(a.mergeOnly);
-  if (strategy === "specified" && prioritySlot != null) {
-    const specified = feasible.find((plan) => String(plan.slot) === String(prioritySlot));
-    if (specified) return [specified, ...feasible.filter((plan) => plan !== specified)];
-  }
+  const common = (a, b) => {
+    if (a.pathScore && b.pathScore) {
+      const comparison = comparePathScores(a.pathScore, b.pathScore);
+      if (comparison) return comparison;
+    }
+    return Number(b.ready) - Number(a.ready) || Number(b.mergeOnly) - Number(a.mergeOnly);
+  };
   if (strategy === "min-energy" || strategy === "fastest") {
     return [...feasible].sort((a, b) => common(a, b) || a.estimatedEnergy - b.estimatedEnergy || b.rewardCoins - a.rewardCoins);
+  }
+  if (strategy === "specified" && prioritySlot != null) {
+    return [...feasible].sort((a, b) => common(a, b) || Number(String(b.slot) === String(prioritySlot)) - Number(String(a.slot) === String(prioritySlot)) || b.efficiency - a.efficiency);
   }
   return [...feasible].sort((a, b) => common(a, b) || b.efficiency - a.efficiency || a.estimatedEnergy - b.estimatedEnergy);
 }
@@ -210,6 +216,38 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
       evidenceBlock,
     };
   });
+
+  if (gameState) {
+    const normalizedState = normalizePlannerState({ state, catalog });
+    const hasStochasticProduction = (catalog.producers || []).some((producer) => producer.drops?.length !== 1 || Number(producer.drops?.[0]?.probability) !== 1);
+    for (const plan of plans) {
+      const spacePlan = planDeterministicOrder(normalizedState, plan.slot);
+      plan.nextAction = spacePlan.nextAction;
+      plan.boardSpaceFeasibility = spacePlan.boardSpaceFeasibility;
+      plan.explanation = spacePlan.explanation;
+      plan.pathScore = spacePlan.score || null;
+      if (spacePlan.status === "planned") {
+        plan.actionable = true;
+        if (!plan.evidenceBlock && plan.blockingReason !== "inventory-unavailable") plan.feasible = true;
+        if (!plan.ready && Number.isFinite(spacePlan.energyRequired)) {
+          plan.estimatedEnergy = spacePlan.energyRequired;
+          plan.efficiency = spacePlan.energyRequired > 0 ? plan.rewardCoins / spacePlan.energyRequired : 0;
+        }
+      } else if (normalizedState.board.spaceKnown && spacePlan.reason === "board-space-deadlock") {
+        plan.feasible = false;
+        plan.actionable = false;
+        plan.blockingReason = "board-space-deadlock";
+      } else if (spacePlan.reason === "insufficient-energy") {
+        plan.feasible = false;
+        plan.actionable = false;
+        plan.blockingReason = "insufficient-energy";
+      } else if (!hasStochasticProduction && spacePlan.reason === "deterministic-path-not-found" && plan.supplyFeasible) {
+        plan.feasible = false;
+        plan.actionable = false;
+        plan.blockingReason = "deterministic-path-not-found";
+      }
+    }
+  }
 
   for (const plan of plans) plan.affordable = plan.feasible && (plan.ready || !Number.isFinite(energyAvailable) || plan.estimatedEnergy <= energyAvailable);
   const feasible = plans.filter((plan) => plan.feasible);
