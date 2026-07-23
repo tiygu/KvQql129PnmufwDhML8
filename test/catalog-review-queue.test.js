@@ -28,6 +28,14 @@ function activeIdentity(database, id = "i1", payload = {}) {
   return database.getCatalogObject("item-identity", id);
 }
 
+test("已生效对象的历史版本不会永久留在审核队列", () => withDatabase((database) => {
+  const object = activeIdentity(database);
+
+  assert.equal(object.status, "active");
+  assert.equal(object.candidateVersion, null);
+  assert.equal(object.reviewReasons.some((reason) => reason.type === "inference-change"), false);
+}));
+
 test("字段级人工裁决只覆盖目标字段并保留完整审计记录", () => withDatabase((database) => {
   const before = activeIdentity(database, "i1", { iconResource: null });
 
@@ -102,22 +110,25 @@ test("stale revision 明确冲突，重载后可重新提交未冲突字段", ()
   });
 }));
 
-test("审核队列汇总新观测、推断变化、证据冲突、图标缺口和裁决冲突", () => withDatabase((database) => {
+test("语义审核队列汇总新观测、推断变化、证据冲突和裁决冲突", () => withDatabase((database) => {
   let object = activeIdentity(database, "i1", { iconResource: null });
   object = database.applyCatalogRuling({ objectType: "item-identity", objectId: "i1", fieldPath: "level", decision: "confirm", value: 1, actor: "operator", note: "确认", expectedRevision: object.revision, baseRulingId: null });
   database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { id: "i1", chainId: "c", level: 2, baseUnits: 2 }, sourceType: "structured-runtime", sourceRef: "changed.json", countDuplicate: false });
   new CatalogReviewGate(database).evaluateObject("item-identity", "i1");
   database.observeCatalogObject({ objectType: "merge-relation", objectId: "new", payload: { itemId: "new", chainId: "c", level: 1, mergeTarget: null }, sourceType: "visual-evidence", sourceRef: "screen.png" });
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "candidate", payload: { id: "candidate", chainId: "c", level: 1, baseUnits: 1 }, sourceType: "structural-inference", sourceRef: "candidate.json", countDuplicate: false });
+  new CatalogReviewGate(database).evaluateObject("item-identity", "candidate");
 
   const types = new Set(database.getCatalogReviewQueue().flatMap((entry) => entry.reasons.map((reason) => reason.type)));
-  assert.deepEqual([...types].sort(), ["evidence-conflict", "icon-gap", "inference-change", "human-ruling-conflict", "new-observation"].sort());
+  assert.deepEqual([...types].sort(), ["evidence-conflict", "inference-change", "human-ruling-conflict", "new-observation"].sort());
   assert.equal(database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1" && conflict.conflictType === "evidence-conflict"), true);
 }));
 
 test("逻辑 IconRes 标识不能冒充已取得的图标证据", () => withDatabase((database) => {
   activeIdentity(database, "i1", { iconResource: "items/leaf", iconEvidenceStatus: "missing" });
-  const entry = database.getCatalogReviewQueue().find((item) => item.objectId === "i1");
-  assert.equal(entry.reasons.some((reason) => reason.type === "icon-gap"), true);
+  const object = database.getCatalogObject("item-identity", "i1");
+  assert.equal(object.completenessGaps.some((gap) => gap.type === "icon-gap"), true);
+  assert.equal(database.getCatalogReviewQueue().some((item) => item.objectId === "i1"), false);
 }));
 
 test("证据冲突只比较不同来源的当前候选并在冲突证据失效后关闭", () => withDatabase((database) => {
@@ -151,4 +162,77 @@ test("人工有效值参与真实规划而无关字段继续使用算法值", ()
   const planning = buildPlanningCatalogFromRepository(database, legacy);
   assert.equal(planning.items[0].level, 1);
   assert.equal(planning.items[0].iconResource, "manual/icon");
+}));
+
+test("确认候选接受整个对象并激活后退出语义审核队列", () => withDatabase((database) => {
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: "candidate",
+    payload: { id: "candidate", chainId: "c", level: 1, baseUnits: 1, descriptionKey: "candidate-name" },
+    sourceType: "structural-inference",
+    sourceRef: "candidate.json",
+    countDuplicate: false,
+  });
+  const gate = new CatalogReviewGate(database);
+  const provisional = gate.evaluateObject("item-identity", "candidate");
+  const candidate = structuredClone(provisional.algorithmCandidate);
+
+  const confirmed = database.completeCatalogReview({
+    objectType: "item-identity",
+    objectId: "candidate",
+    decision: "confirm",
+    actor: "operator-a",
+    note: "整对象核对无误",
+    expectedRevision: provisional.revision,
+  });
+
+  assert.equal(confirmed.status, "active");
+  assert.equal(confirmed.activeVersion.origin, "user");
+  assert.deepEqual(confirmed.activeVersion.payload, candidate);
+  assert.deepEqual(confirmed.effectiveValue, candidate);
+  assert.equal(confirmed.candidateVersion, null);
+  assert.equal(confirmed.reviewStatus, "clear");
+  assert.deepEqual(confirmed.reviewReasons, []);
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectId === "candidate"), false);
+}));
+
+test("保存修改提交完整对象并把修改后的版本激活", () => withDatabase((database) => {
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: "modified",
+    payload: { id: "modified", chainId: "c", level: 1, baseUnits: 1, descriptionKey: "before" },
+    sourceType: "structural-inference",
+    sourceRef: "candidate.json",
+    countDuplicate: false,
+  });
+  const provisional = new CatalogReviewGate(database).evaluateObject("item-identity", "modified");
+  const modifiedPayload = { ...provisional.algorithmCandidate, descriptionKey: "人工修正后的完整对象" };
+
+  const modified = database.completeCatalogReview({
+    objectType: "item-identity",
+    objectId: "modified",
+    decision: "modify",
+    payload: modifiedPayload,
+    actor: "operator-b",
+    note: "按游戏图鉴修正名称",
+    expectedRevision: provisional.revision,
+  });
+
+  assert.equal(modified.status, "active");
+  assert.equal(modified.activeVersion.origin, "user");
+  assert.deepEqual(modified.activeVersion.payload, modifiedPayload);
+  assert.deepEqual(modified.effectiveValue, modifiedPayload);
+  assert.equal(modified.candidateVersion, null);
+  assert.deepEqual(modified.versions.map((version) => version.status), ["observed", "provisional", "active"]);
+  assert.equal(modified.reviewReasons.some((reason) => reason.type === "human-ruling-conflict"), false);
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectId === "modified"), false);
+}));
+
+test("图标缺口不进入语义审核队列但在对象详情保留完整性提示", () => withDatabase((database) => {
+  const object = activeIdentity(database, "without-icon", { iconResource: null, iconEvidenceStatus: "missing" });
+
+  assert.equal(object.status, "active");
+  assert.equal(object.reviewReasons.some((reason) => reason.type === "icon-gap"), false);
+  assert.equal(object.completenessGaps.some((gap) => gap.type === "icon-gap" && gap.fieldPath === "iconResourceIdentifier"), true);
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectId === "without-icon"), false);
 }));

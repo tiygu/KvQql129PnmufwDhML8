@@ -184,7 +184,10 @@ class CatalogReviewGate {
   evaluateObject(objectType, objectId) {
     const object = this.database.getCatalogObject(objectType, objectId);
     if (!object) throw new Error(`catalog object not found: ${objectType}/${objectId}`);
-    if (object.activeVersion?.origin === "user" || object.candidateVersion?.origin === "user") return object;
+    if (object.activeVersion?.origin === "user" || object.candidateVersion?.origin === "user") {
+      this._recordEvidenceConflict(object, this._eligibleEvidence(object));
+      return this.database.getCatalogObject(objectType, objectId);
+    }
     const decision = this.decide(object);
     return this.database.transitionCatalogObject({
       objectType, objectId, status: decision.status, payload: decision.payload,

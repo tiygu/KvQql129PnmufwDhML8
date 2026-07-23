@@ -57,6 +57,35 @@ test("Production Profile and each Production Mode have independent evidence life
   assert.equal(database.getCatalogObject("production-mode", "p:double").status, "active");
 }));
 
+test("current production mode uses structured runtime distribution without requiring a production action first", () => withDatabase((database) => {
+  observe(database, "item-identity", "p", { id: "p", chainId: "producer", level: 1 });
+  observe(database, "item-identity", "a1", { id: "a1", chainId: "a", level: 1 });
+  observe(database, "merge-relation", "p", { itemId: "p", chainId: "producer", level: 1, mergeTarget: null });
+  observe(database, "merge-relation", "a1", { itemId: "a1", chainId: "a", level: 1, mergeTarget: null });
+  observe(database, "production-profile", "p", { producerItemId: "p", energyCost: 1, theoreticalDistribution: { sampleSpaceSize: 1, outcomes: [{ itemId: "a1", weight: 1, probability: 1 }] } });
+  new CatalogReviewGate(database).evaluateAll();
+
+  collectPassiveCatalogEvidence(database, { state: { board: { grids: [] }, orders: [], producers: [{
+    index: 4,
+    itemId: "p",
+    energyCost: 1,
+    currentProductionModeId: "single",
+    availableProductionModes: [
+      { modeId: "single", unlocked: true, theoreticalDistribution: { sampleSpaceSize: 1, outputsPerAction: 1, outcomes: [{ itemId: "a1", weight: 1, probability: 1 }] } },
+      { modeId: "double", unlocked: true, theoreticalDistribution: { sampleSpaceSize: 1, outputsPerAction: 2, outcomes: [{ itemId: "a1", weight: 1, probability: 1 }] } },
+    ],
+    productionModeSwitchEntry: { status: "available", method: "setMultipleMode" },
+  }] } });
+  new CatalogReviewGate(database).evaluateAll();
+
+  const current = database.getCatalogObject("production-mode", "p:single");
+  assert.equal(current.status, "active");
+  assert.equal(current.evidence.some((entry) => entry.sourceType === "structured-runtime"), true);
+  assert.deepEqual(current.algorithmCandidate.outputs, [{ itemId: "a1", count: 1, probability: 1 }]);
+  assert.equal(database.getCatalogObject("production-mode", "p:double").status, "observed");
+  assert.deepEqual(database.getCatalogProjection().producers[0].modes.map((mode) => mode.modeId), ["single"]);
+}));
+
 test("planner compares energy, peak space, merges, target level, and overshoot while avoiding useless switches", () => {
   const producer = { itemId: "p", modes: [
     { modeId: "single", energyCost: 1, unlocked: true, drops: [{ itemId: "a1", chainId: "a", level: 1, baseUnits: 1, count: 1, probability: 1 }] },

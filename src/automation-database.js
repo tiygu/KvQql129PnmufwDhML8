@@ -52,6 +52,22 @@ function validateCatalogIdentity(objectType, objectId) {
   return { objectType: normalizedType, objectId: normalizedId };
 }
 
+function validateCatalogReviewPayload(identity, payload) {
+  if (payload == null || typeof payload !== "object" || Array.isArray(payload) || Object.keys(payload).length === 0) {
+    throw new TypeError("catalog review payload must be a complete object");
+  }
+  const value = structuredClone(payload);
+  const payloadObjectId = identity.objectType === "production-profile"
+    ? value.producerItemId ?? value.itemId
+    : identity.objectType === "production-mode"
+      ? `${value.producerItemId ?? value.itemId ?? ""}:${value.modeId ?? ""}`
+      : value.itemId ?? value.id;
+  if (String(payloadObjectId ?? "") !== identity.objectId) {
+    throw new TypeError(`catalog review payload identity mismatch: ${identity.objectType}/${identity.objectId}`);
+  }
+  return value;
+}
+
 class AutomationDatabase {
   constructor(filePath = "data/automation.db") {
     this.filePath = path.resolve(String(filePath));
@@ -297,6 +313,7 @@ class AutomationDatabase {
     if (!objectColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_objects ADD COLUMN disposition TEXT NOT NULL DEFAULT 'enabled'");
     const evidenceColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_evidence)").all().map((column) => column.name));
     if (!evidenceColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_evidence ADD COLUMN disposition TEXT NOT NULL DEFAULT 'eligible'");
+    this.db.exec("UPDATE catalog_repository_objects SET candidate_version_id=NULL WHERE status='active' AND active_version_id IS NOT NULL AND candidate_version_id IS NOT NULL");
   }
 
   _catalogObjectRow(objectType, objectId) {
@@ -380,14 +397,10 @@ class AutomationDatabase {
 
   _catalogReviewReasons(row, algorithmCandidate, activeRulings) {
     const reasons = [];
-    const versionCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM catalog_repository_versions WHERE object_id=?").get(row.id).count);
     if (row.status === "observed") reasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
-    if (versionCount > 1) reasons.push({ type: "inference-change", message: "算法候选或生效状态已变化" });
+    if (row.candidate_version_id != null) reasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
     for (const conflict of this.db.prepare("SELECT conflict_type,details_json FROM catalog_repository_conflicts WHERE object_type=? AND object_id=? AND status='open' ORDER BY id").all(row.object_type, row.object_id)) {
       reasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
-    }
-    if (row.object_type === "item-identity" && !this._selectedIconCandidate(row.id)) {
-      reasons.push({ type: "icon-gap", fieldPath: "iconResourceIdentifier", message: "缺少物品图标证据" });
     }
     for (const ruling of activeRulings.values()) {
       const candidate = fieldValue(algorithmCandidate, ruling.fieldPath);
@@ -396,6 +409,14 @@ class AutomationDatabase {
       }
     }
     return reasons;
+  }
+
+  _catalogCompletenessGaps(row) {
+    const gaps = [];
+    if (row.object_type === "item-identity" && !this._selectedIconCandidate(row.id)) {
+      gaps.push({ type: "icon-gap", fieldPath: "iconResourceIdentifier", message: "缺少物品图标证据" });
+    }
+    return gaps;
   }
 
   _catalogObjectResult(row, { includeHistory = true } = {}) {
@@ -444,6 +465,7 @@ class AutomationDatabase {
     result.effectiveValue = [...activeRulings.values()].reduce((payload, ruling) => setFieldValue(payload, ruling.fieldPath, ruling.value), result.algorithmCandidate);
     result.rulingHistory = this._catalogRulings(row.id);
     result.reviewReasons = this._catalogReviewReasons(row, result.algorithmCandidate, activeRulings);
+    result.completenessGaps = this._catalogCompletenessGaps(row);
     result.reviewStatus = result.reviewReasons.length ? "needs-review" : "clear";
     return result;
   }
@@ -506,7 +528,7 @@ class AutomationDatabase {
         VALUES(?,?,?,?,?,?,?)`).run(object.id, nextVersion, status, String(origin || "user"), canonicalJson(payload), JSON.stringify(this._catalogEvidenceSummary(object.id)), now);
       const versionId = Number(inserted.lastInsertRowid);
       if (status === "active") {
-        this.db.prepare("UPDATE catalog_repository_objects SET status='active',active_version_id=?,revision=revision+1,updated_at=? WHERE id=?").run(versionId, now, object.id);
+        this.db.prepare("UPDATE catalog_repository_objects SET status='active',candidate_version_id=NULL,active_version_id=?,revision=revision+1,updated_at=? WHERE id=?").run(versionId, now, object.id);
       } else if (status === "provisional") {
         this.db.prepare("UPDATE catalog_repository_objects SET status='provisional',candidate_version_id=?,active_version_id=NULL,revision=revision+1,updated_at=? WHERE id=?").run(versionId, now, object.id);
       } else {
@@ -523,6 +545,50 @@ class AutomationDatabase {
     this._assertCatalogRevision(object, expectedRevision);
     const candidate = this._catalogVersion(object.candidate_version_id);
     return this.saveCatalogVersion({ ...identity, payload: candidate.payload, status: "active", expectedRevision });
+  }
+
+  completeCatalogReview(input) {
+    const identity = validateCatalogIdentity(input.objectType, input.objectId);
+    const decision = String(input.decision || "");
+    if (!["confirm", "modify"].includes(decision)) throw new TypeError(`unsupported catalog review decision: ${decision}`);
+    const actor = String(input.actor || "").trim();
+    const note = String(input.note || "").trim();
+    if (!actor) throw new TypeError("catalog review actor is required");
+    if (!note) throw new TypeError("catalog review note is required");
+    return this.transaction(() => {
+      const before = this._catalogObjectRow(identity.objectType, identity.objectId);
+      if (!before) throw new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`);
+      this._assertCatalogRevision(before, input.expectedRevision);
+      const algorithmCandidate = this._catalogAlgorithmCandidate(before);
+      const payload = validateCatalogReviewPayload(identity, decision === "confirm" ? algorithmCandidate : input.payload);
+      const activeRulings = this._activeCatalogRulings(before.id);
+      const effectiveBefore = [...activeRulings.values()].reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
+      const nextRevision = Number(before.revision) + 1;
+      const now = input.createdAt || new Date().toISOString();
+      const json = (value) => JSON.stringify(value === undefined ? null : value);
+      const insertRuling = this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)`);
+      for (const ruling of activeRulings.values()) {
+        insertRuling.run(before.id, ruling.fieldPath, "revoke", null, actor, `整对象审核替代旧裁决：${note}`, json(fieldValue(effectiveBefore, ruling.fieldPath)), json(fieldValue(algorithmCandidate, ruling.fieldPath)), nextRevision, now);
+      }
+      for (const fieldPath of Object.keys(payload).sort()) {
+        insertRuling.run(before.id, fieldPath, decision, json(payload[fieldPath]), actor, note, json(fieldValue(effectiveBefore, fieldPath)), json(payload[fieldPath]), nextRevision, now);
+      }
+      const nextVersion = Number(this.db.prepare("SELECT COALESCE(MAX(version),0)+1 AS version FROM catalog_repository_versions WHERE object_id=?").get(before.id).version);
+      const inserted = this.db.prepare(`INSERT INTO catalog_repository_versions(object_id,version,status,origin,payload_json,evidence_summary_json,created_at)
+        VALUES(?,?,?,?,?,?,?)`).run(before.id, nextVersion, "active", "user", canonicalJson(payload), JSON.stringify(this._catalogEvidenceSummary(before.id)), now);
+      const versionId = Number(inserted.lastInsertRowid);
+      this.db.prepare("UPDATE catalog_repository_objects SET status='active',candidate_version_id=NULL,active_version_id=?,revision=?,updated_at=? WHERE id=?")
+        .run(versionId, nextRevision, now, before.id);
+      const after = this._catalogObjectRow(identity.objectType, identity.objectId);
+      this._recordCatalogTransition(after, {
+        fromStatus: before.status,
+        fromDisposition: before.disposition,
+        reason: `human-review-${decision}:${actor}`,
+        evidenceRevision: nextRevision,
+      });
+      return this._catalogObjectResult(after);
+    });
   }
 
   _recordCatalogTransition(object, { fromStatus, fromDisposition, reason, evidenceRevision }) {
@@ -684,21 +750,41 @@ class AutomationDatabase {
   }
 
   getCatalogReviewQueue() {
-    return this.db.prepare("SELECT * FROM catalog_repository_objects ORDER BY updated_at DESC,object_type,object_id").all()
-      .map((row) => {
-        const object = this._catalogObjectResult(row);
-        return {
-          objectType: object.objectType,
-          objectId: object.objectId,
-          revision: object.revision,
-          status: object.status,
-          disposition: object.disposition,
-          reviewStatus: object.reviewStatus,
-          reasons: object.reviewReasons,
-          updatedAt: object.updatedAt,
-        };
-      })
-      .filter((entry) => entry.reasons.length > 0);
+    const rows = this.db.prepare("SELECT * FROM catalog_repository_objects ORDER BY updated_at DESC,object_type,object_id").all();
+    const conflictsByObject = new Map();
+    for (const conflict of this.db.prepare("SELECT object_type,object_id,conflict_type,details_json FROM catalog_repository_conflicts WHERE status='open' ORDER BY id").all()) {
+      const key = `${conflict.object_type}:${conflict.object_id}`;
+      if (!conflictsByObject.has(key)) conflictsByObject.set(key, []);
+      conflictsByObject.get(key).push(conflict);
+    }
+    const versions = this.db.prepare("SELECT id,object_id,version,payload_json FROM catalog_repository_versions ORDER BY object_id,version").all();
+    const versionById = new Map(versions.map((version) => [Number(version.id), version]));
+    const latestVersionByObject = new Map(versions.map((version) => [Number(version.object_id), version]));
+    const activeRulingsByObject = new Map();
+    for (const ruling of this.db.prepare("SELECT * FROM catalog_repository_rulings ORDER BY object_id,id").all()) {
+      const objectId = Number(ruling.object_id);
+      if (!activeRulingsByObject.has(objectId)) activeRulingsByObject.set(objectId, new Map());
+      const active = activeRulingsByObject.get(objectId);
+      if (ruling.decision === "revoke") active.delete(ruling.field_path);
+      else active.set(ruling.field_path, this._catalogRulingRow(ruling));
+    }
+    return rows.map((row) => {
+      const reasons = [];
+      if (row.status === "observed") reasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
+      if (row.candidate_version_id != null) reasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
+      for (const conflict of conflictsByObject.get(`${row.object_type}:${row.object_id}`) || []) {
+        reasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
+      }
+      const version = versionById.get(Number(row.active_version_id)) || versionById.get(Number(row.candidate_version_id)) || latestVersionByObject.get(Number(row.id));
+      const algorithmCandidate = parseJson(version?.payload_json) || {};
+      for (const ruling of (activeRulingsByObject.get(Number(row.id)) || new Map()).values()) {
+        const candidate = fieldValue(algorithmCandidate, ruling.fieldPath);
+        if (canonicalJson(candidate ?? null) !== canonicalJson(ruling.value ?? null)) {
+          reasons.push({ type: "human-ruling-conflict", fieldPath: ruling.fieldPath, candidate, humanValue: ruling.value, message: "算法证据与人工裁决冲突" });
+        }
+      }
+      return { objectType: row.object_type, objectId: row.object_id, revision: Number(row.revision), status: row.status, disposition: row.disposition, reviewStatus: reasons.length ? "needs-review" : "clear", reasons, updatedAt: row.updated_at };
+    }).filter((entry) => entry.reasons.length > 0);
   }
 
   _iconCandidate(row) {
@@ -812,6 +898,32 @@ class AutomationDatabase {
     return object ? this._selectedIconCandidate(object.id) : null;
   }
 
+  invalidateAutomaticIconSelections(isEligible, { reason = "automatic-icon-quality-gate" } = {}) {
+    if (typeof isEligible !== "function") throw new TypeError("icon eligibility predicate is required");
+    return this.transaction(() => {
+      const rows = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
+        FROM catalog_icon_candidates candidate
+        JOIN catalog_repository_objects object ON object.id=candidate.object_id
+        JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
+        WHERE candidate.selected=1 AND candidate.selection_origin='automatic'`).all();
+      const invalidated = [];
+      for (const row of rows) {
+        const candidate = this._iconCandidate(row);
+        if (isEligible(candidate)) continue;
+        const object = this._catalogObjectRow("item-identity", candidate.itemId);
+        const now = new Date().toISOString();
+        this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE id=?").run(candidate.id);
+        this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
+        const after = this._catalogObjectRow("item-identity", candidate.itemId);
+        this.db.prepare(`INSERT INTO catalog_icon_selection_history(object_id,candidate_id,previous_candidate_id,action,actor,note,object_revision,created_at)
+          VALUES(?,?,?,?,?,?,?,?)`).run(object.id, null, candidate.id, "automatic-invalidate", "runtime-quality-gate", String(reason), after.revision, now);
+        this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: `${reason}:${candidate.assetHash}`, evidenceRevision: after.revision });
+        invalidated.push({ itemId: candidate.itemId, candidateId: candidate.id, sourceType: candidate.sourceType });
+      }
+      return invalidated;
+    });
+  }
+
   listIconAssets() {
     return this.db.prepare("SELECT * FROM catalog_icon_assets ORDER BY hash").all().map((row) => ({ hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at }));
   }
@@ -821,11 +933,49 @@ class AutomationDatabase {
     return row ? { hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at } : null;
   }
 
+  getSelectedIconHashes() {
+    return Object.fromEntries(this.db.prepare(`SELECT object.object_id,candidate.asset_hash
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      WHERE object.object_type='item-identity' AND candidate.selected=1
+      ORDER BY object.object_id`).all().map((row) => [String(row.object_id), String(row.asset_hash)]));
+  }
+
   getCatalogRevision() {
     const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,revision FROM catalog_repository_objects ORDER BY object_type,object_id").all();
     const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
     const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
     return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions })).digest("hex");
+  }
+
+  getCatalogPresentationRevision() {
+    const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,candidate_version_id,active_version_id FROM catalog_repository_objects ORDER BY object_type,object_id").all();
+    const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
+    const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
+    const selectedIcons = this.db.prepare(`SELECT object.object_id,candidate.id,candidate.asset_hash
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      WHERE candidate.selected=1
+      ORDER BY object.object_id`).all();
+    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions, selectedIcons })).digest("hex");
+  }
+
+  getCatalogSemanticRevision() {
+    const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,candidate_version_id,active_version_id FROM catalog_repository_objects ORDER BY object_type,object_id").all();
+    const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
+    const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
+    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions })).digest("hex");
+  }
+
+  getCatalogUiRevision() {
+    const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,candidate_version_id,active_version_id FROM catalog_repository_objects ORDER BY object_type,object_id").all();
+    const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
+    const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
+    const iconCandidates = this.db.prepare(`SELECT object.object_id,candidate.id,candidate.asset_hash,candidate.rank_score,candidate.selected,candidate.selection_origin
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      ORDER BY object.object_id,candidate.id`).all();
+    return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions, iconCandidates })).digest("hex");
   }
 
   upsertTheoreticalProductionDistribution({ producerItemId, modeId, theoreticalDistribution, observedAt = new Date().toISOString() }) {

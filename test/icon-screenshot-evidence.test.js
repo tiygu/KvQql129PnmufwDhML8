@@ -5,12 +5,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const vm = require("node:vm");
 const { PNG } = require("pngjs");
 const jpeg = require("jpeg-js");
 const { AutomationDatabase } = require("../src/automation-database");
 const { AutomationRuntime } = require("../src/automation-runtime");
 const { cropScreenshot, compareIcons, chooseStableFrame } = require("../src/icon-screenshot-evidence");
-const { IconEvidenceService, resolveScreenshotTarget, captureCdpScreenshot } = require("../src/icon-evidence");
+const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot } = require("../src/icon-evidence");
 
 function image(width, height, pixel) {
   const png = new PNG({ width, height });
@@ -48,12 +49,197 @@ test("screenshot provider uses atomic runtime bounds and CDP capture", async () 
   const target = await resolveScreenshotTarget({ client, contextId: 9, itemId: "i1" });
   assert.equal(target.devicePixelRatio, 2);
   assert.match(expressions[1], /i1/);
+  assert.match(expressions[1], /_itemLayer/);
+  assert.match(expressions[1], /childViews/);
+  assert.match(expressions[1], /_boardGrid/);
   assert.match(expressions[2], /getBoundingBoxToWorld/);
   const token = /slots\["([^"]+)"\]/.exec(expressions[1])?.[1];
   assert.ok(token && expressions[2].includes(token));
   assert.equal(expressions.every((expression) => !/while\s*\(/.test(expression)), true);
   assert.equal((await captureCdpScreenshot({ client })).toString(), "png");
   assert.deepEqual(calls.map(([method]) => method), ["Page.enable", "Page.captureScreenshot"]);
+});
+
+test("screenshot provider finds an item icon nested in the order view tree", async () => {
+  const iconNode = {
+    name: "icon",
+    activeInHierarchy: true,
+    getBoundingBoxToWorld: () => ({ x: 20, y: 30, width: 40, height: 50 }),
+  };
+  const orderItemNode = {
+    name: "task_single_item",
+    activeInHierarchy: true,
+    getComponentsInChildren: () => [{ node: iconNode, spriteFrame: { name: "icon_meat_3" } }],
+  };
+  const orderItemView = { itemId: "10100109", mNode: orderItemNode, childViews: [] };
+  const controllerView = { childViews: [{ childViews: [{ childViews: [{ childViews: [orderItemView] }] }] }] };
+  const entry = { _components: [{ mControllers: [{ _controllerClazzName: "UserBoardViewController", view: controllerView }] }] };
+  const root = {
+    getChildByName: (name) => name === "Entry" ? entry : null,
+    getComponentsInChildren: () => [],
+  };
+  function Sprite() {}
+  const sandbox = {
+    cc: { Sprite, director: { getScene: () => root }, view: { getVisibleSize: () => ({ width: 100, height: 100 }) } },
+    innerWidth: 100,
+    innerHeight: 100,
+    devicePixelRatio: 1,
+  };
+  sandbox.globalThis = sandbox;
+  const client = { evaluate: async (source) => vm.runInNewContext(source, sandbox) };
+
+  const target = await resolveScreenshotTarget({ client, contextId: 9, itemId: "10100109" });
+
+  assert.equal(target.runtimeSource, "controller-item-view");
+  assert.equal(JSON.stringify(target.bounds), JSON.stringify({ x: 20, y: 20, width: 40, height: 50 }));
+});
+
+test("exact provider resolves the SpriteFrame from an offscreen order item view", async () => {
+  const texture = {
+    _uuid: "texture-1",
+    _nativeUrl: "https://assets.invalid/merge-icons.png",
+    _width: 1024,
+    _height: 1024,
+    _textureSource: { _nativeData: { width: 476, height: 824 } },
+  };
+  const frame = {
+    _name: "icon_meat_3",
+    _uuid: "frame-1",
+    _texture: texture,
+    _rect: { x: 237, y: 337, width: 116, height: 84 },
+    _originalSize: { width: 120, height: 120 },
+    _offset: { x: 0, y: 1 },
+  };
+  const itemNode = { getComponentsInChildren: () => [{ node: { name: "icon" }, spriteFrame: frame }] };
+  const itemView = { itemId: "10100109", mNode: itemNode, childViews: [] };
+  const controllerView = { childViews: [{ childViews: [{ childViews: [{ childViews: [itemView] }] }] }] };
+  const entry = { _components: [{ mControllers: [{ _controllerClazzName: "UserBoardViewController", view: controllerView }] }] };
+  function Sprite() {}
+  const sandbox = {
+    cc: {
+      Sprite,
+      director: { getScene: () => ({ getChildByName: () => entry, getComponentsInChildren: () => [] }) },
+    },
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage: () => {} }),
+        toDataURL: () => "data:image/png;base64,cG5n",
+      }),
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const client = { evaluate: async (source) => vm.runInNewContext(source, sandbox) };
+
+  const metadata = await resolveCocosSpriteFrame({ client, contextId: 9, itemId: "10100109" });
+
+  assert.equal(metadata.runtimeIdentifier, "icon_meat_3");
+  assert.equal(metadata.resourceUrl, "data:image/png;base64,cG5n");
+  assert.equal(JSON.stringify(metadata.rect), JSON.stringify({ x: 237, y: 337, width: 116, height: 84 }));
+});
+
+test("exact provider resolves a loaded SpriteFrame by catalog resource without a rendered item view", async () => {
+  const texture = {
+    _uuid: "texture-suitcase",
+    _width: 1024,
+    _height: 1024,
+    _textureSource: { _nativeData: { width: 1024, height: 1024 } },
+  };
+  const frame = {
+    _name: "icon_clothes_15",
+    _uuid: "frame-clothes-15",
+    _texture: texture,
+    _rect: { x: 640, y: 320, width: 96, height: 96 },
+    _originalSize: { width: 96, height: 96 },
+    _offset: { x: 0, y: 0 },
+  };
+  function Sprite() {}
+  const sandbox = {
+    cc: {
+      Sprite,
+      director: { getScene: () => ({ getChildByName: () => null, children: [], getComponentsInChildren: () => [] }) },
+      assetManager: { assets: { _map: { "frame-clothes-15": frame } } },
+    },
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage: () => {} }),
+        toDataURL: () => "data:image/png;base64,Y2xvdGhlcw==",
+      }),
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const client = { evaluate: async (source) => vm.runInNewContext(source, sandbox) };
+
+  const metadata = await resolveCocosSpriteFrame({
+    client,
+    contextId: 9,
+    itemId: "10100075",
+    itemIdentity: { itemId: "10100075", iconResourceIdentifier: "suitcase/icon_clothes_15" },
+  });
+
+  assert.equal(metadata.runtimeIdentifier, "icon_clothes_15");
+  assert.equal(metadata.resourceUrl, "data:image/png;base64,Y2xvdGhlcw==");
+  assert.equal(JSON.stringify(metadata.rect), JSON.stringify({ x: 640, y: 320, width: 96, height: 96 }));
+});
+
+test("catalog resource SpriteFrame outranks a stale offscreen item view", async () => {
+  const staleTexture = { _uuid: "stale-texture", _textureSource: { _nativeData: { width: 128, height: 128 } } };
+  const staleFrame = {
+    _name: "icon",
+    _uuid: "stale-frame",
+    _texture: staleTexture,
+    _rect: { x: 0, y: 0, width: 58, height: 58 },
+    _originalSize: { width: 58, height: 58 },
+    _offset: { x: 0, y: 0 },
+  };
+  const genericAssetFrame = {
+    _name: "icon",
+    _uuid: "generic-icon-frame",
+    _texture: staleTexture,
+    _rect: { x: 224, y: 2, width: 54, height: 58 },
+    _originalSize: { width: 54, height: 58 },
+    _offset: { x: 0, y: 0 },
+  };
+  const exactTexture = { _uuid: "clothes-texture", _textureSource: { _nativeData: { width: 512, height: 512 } } };
+  const exactFrame = {
+    name: "",
+    _name: "icon_clothes_3",
+    _uuid: "clothes-frame-3",
+    _texture: exactTexture,
+    _rect: { x: 128, y: 64, width: 72, height: 76 },
+    _originalSize: { width: 72, height: 76 },
+    _offset: { x: 0, y: 0 },
+  };
+  const itemView = {
+    itemId: "10100063",
+    mNode: { getComponentsInChildren: () => [{ node: { name: "icon" }, spriteFrame: staleFrame }] },
+    childViews: [],
+  };
+  const controllerView = { childViews: [itemView] };
+  const entry = { _components: [{ mControllers: [{ _controllerClazzName: "UserBoardViewController", view: controllerView }] }] };
+  function Sprite() {}
+  const sandbox = {
+    cc: {
+      Sprite,
+      director: { getScene: () => ({ getChildByName: () => entry, getComponentsInChildren: () => [] }) },
+      assetManager: { assets: { _map: { "generic-icon-frame": genericAssetFrame, "clothes-frame-3": exactFrame } } },
+    },
+    document: {
+      createElement: () => ({ getContext: () => ({ drawImage: () => {} }), toDataURL: () => "data:image/png;base64,ZXhhY3Q=" }),
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const client = { evaluate: async (source) => vm.runInNewContext(source, sandbox) };
+
+  const metadata = await resolveCocosSpriteFrame({
+    client,
+    contextId: 9,
+    itemId: "10100063",
+    itemIdentity: { itemId: "10100063", iconResourceIdentifier: "suitcase/icon_clothes_3" },
+  });
+
+  assert.equal(metadata.runtimeIdentifier, "icon_clothes_3");
+  assert.equal(metadata.textureUuid, "clothes-texture");
+  assert.equal(JSON.stringify(metadata.rect), JSON.stringify({ x: 128, y: 64, width: 72, height: 76 }));
 });
 
 test("multi-frame selection prefers the repeated stable frame over a transient overlay", () => {
@@ -127,6 +313,30 @@ test("manual icon selection outranks later automatic candidates and revoke retai
   }
 });
 
+test("startup quality cleanup invalidates stale automatic screenshots but preserves manual overrides", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-cleanup-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  const file = path.join(root, "icon.png");
+  fs.writeFileSync(file, image(2, 2, () => [255, 0, 0, 255]));
+  const asset = (hash) => ({ hash, mimeType: "image/png", width: 2, height: 2, byteSize: fs.statSync(file).size, filePath: file });
+  try {
+    for (const itemId of ["automatic", "manual"]) database.observeCatalogObject({ objectType: "item-identity", objectId: itemId, payload: { itemId }, sourceType: "runtime" });
+    database.saveIconCandidate({ itemId: "automatic", cacheKey: "bad-auto", sourceType: "screenshot-runtime", crop: { backgroundRemoval: { applied: false } }, similarity: {}, asset: asset("a".repeat(64)) });
+    const manualCandidate = database.saveIconCandidate({ itemId: "manual", cacheKey: "bad-manual", sourceType: "screenshot-runtime", crop: { backgroundRemoval: { applied: false } }, similarity: {}, asset: asset("b".repeat(64)) });
+    database.selectIconCandidate("manual", manualCandidate.id, { actor: "operator", note: "verified by eye", expectedRevision: database.getCatalogObject("item-identity", "manual").revision });
+
+    const invalidated = database.invalidateAutomaticIconSelections((candidate) => candidate.sourceType !== "screenshot-runtime"
+      || (candidate.crop?.backgroundRemoval?.applied === true && candidate.similarity?.qualityGate?.status === "eligible"));
+
+    assert.deepEqual(invalidated.map((entry) => entry.itemId), ["automatic"]);
+    assert.equal(database.getSelectedIconCandidate("automatic"), null);
+    assert.equal(database.getSelectedIconCandidate("manual").selectionOrigin, "manual");
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("exact mapping failure falls back to stable runtime screenshot evidence without activating catalog knowledge", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-fallback-"));
   const database = new AutomationDatabase(path.join(root, "automation.db"));
@@ -140,7 +350,7 @@ test("exact mapping failure falls back to stable runtime screenshot evidence wit
   const service = new IconEvidenceService({
     database, cacheDir: path.join(root, "cache"), concurrency: 1, screenshotFrameDelayMs: 0,
     resolveSpriteFrame: async () => { throw new Error("no SpriteFrame mapping"); },
-    resolveScreenshotBounds: async ({ itemId }) => ({ observedItemId: itemId, bounds: { x: 5, y: 5, width: 20, height: 20 }, viewport: { width: 40, height: 40 }, devicePixelRatio: 1, runtimeSource: "board-cell" }),
+    resolveScreenshotBounds: async ({ itemId }) => ({ observedItemId: itemId, bounds: { x: 0, y: 0, width: 40, height: 40 }, viewport: { width: 40, height: 40 }, devicePixelRatio: 1, runtimeSource: "board-cell" }),
     captureScreenshot: async () => frames[captures++],
   });
   try {
@@ -156,6 +366,40 @@ test("exact mapping failure falls back to stable runtime screenshot evidence wit
     assert.deepEqual(candidate.similarity.frameSelection.acceptedFrameIndexes, [0, 2]);
     assert.equal(database.getCatalogObject("merge-relation", "i1").status, "observed");
     assert.equal(database.getCatalogObject("production-profile", "p1:default").status, "observed");
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("transformed board screenshots remain audit candidates but are never automatically selected", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-fallback-rejected-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { itemId: "i1" }, sourceType: "runtime" });
+  const frame = image(40, 40, (x, y) => (x + y) % 2 ? [245, 245, 245, 255] : [15, 15, 15, 255]);
+  const service = new IconEvidenceService({
+    database, cacheDir: path.join(root, "cache"), concurrency: 1, screenshotFrameDelayMs: 0,
+    resolveSpriteFrame: async () => { throw new Error("no SpriteFrame mapping"); },
+    resolveScreenshotBounds: async ({ itemId }) => ({
+      observedItemId: itemId,
+      bounds: { x: 0, y: 0, width: 40, height: 40 },
+      viewport: { width: 40, height: 40 },
+      devicePixelRatio: 1,
+      runtimeSource: "board-item-view",
+      captureEligibility: "transformed-board-item",
+    }),
+    captureScreenshot: async () => frame,
+  });
+  try {
+    service.request("i1");
+    await service.waitForIdle();
+    assert.equal(service.getTask(1).status, "complete");
+    assert.equal(database.getSelectedIconCandidate("i1"), null);
+    const [candidate] = database.listIconCandidates("i1");
+    assert.equal(candidate.sourceType, "screenshot-runtime");
+    assert.equal(candidate.selected, false);
+    assert.equal(candidate.similarity.qualityGate.status, "rejected");
+    assert.ok(candidate.similarity.qualityGate.reasons.includes("transformed-board-item"));
   } finally {
     database.close();
     fs.rmSync(root, { recursive: true, force: true });

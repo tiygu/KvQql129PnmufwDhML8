@@ -466,7 +466,7 @@ function stateKey(state) {
   return `${state.energy}|${grids.join("|")}`;
 }
 
-function buildMergeCandidates(state, onPruned = null) {
+function buildMergeCandidates(state, onPruned = null, { canonicalOnly = false } = {}) {
   const actions = [];
   const groups = new Map();
   for (const grid of state.board.grids.filter((entry) => entry.itemId && !entry.empty)) {
@@ -474,10 +474,14 @@ function buildMergeCandidates(state, onPruned = null) {
     groups.get(grid.itemId).push(grid);
   }
   for (const [itemId, grids] of groups) {
+    pairSearch:
     for (let left = 0; left < grids.length; left += 1) for (let right = left + 1; right < grids.length; right += 1) {
       const action = { type: "merge", from: grids[left].index, to: grids[right].index, itemId, resultItemId: catalogItem(state, itemId)?.mergeTarget || null };
       const simulated = simulateMerge(state, action);
-      if (simulated.ok) actions.push(action);
+      if (simulated.ok) {
+        actions.push(action);
+        if (canonicalOnly) break pairSearch;
+      }
       else onPruned?.(simulated.reason);
     }
   }
@@ -485,7 +489,10 @@ function buildMergeCandidates(state, onPruned = null) {
 }
 
 function candidateActions(state, pruned) {
-  const actions = buildMergeCandidates(state, (reason) => { pruned[reason] = (pruned[reason] || 0) + 1; });
+  // Grid positions are interchangeable for deterministic planning. Keeping one
+  // safe representative per item identity avoids exploring permutations that
+  // have the same inventory, energy, and order effect.
+  const actions = buildMergeCandidates(state, (reason) => { pruned[reason] = (pruned[reason] || 0) + 1; }, { canonicalOnly: true });
   for (const profile of state.catalog.producers) {
     if (profile.drops.length !== 1 || profile.drops[0].probability !== 1) continue;
     for (const grid of state.board.grids.filter((entry) => entry.itemId === profile.itemId)) {
@@ -495,9 +502,15 @@ function candidateActions(state, pruned) {
       else pruned[simulated.reason] = (pruned[simulated.reason] || 0) + 1;
     }
   }
-  for (const candidate of buildWarehouseStoreCandidates(state)) {
-    if (candidate.storeAvailability.status === "available") actions.push(candidate);
-    else pruned["warehouse-native-preflight-required"] = (pruned["warehouse-native-preflight-required"] || 0) + 1;
+  if (state.warehouse.storeAvailability?.status === "available") {
+    for (const candidate of buildWarehouseStoreCandidates(state)) {
+      if (candidate.storeAvailability.status === "available") actions.push(candidate);
+    }
+  } else {
+    // Candidate valuation deep-copies the planner state for every eligible grid.
+    // Those candidates cannot execute until native preflight succeeds, so doing
+    // that work for every breadth-first search state only blocks the event loop.
+    pruned["warehouse-native-preflight-required"] = (pruned["warehouse-native-preflight-required"] || 0) + 1;
   }
   return actions.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
@@ -522,6 +535,12 @@ function planDeterministicOrder(state, orderSlot, { maxStates = 768, maxDepth = 
   let consideredStates = 0;
   while (queue.length && consideredStates < maxStates) {
     const node = queue.shift();
+    if (goals.length) {
+      const bestGoal = [...goals].sort((left, right) => comparePathScores(left.score, right.score))[0];
+      const lowerBoundReached = bestGoal.peakOccupied === state.board.occupied
+        && bestGoal.opportunityLoss === 0;
+      if (lowerBoundReached && node.depth >= bestGoal.depth) break;
+    }
     consideredStates += 1;
     if (node.depth >= maxDepth) { pruned["horizon-limit"] = (pruned["horizon-limit"] || 0) + 1; continue; }
     for (const action of candidateActions(node.state, pruned)) {

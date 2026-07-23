@@ -335,11 +335,12 @@ function buildBridgeInstallExpression(contextGeneration) {
         && !safe(() => grid.isLocking, false)).map(describeGrid);
       const boardAvailable = !!controller && !!boardView && Array.isArray(gameBoard?.__private_95_grids);
       const boardVisible = boardAvailable && !!controller.isViewVisible;
+      const boardHasSubstance = boardAvailable && grids.length > 0 && !grids.every((grid) => grid.empty);
       const energyAmount = resourceAmount(3);
       return {
         schemaVersion: 1,
         collectedAt: new Date().toISOString(),
-        scene: boardVisible ? "board" : "map",
+        scene: (boardVisible || boardHasSubstance) ? "board" : "map",
         resources: { coins: resourceAmount(1), diamonds: resourceAmount(2), energy: energyAmount },
         energy: {
           amount: energyAmount,
@@ -416,13 +417,16 @@ function buildBridgeInstallExpression(contextGeneration) {
       const boardController = controllers.find((c) => c?._controllerClazzName === "UserBoardViewController");
       const entranceController = controllers.find((c) => c?._controllerClazzName === "EntranceViewController");
       const missionController = controllers.find((c) => c?._controllerClazzName === "AreaMissionInfoViewController");
+      // Trust board data when available even if isViewVisible returns false (e.g. overlays).
+      const boardGrids = boardController?.view?._boardView?._gameBoardView?._boardStore?._state?._gameBoard?.__private_95_grids;
+      const boardHasSubstance = Array.isArray(boardGrids) && boardGrids.some((grid) => !grid.isEmpty);
       return {
         mapController, boardController, entranceController, missionController,
         mapVisible: !!mapController?.isViewVisible,
-        boardVisible: !!boardController?.isViewVisible,
+        boardVisible: (!!boardController?.isViewVisible) || boardHasSubstance,
         entranceVisible: !!entranceController?.isViewVisible,
         missionVisible: !!missionController?.isViewVisible,
-        scene: !!boardController?.isViewVisible ? "board" : (!!mapController?.isViewVisible ? "map" : "unknown")
+        scene: (!!boardController?.isViewVisible || boardHasSubstance) ? "board" : (!!mapController?.isViewVisible ? "map" : "unknown")
       };
     };
     const readGameplayArea = () => {
@@ -1569,7 +1573,9 @@ class CdpRuntimeControlAdapter {
         "baseline",
       );
       const validated = validateBaseline(baseline);
-      if (this.readiness) this.readiness.revision = validated.revision;
+      if (this.readiness && Number.isInteger(validated.revision)) {
+        this.readiness.revision = validated.revision;
+      }
       this.cachedBaseline = mergeReconciledBaseline(this.reconciledState, validated);
       this.requiresBroadReconciliation = false;
       return "baseline";
@@ -1599,7 +1605,9 @@ class CdpRuntimeControlAdapter {
         signal,
         "baseline",
       ));
-      if (this.readiness) this.readiness.revision = baseline.revision;
+      if (this.readiness && Number.isInteger(baseline.revision)) {
+        this.readiness.revision = baseline.revision;
+      }
       return mergeReconciledBaseline(this.reconciledState, baseline);
     } catch (error) {
       if (error?.name === "AbortError") throw error;
@@ -1643,7 +1651,7 @@ class CdpRuntimeControlAdapter {
       }
       const operationId = String(command.operationId || `production-${randomUUID()}`);
       const expectedRevision = command.expectedRevision == null
-        ? this.readiness.revision
+        ? (this.readiness?.revision ?? 0)
         : Number(command.expectedRevision);
       const semanticCommand = {
         operationId,
@@ -1843,7 +1851,7 @@ class CdpRuntimeControlAdapter {
       }
       const operationId = String(command.operationId || `submit-order-${randomUUID()}`);
       const expectedRevision = command.expectedRevision == null
-        ? this.readiness.revision
+        ? (this.readiness?.revision ?? 0)
         : Number(command.expectedRevision);
       const expectedTaskId = command.before?.orders
         ?.find((o) => String(o.slot) === slot)?.taskId ?? null;
@@ -2044,7 +2052,7 @@ class CdpRuntimeControlAdapter {
       }
       const operationId = String(command.operationId || `navigate-${randomUUID()}`);
       const expectedRevision = command.expectedRevision == null
-        ? this.readiness.revision
+        ? (this.readiness?.revision ?? 0)
         : Number(command.expectedRevision);
       const semanticCommand = {
         operationId,
@@ -2266,7 +2274,7 @@ class CdpRuntimeControlAdapter {
       // Step 4: execute button fallback via the injected bridge
       const operationId = String(command.operationId || `btn-fallback-${randomUUID()}`);
       const expectedRevision = command.expectedRevision == null
-        ? this.readiness.revision
+        ? (this.readiness?.revision ?? 0)
         : Number(command.expectedRevision);
       const fallbackCommand = {
         operationId,
@@ -2388,7 +2396,7 @@ class CdpRuntimeControlAdapter {
     }
     const operationId = String(command.operationId || `merge-${randomUUID()}`);
     const expectedRevision = command.expectedRevision == null
-      ? this.readiness.revision
+      ? (this.readiness?.revision ?? 0)
       : Number(command.expectedRevision);
     const semanticCommand = {
       operationId,
@@ -2458,6 +2466,46 @@ class CdpRuntimeControlAdapter {
       };
     }
     this.readiness.revision = acknowledgement.revision;
+    if (acknowledgement.outcome === "rejected-precondition" && acknowledgement.reason === "merge-not-ready") {
+      const requestedPollMs = Number(request.options?.delayMs);
+      const pollMs = Math.max(1, Math.min(250, requestedPollMs > 0 ? requestedPollMs : 100));
+      const requestedBudgetMs = Number(request.options?.settleMs);
+      const budgetMs = Math.max(pollMs, Math.min(2_000, requestedBudgetMs > 0 ? requestedBudgetMs : 1_000));
+      const startedAt = Date.now();
+      let replanState = null;
+      do {
+        await waitForAbortable(new Promise((resolve) => setTimeout(resolve, pollMs)), signal);
+        replanState = await this.readState(signal);
+        const source = replanState.board?.grids?.find((grid) => Number(grid.index) === sourceGrid);
+        const target = replanState.board?.grids?.find((grid) => Number(grid.index) === targetGrid);
+        const pairChanged = String(source?.itemId || "") !== String(semanticCommand.expectedItemId || "")
+          || String(target?.itemId || "") !== String(semanticCommand.expectedItemId || "");
+        const pairReady = source?.actionReady !== false && target?.actionReady !== false;
+        if (pairChanged || pairReady) {
+          this.requiresBroadReconciliation = false;
+          return {
+            ok: false,
+            executed: false,
+            reason: acknowledgement.reason,
+            stopReason: acknowledgement.reason,
+            actions: [],
+            replanRequested: true,
+            replanState,
+            acknowledgement: cloneRecord(acknowledgement),
+          };
+        }
+      } while (Date.now() - startedAt < budgetMs);
+      return {
+        ok: false,
+        executed: false,
+        reason: acknowledgement.reason,
+        stopReason: acknowledgement.reason,
+        actions: [],
+        pauseRequested: false,
+        acknowledgement: cloneRecord(acknowledgement),
+        timing: { stage: "action-readiness", elapsedMs: Date.now() - startedAt, budgetMs },
+      };
+    }
     if (acknowledgement.outcome === "aborted") {
       return {
         ok: false,

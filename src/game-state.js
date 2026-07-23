@@ -75,8 +75,9 @@ function buildGameState({ state = {}, boardState = null, overlays = [] } = {}) {
   const orderSlots = new Set([...snapshotTasks.keys(), ...liveOrders.keys()]);
   const orders = [...orderSlots].map((slot) => normalizeOrder(snapshotTasks.get(slot), liveOrders.get(slot)));
   const boardOk = !!boardState?.ok;
+  const boardHasSubstance = boardOk && typeof boardState?.signature === "string" && boardState.signature.length > 0;
   const mode = state.gameplay?.mode ?? null;
-  const scene = boardOk && boardState.boardVisible ? "board"
+  const scene = (boardOk && boardState.boardVisible) || boardHasSubstance ? "board"
     : mode === "warehouse" ? "warehouse"
       : mode === "map-mission" ? "map-mission"
         : mode === "board" ? "board" : "map";

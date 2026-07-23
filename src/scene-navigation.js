@@ -53,11 +53,12 @@ const OPEN_MAP_EXPRESSION = `(() => {
 })()`;
 
 class SceneNavigator {
-  constructor({ client, contextId, settleMs = 1600, evaluateTimeoutMs = 10000 }) {
+  constructor({ client, contextId, settleMs = 1600, evaluateTimeoutMs = 10000, verificationAttempts = 5 }) {
     this.client = client;
     this.contextId = contextId;
     this.settleMs = Math.max(300, Number(settleMs));
     this.evaluateTimeoutMs = Math.max(5000, Number(evaluateTimeoutMs));
+    this.verificationAttempts = Math.max(1, Math.min(10, Math.floor(Number(verificationAttempts) || 5)));
   }
 
   evaluate(expression, signal = null) {
@@ -84,10 +85,14 @@ class SceneNavigator {
     const acknowledgement = await this.evaluate(target === "board" ? OPEN_BOARD_EXPRESSION : OPEN_MAP_EXPRESSION, signal);
     actions.push(acknowledgement);
     if (!acknowledgement?.ok) return { ok: false, executed: true, reason: acknowledgement?.reason || "navigation-rejected", target, before, actions };
-    if (!await waitForDelay(this.settleMs, signal)) return { ok: false, executed: true, reason: "aborted", target, before, actions };
-    const after = await this.readState(signal);
-    const arrived = target === "board" ? after.boardVisible : after.mapVisible && !after.boardVisible;
-    return { ok: arrived, executed: true, reason: arrived ? "navigation-verified" : "navigation-not-observed", target, before, after, actions };
+    let after = before;
+    for (let attempt = 1; attempt <= this.verificationAttempts; attempt += 1) {
+      if (!await waitForDelay(this.settleMs, signal)) return { ok: false, executed: true, reason: "aborted", target, before, after, actions };
+      after = await this.readState(signal);
+      const arrived = target === "board" ? after.boardVisible : after.mapVisible && !after.boardVisible;
+      if (arrived) return { ok: true, executed: true, reason: "navigation-verified", target, before, after, actions, verificationAttempts: attempt };
+    }
+    return { ok: false, executed: true, reason: "navigation-not-observed", target, before, after, actions, verificationAttempts: this.verificationAttempts };
   }
 }
 

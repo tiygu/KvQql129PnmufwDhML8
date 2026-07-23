@@ -38,6 +38,7 @@ function createRuntime() {
     stopConnectionRoute: async () => ({ ok: true, reason: "route-stopped" }),
     preview: async () => ({ ok: true, reason: "planned" }),
     startInBackground: (options) => ({ ok: true, accepted: true, options }),
+    startIdleInBackground: (options) => ({ ok: true, accepted: true, idle: true, options }),
     stop: () => ({ ok: true }),
     pause: () => ({ ok: true, paused: true }),
     resume: () => ({ ok: true, paused: false }),
@@ -51,6 +52,32 @@ function createRuntime() {
 async function listen(server) {
   await new Promise((resolve) => server.httpServer.listen(0, "127.0.0.1", resolve));
   return server.httpServer.address().port;
+}
+
+function waitForEvent(client, predicate, label = "event") {
+  let timer = null;
+  let handler = null;
+  const promise = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      client.off("message", handler);
+      reject(new Error(`${label} timeout`));
+    }, 2000);
+    handler = (raw) => {
+      const event = JSON.parse(String(raw));
+      if (!predicate(event)) return;
+      clearTimeout(timer);
+      client.off("message", handler);
+      resolve(event);
+    };
+    client.on("message", handler);
+  });
+  return {
+    promise,
+    cancel() {
+      clearTimeout(timer);
+      client.off("message", handler);
+    },
+  };
 }
 
 test("control server hosts the console and accepts background automation", async () => {
@@ -72,6 +99,14 @@ test("control server hosts the console and accepts background automation", async
     });
     assert.equal(response.status, 202);
     assert.deepEqual(await response.json(), { ok: true, accepted: true, options: { maxActions: 1 } });
+
+    const continuousResponse = await fetch(`http://127.0.0.1:${port}/api/automation/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode: "automatic" }),
+    });
+    assert.equal(continuousResponse.status, 202);
+    assert.deepEqual(await continuousResponse.json(), { ok: true, accepted: true, idle: true, options: { mode: "automatic" } });
 
     const catalogResponse = await fetch(`http://127.0.0.1:${port}/api/catalog`);
     const catalog = await catalogResponse.json();
@@ -222,6 +257,138 @@ test("人工裁决 API 返回明确 revision 冲突并向所有控制台广播�
     });
     assert.equal(stale.status, 409);
     assert.deepEqual(await stale.json(), { ok: false, error: "catalog revision conflict", code: "CATALOG_REVISION_CONFLICT", fieldPath: "level", currentObject: { objectType: "item-identity", objectId: "i", revision: 3 } });
+  } finally {
+    client.close();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("完整候选确认与整项修改会完成审核、校验 revision 并广播队列变化", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-review-complete-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const runtime = createRuntime();
+  const completions = [];
+  let revision = 3;
+  runtime.completeCatalogReview = (input) => {
+    if (input.expectedRevision !== revision) {
+      throw Object.assign(new Error("catalog revision conflict"), {
+        code: "CATALOG_REVISION_CONFLICT",
+        statusCode: 409,
+        currentObject: { objectType: input.objectType, objectId: input.objectId, revision },
+      });
+    }
+    completions.push(input);
+    revision += 1;
+    const effectiveValue = input.decision === "modify"
+      ? input.payload
+      : { itemId: input.objectId, chainId: "c", level: 1, baseUnits: 1 };
+    return {
+      objectType: input.objectType,
+      objectId: input.objectId,
+      status: "active",
+      revision,
+      reviewStatus: "clear",
+      reviewReasons: [],
+      effectiveValue,
+    };
+  };
+  const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  const client = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  try {
+    await new Promise((resolve, reject) => { client.once("open", resolve); client.once("error", reject); });
+
+    const confirmInput = {
+      objectType: "item-identity", objectId: "i", decision: "confirm",
+      actor: "operator-a", note: "完整候选已核对", expectedRevision: 3,
+    };
+    const confirmEvent = waitForEvent(client, (event) => event.type === "catalog-review-updated" && event.revision === 4, "catalog confirm event");
+    const confirmed = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(confirmInput),
+    });
+    if (confirmed.status !== 200) confirmEvent.cancel();
+    assert.equal(confirmed.status, 200);
+    assert.deepEqual(await confirmed.json(), {
+      objectType: "item-identity", objectId: "i", status: "active", revision: 4,
+      reviewStatus: "clear", reviewReasons: [],
+      effectiveValue: { itemId: "i", chainId: "c", level: 1, baseUnits: 1 },
+    });
+    assert.deepEqual(await confirmEvent.promise, {
+      type: "catalog-review-updated", objectType: "item-identity", objectId: "i", revision: 4, reviewStatus: "clear",
+    });
+
+    const modifiedPayload = { itemId: "i", chainId: "manual", level: 2, baseUnits: 2 };
+    const modifyInput = {
+      objectType: "item-identity", objectId: "i", decision: "modify", payload: modifiedPayload,
+      actor: "operator-b", note: "整项修改已核对", expectedRevision: 4,
+    };
+    const modifyEvent = waitForEvent(client, (event) => event.type === "catalog-review-updated" && event.revision === 5, "catalog modify event");
+    const modified = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(modifyInput),
+    });
+    if (modified.status !== 200) modifyEvent.cancel();
+    assert.equal(modified.status, 200);
+    assert.deepEqual((await modified.json()).effectiveValue, modifiedPayload);
+    assert.deepEqual(await modifyEvent.promise, {
+      type: "catalog-review-updated", objectType: "item-identity", objectId: "i", revision: 5, reviewStatus: "clear",
+    });
+    assert.deepEqual(completions, [confirmInput, modifyInput]);
+
+    const stale = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...confirmInput, note: "旧页面", expectedRevision: 2 }),
+    });
+    assert.equal(stale.status, 409);
+    assert.deepEqual(await stale.json(), {
+      ok: false, error: "catalog revision conflict", code: "CATALOG_REVISION_CONFLICT",
+      currentObject: { objectType: "item-identity", objectId: "i", revision: 5 },
+    });
+  } finally {
+    client.close();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("证据处置 API 返回重评结果并向所有控制台广播审核变化", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-evidence-disposition-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const runtime = createRuntime();
+  const calls = [];
+  runtime.setCatalogEvidenceDisposition = (objectType, objectId, evidenceId, disposition, reason, expectedRevision) => {
+    calls.push({ objectType, objectId, evidenceId, disposition, reason, expectedRevision });
+    return {
+      objectType, objectId, status: "active", revision: expectedRevision + 1,
+      reviewStatus: "clear", reviewReasons: [],
+      evidence: [{ id: Number(evidenceId), disposition }],
+    };
+  };
+  const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  const client = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  try {
+    await new Promise((resolve, reject) => { client.once("open", resolve); client.once("error", reject); });
+    const input = {
+      objectType: "item-identity", objectId: "i", evidenceId: 7,
+      disposition: "paused", reason: "等待复核", expectedRevision: 3,
+    };
+    const pendingEvent = waitForEvent(client, (event) => event.type === "catalog-review-updated" && event.revision === 4, "catalog evidence event");
+    const response = await fetch(`http://127.0.0.1:${port}/api/catalog/evidence/disposition`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+    });
+    if (response.status !== 200) pendingEvent.cancel();
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      objectType: "item-identity", objectId: "i", status: "active", revision: 4,
+      reviewStatus: "clear", reviewReasons: [], evidence: [{ id: 7, disposition: "paused" }],
+    });
+    assert.deepEqual(calls, [input]);
+    assert.deepEqual(await pendingEvent.promise, {
+      type: "catalog-review-updated", objectType: "item-identity", objectId: "i", revision: 4, reviewStatus: "clear",
+    });
   } finally {
     client.close();
     await server.close();

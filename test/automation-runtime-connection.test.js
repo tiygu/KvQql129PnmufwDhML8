@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { AutomationRuntime } = require("../src/automation-runtime");
+const { AutomationRuntime, buildOptimizationPlanInWorker } = require("../src/automation-runtime");
 const { AutomationDatabase } = require("../src/automation-database");
 
 function persistedCatalogFixture() {
@@ -21,6 +21,15 @@ function persistedCatalogFixture() {
     ] }],
   };
 }
+
+test("规划 Worker 不会因为动作间隔预算到期而中止", async () => {
+  const plan = await buildOptimizationPlanInWorker({
+    catalog: { rules: {}, chains: [], items: [], producers: [] },
+    state: { schemaVersion: 1, resources: { energy: 10 }, board: { grids: [], mergeCandidates: [], empty: 4 }, orders: [] },
+  }, { timeoutMs: 0 });
+
+  assert.equal(plan.boundaryReason, "no-feasible-order");
+});
 
 test("CDP WebSocket关闭时仪表盘返回可渲染的重连状态而不是导致控制请求失败", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-disconnected-"));
@@ -76,7 +85,7 @@ test("Catalog Repository 写入失败时事务回滚且不写可变 JSON 真相"
   const beforeCatalog = backend.exportCatalog();
   const persistedPath = path.join(dataDir, "item-catalog.json");
   backend.connect = async () => ({ probe: { context: { id: 1 } } });
-  backend.lab = { snapshot: async () => ({ fixture: true }) };
+  backend.lab = { snapshot: async () => ({ fixture: true, focusedControllers: { selectedItem: { itemId: "new-item" } } }) };
   backend.buildCatalog = () => ({
     rules: {}, coverage: {}, chains: [{ id: "new-chain", complete: false }],
     items: [{ id: "new-item", chainId: "new-chain", level: 1 }], producers: [],
@@ -145,4 +154,248 @@ test("Runtime Catalog Review Gate 独立降级关系对象并隔离真实规划"
   assert.equal(backend.getPlanningCatalog({ includeProvisional: true }).items.some((item) => item.id === "i1"), true);
   backend.database.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("规划图鉴按仓库 revision 复用并在证据变化后立即失效", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-planning-cache-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    const first = backend.getPlanningCatalog({ executionMode: "automatic" });
+    const second = backend.getPlanningCatalog({ executionMode: "automatic" });
+    assert.strictEqual(second, first);
+    backend.database.observeCatalogObject({
+      objectType: "item-identity",
+      objectId: "cache-invalidation-item",
+      payload: { itemId: "cache-invalidation-item" },
+      sourceType: "runtime",
+    });
+    const third = backend.getPlanningCatalog({ executionMode: "automatic" });
+    assert.notStrictEqual(third, first);
+    assert.notEqual(third.revision, first.revision);
+  } finally {
+    backend.database.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("仪表盘图鉴视图按仓库 revision 复用并在对象变化后失效", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-catalog-view-cache-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    const first = backend.getCatalogView({ includeRepositoryObjects: false });
+    const second = backend.getCatalogView({ includeRepositoryObjects: false });
+    assert.strictEqual(second, first);
+    backend.database.observeCatalogObject({ objectType: "item-identity", objectId: "view-cache-item", payload: { itemId: "view-cache-item" }, sourceType: "runtime" });
+    const third = backend.getCatalogView({ includeRepositoryObjects: false });
+    assert.notStrictEqual(third, first);
+    assert.notEqual(third.revision, first.revision);
+  } finally {
+    backend.database.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("完整图鉴视图忽略重复证据计数但在有效对象变化后失效", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-full-catalog-view-cache-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    const observation = { objectType: "item-identity", objectId: "full-view-cache-item", payload: { itemId: "full-view-cache-item", level: 1 }, sourceType: "runtime", sourceRef: "same-sample" };
+    backend.database.observeCatalogObject(observation);
+    const first = backend.getCatalogView();
+    backend.database.observeCatalogObject(observation);
+    const second = backend.getCatalogView();
+    assert.strictEqual(second, first);
+    backend.database.observeCatalogObject({ ...observation, objectId: "full-view-cache-item-2", payload: { itemId: "full-view-cache-item-2", level: 2 } });
+    assert.notStrictEqual(backend.getCatalogView(), first);
+  } finally {
+    backend.database.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("自动图标质量拒绝后进入退避而人工采集仍可立即重试", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-icon-backoff-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  const item = backend.database.listCatalogObjects({ objectType: "item-identity" })[0];
+  const requests = [];
+  backend.iconService.request = (itemId) => { requests.push(String(itemId)); return { itemId: String(itemId), status: "queued" }; };
+  try {
+    backend.iconEvidenceRetryAt.set(item.objectId, Date.now() + 300_000);
+    const queued = backend.queueVisibleBoardIconEvidence({ board: { grids: [{ itemId: item.objectId }] } });
+    assert.deepEqual(queued, []);
+    backend.acquireCatalogIcon(item.objectId);
+    assert.deepEqual(requests, [item.objectId]);
+    assert.equal(backend.iconEvidenceRetryAt.has(item.objectId), false);
+  } finally {
+    backend.database.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("运行时重启会清除与资源提示冲突的通用自动图标并保留人工选择", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-generic-icon-"));
+  const iconPath = path.join(dataDir, "generic-icon.png");
+  fs.writeFileSync(path.join(dataDir, "item-catalog.json"), JSON.stringify(persistedCatalogFixture()), "utf8");
+  fs.writeFileSync(iconPath, Buffer.from("same-generic-icon"));
+  let backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  const candidateAsset = {
+    hash: "a".repeat(64),
+    mimeType: "image/png",
+    width: 1,
+    height: 1,
+    byteSize: fs.statSync(iconPath).size,
+    filePath: iconPath,
+  };
+  backend.database.saveIconCandidate({
+    itemId: "i1",
+    cacheKey: "generic-i1",
+    sourceType: "cocos-runtime-resource",
+    runtimeIdentifier: "icon",
+    crop: { rect: { x: 0, y: 0, width: 1, height: 1 } },
+    asset: candidateAsset,
+  });
+  const manualCandidate = backend.database.saveIconCandidate({
+    itemId: "i2",
+    cacheKey: "generic-i2",
+    sourceType: "cocos-runtime-resource",
+    runtimeIdentifier: "icon",
+    crop: { rect: { x: 0, y: 0, width: 1, height: 1 } },
+    asset: candidateAsset,
+  });
+  backend.database.selectIconCandidate("i2", manualCandidate.id, {
+    actor: "operator",
+    note: "verified",
+    expectedRevision: backend.getCatalogObject("item-identity", "i2").revision,
+  });
+  backend.database.close();
+
+  backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    assert.equal(backend.getCatalogObject("item-identity", "i1").selectedIcon, null);
+    assert.equal(backend.getCatalogObject("item-identity", "i2").selectedIcon.id, manualCandidate.id);
+    const queued = backend.queueVisibleBoardIconEvidence({
+      board: { grids: [{ itemId: "i1" }, { itemId: "i2" }] },
+    });
+    assert.deepEqual(queued.map(({ itemId, status }) => ({ itemId, status })), [
+      { itemId: "i1", status: "queued" },
+    ]);
+  } finally {
+    backend.iconService.interruptForAutomation();
+    await backend.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("dashboard polling reuses the runtime state while an automation action is active", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-dashboard-running-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  let collections = 0;
+  backend.collectState = async () => { collections += 1; throw new Error("dashboard must not compete with action verification"); };
+  backend.connectionService.status = async () => ({ listening: true, starting: false, managed: false, cdpPort: 62000 });
+  backend.running = true;
+  backend.lab = {};
+  backend.selection = { probe: { context: { id: 1 } } };
+  backend.lastState = {
+    schemaVersion: 1,
+    collectedAt: new Date().toISOString(),
+    scene: "board",
+    resources: { coins: 0, diamonds: 0, energy: 10 },
+    board: { available: true, visible: true, width: 1, height: 1, occupied: 0, empty: 1, signature: "empty-board", grids: [], requiredItemCounts: {} },
+    warehouse: { inventoryKnowledge: { status: "unknown", slots: [], items: [], exchangeCapacity: 0 }, storeAvailability: { status: "unknown" } },
+    orders: [],
+    mapMission: { canComplete: false, requirements: [] },
+  };
+  backend.lastPlan = { status: "cached-running-plan", recommended: null, plans: [] };
+
+  const dashboard = await backend.dashboard();
+
+  assert.equal(collections, 0);
+  assert.equal(dashboard.connected, true);
+  assert.equal(dashboard.state, backend.lastState);
+  assert.equal(dashboard.plan, backend.lastPlan);
+  backend.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("active automation defers full-board catalog evidence instead of blocking every action", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-deferred-board-evidence-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  const state = {
+    schemaVersion: 1,
+    collectedAt: new Date().toISOString(),
+    scene: "board",
+    resources: { coins: 0, diamonds: 0, energy: 10 },
+    board: { available: true, visible: true, width: 1, height: 1, occupied: 0, empty: 1, signature: "active-board", grids: [], requiredItemCounts: {} },
+    warehouse: { inventoryKnowledge: { status: "unknown", slots: [], items: [], exchangeCapacity: 0 }, storeAvailability: { status: "unknown" } },
+    orders: [],
+    mapMission: { canComplete: false, requirements: [] },
+  };
+  backend.running = true;
+
+  backend.queuePassiveCatalogEvidence({ state });
+  backend.queuePassiveCatalogEvidence({ actionDiff: { type: "merge", itemId: "i1", expectedTarget: "i2", actualTarget: "i2", verified: true } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(backend.passiveCatalogDrainPromise, null);
+  assert.equal(backend.passiveCatalogState, null);
+  assert.equal(backend.deferredPassiveCatalogState, state);
+  assert.equal(backend.passiveCatalogDiffs.length, 0);
+  assert.equal(backend.deferredPassiveCatalogDiffs.length, 1);
+  backend.running = false;
+  backend.flushDeferredPassiveCatalogState();
+  assert.ok(backend.passiveCatalogDrainPromise);
+  await backend.passiveCatalogDrainPromise;
+  assert.equal(backend.deferredPassiveCatalogState, null);
+  backend.queuePassiveCatalogEvidence({ state });
+  assert.equal(backend.passiveCatalogDrainPromise, null);
+  backend.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("passive item evidence convergence clears stale review conflicts", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-passive-review-convergence-"));
+  fs.writeFileSync(path.join(dataDir, "item-catalog.json"), JSON.stringify(persistedCatalogFixture()), "utf8");
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    backend.database.observeCatalogObject({
+      objectType: "item-identity", objectId: "i1",
+      payload: { itemId: "i1", chainId: "c", level: 1, baseUnits: 1, saleValue: 99 },
+      sourceType: "passive-runtime", sourceRef: "stale-board-state", countDuplicate: false,
+    });
+    backend.catalogGate.evaluateObject("item-identity", "i1");
+    assert.equal(backend.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), true);
+
+    backend.queuePassiveCatalogEvidence({ state: { board: { grids: [{ index: 0, itemId: "i1", level: 1 }] }, orders: [], producers: [] } });
+    await backend.passiveCatalogDrainPromise;
+
+    assert.equal(backend.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), false);
+  } finally {
+    await backend.close(); fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("runtime startup reconciles review conflicts against the latest persisted evidence", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-review-startup-reconcile-"));
+  fs.writeFileSync(path.join(dataDir, "item-catalog.json"), JSON.stringify(persistedCatalogFixture()), "utf8");
+  const first = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  first.database.observeCatalogObject({
+    objectType: "item-identity", objectId: "i1",
+    payload: { itemId: "i1", chainId: "c", level: 1, baseUnits: 1, saleValue: 99 },
+    sourceType: "passive-runtime", sourceRef: "board-state", countDuplicate: false,
+  });
+  first.catalogGate.evaluateObject("item-identity", "i1");
+  assert.equal(first.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), true);
+  first.database.observeCatalogObject({
+    objectType: "item-identity", objectId: "i1",
+    payload: { itemId: "i1", chainId: "c", level: 1, baseUnits: 1, saleValue: 0, iconResourceIdentifier: "leaf/1" },
+    sourceType: "passive-runtime", sourceRef: "board-state", countDuplicate: false,
+  });
+  await first.close();
+
+  const restarted = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    assert.equal(restarted.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), false);
+  } finally {
+    await restarted.close(); fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });

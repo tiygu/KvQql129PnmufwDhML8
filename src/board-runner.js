@@ -38,6 +38,7 @@ const BOARD_CONTROL_STATE_EXPRESSION = `(() => {
     moveable: !!safe(() => grid.isMoveable, false),
     locked: !!grid.isLocking,
     frozen: !!safe(() => grid.isFrozen, false),
+    actionReady: !!safe(() => boardView.canBoardGridBeDragging(grid), false) && !safe(() => boardView.isBoardGridItemAnimating(grid), false),
     taskNeed: !!safe(() => grid.item?.taskNeed, false),
     level: safe(() => grid.item.itemConfig.Level, null),
     mergeTarget: safe(() => grid.item.itemConfig.MergeTarget, null),
@@ -151,23 +152,68 @@ class BoardAutomationRunner {
   constructor(options) {
     this.client = options.client;
     this.contextId = options.contextId;
-    this.delayMs = Math.max(300, Math.min(5000, Number(options.delayMs ?? 1200)));
+    this.delayMs = Math.max(50, Math.min(250, Number(options.pollIntervalMs ?? options.delayMs ?? 100)));
+    this.pollIntervalMs = this.delayMs;
+    this.confirmationTimeoutMs = Math.max(300, Math.min(5000, Number(options.confirmationTimeoutMs ?? 1000)));
     this.evaluateTimeoutMs = Math.max(5000, Number(options.evaluateTimeoutMs ?? 10000));
+    this.now = typeof options.now === "function" ? options.now : () => Date.now();
+    this.wait = typeof options.wait === "function" ? options.wait : waitForDelay;
   }
 
-  evaluate(expression, signal = null) {
-    return this.client.evaluate(expression, this.contextId, { timeoutMs: this.evaluateTimeoutMs, signal });
+  evaluate(expression, signal = null, timeoutMs = this.evaluateTimeoutMs) {
+    return this.client.evaluate(expression, this.contextId, { timeoutMs: Math.max(50, Math.min(this.evaluateTimeoutMs, Number(timeoutMs) || this.evaluateTimeoutMs)), signal });
   }
 
-  readState(signal = null) {
-    return this.evaluate(BOARD_CONTROL_STATE_EXPRESSION, signal);
+  readState(signal = null, timeoutMs = this.evaluateTimeoutMs) {
+    return this.evaluate(BOARD_CONTROL_STATE_EXPRESSION, signal, timeoutMs);
   }
 
   async waitForSettle(signal = null) {
-    return waitForDelay(this.delayMs, signal);
+    return this.wait(this.pollIntervalMs, signal);
   }
 
-  async executeAtomicAndRead(expression, uncertainAction, rejectedReason, signal = null) {
+  async readUntilConfirmed(beforeSignature, { signal = null, requireChange = true } = {}) {
+    const startedAt = this.now();
+    const maximumPolls = Math.ceil(this.confirmationTimeoutMs / this.pollIntervalMs) + 1;
+    let state = null;
+    for (let poll = 0; poll < maximumPolls; poll += 1) {
+      const elapsed = this.now() - startedAt;
+      if (requireChange && elapsed >= this.confirmationTimeoutMs) break;
+      if (await this.waitForSettle(signal) === false) return { ok: false, reason: "aborted", elapsedMs: this.now() - startedAt };
+      const remaining = Math.max(50, this.confirmationTimeoutMs - (this.now() - startedAt));
+      try {
+        state = await this.readState(signal, requireChange ? remaining : Math.min(remaining, this.confirmationTimeoutMs));
+      } catch (error) {
+        if (requireChange && this.now() - startedAt >= this.confirmationTimeoutMs) break;
+        return { ok: false, reason: "verification_read_error", error: error.message, elapsedMs: this.now() - startedAt };
+      }
+      if (!state?.ok || state.signature !== beforeSignature || !requireChange) return { ok: true, state, elapsedMs: this.now() - startedAt };
+    }
+    return { ok: false, reason: "action_confirmation_timeout", state, elapsedMs: Math.min(this.confirmationTimeoutMs, this.now() - startedAt), pauseRequested: true };
+  }
+
+  async waitUntilMergeReady(state, candidate, signal = null) {
+    const startedAt = this.now();
+    const maximumPolls = Math.ceil(this.confirmationTimeoutMs / this.pollIntervalMs) + 1;
+    let current = state;
+    for (let poll = 0; poll < maximumPolls; poll += 1) {
+      const source = current.grids.find((grid) => Number(grid.index) === Number(candidate.from));
+      const target = current.grids.find((grid) => Number(grid.index) === Number(candidate.to));
+      if (source?.actionReady !== false && target?.actionReady !== false) return { ok: true, state: current };
+      if (this.now() - startedAt >= this.confirmationTimeoutMs) break;
+      if (await this.waitForSettle(signal) === false) return { ok: false, reason: "aborted", state: current };
+      try {
+        current = await this.readState(signal, Math.max(50, this.confirmationTimeoutMs - (this.now() - startedAt)));
+      } catch (error) {
+        return { ok: false, reason: "verification_read_error", error: error.message, state: current };
+      }
+      const stillAvailable = current?.mergeCandidates?.some((entry) => Number(entry.from) === Number(candidate.from) && Number(entry.to) === Number(candidate.to));
+      if (!current?.ok || !stillAvailable) return { ok: false, reason: "planned_merge_not_available", state: current };
+    }
+    return { ok: false, reason: "merge_not_ready_timeout", state: current, timing: { stage: "action-readiness", elapsedMs: this.now() - startedAt, budgetMs: this.confirmationTimeoutMs } };
+  }
+
+  async executeAtomicAndRead(expression, uncertainAction, rejectedReason, signal = null, confirmation = {}) {
     let acknowledgement;
     try {
       acknowledgement = await this.evaluate(expression, signal);
@@ -175,12 +221,9 @@ class BoardAutomationRunner {
       return { ok: false, failure: { ok: false, executed: true, reason: "atomic_action_error", error: error.message, uncertainAction } };
     }
     if (!acknowledgement?.ok) return { ok: false, failure: { ok: false, executed: true, reason: acknowledgement?.reason || rejectedReason, failedAction: acknowledgement } };
-    if (await this.waitForSettle(signal) === false) return { ok: false, failure: { ok: false, executed: true, reason: "aborted", uncertainAction } };
-    try {
-      return { ok: true, acknowledgement, state: await this.readState(signal) };
-    } catch (error) {
-      return { ok: false, failure: { ok: false, executed: true, reason: "verification_read_error", error: error.message, uncertainAction } };
-    }
+    const confirmed = await this.readUntilConfirmed(confirmation.beforeSignature, { signal, requireChange: confirmation.requireChange !== false });
+    if (!confirmed.ok) return { ok: false, failure: { ok: false, executed: true, reason: confirmed.reason, error: confirmed.error, uncertainAction, pauseRequested: !!confirmed.pauseRequested, timing: { stage: "action-confirmation", elapsedMs: confirmed.elapsedMs, budgetMs: this.confirmationTimeoutMs } } };
+    return { ok: true, acknowledgement, state: confirmed.state, timing: { stage: "action-confirmation", elapsedMs: confirmed.elapsedMs, budgetMs: this.confirmationTimeoutMs } };
   }
 
   async run(options = {}) {
@@ -189,6 +232,13 @@ class BoardAutomationRunner {
     if (requestedProducer != null && !Number.isInteger(requestedProducer)) throw new Error("board-auto requires an integer --producer index");
     const requestedMerge = options.merge == null ? null : { from: Number(options.merge.from), to: Number(options.merge.to) };
     if (requestedMerge && (!Number.isInteger(requestedMerge.from) || !Number.isInteger(requestedMerge.to) || requestedMerge.from === requestedMerge.to)) throw new Error("board-auto requires distinct integer merge indexes");
+    const targetOrderSlot = options.plannedAction?.targetOrderSlot == null ? null : String(options.plannedAction.targetOrderSlot);
+    const boundaryOrders = (current) => {
+      const readyOrders = Array.isArray(current?.readyOrders) ? current.readyOrders : [];
+      return targetOrderSlot == null
+        ? readyOrders
+        : readyOrders.filter((order) => String(order.slot) === targetOrderSlot);
+    };
     const execute = !!options.execute;
     let state;
     try {
@@ -209,13 +259,19 @@ class BoardAutomationRunner {
     for (let step = 0; step < maxActions; step += 1) {
       if (options.signal?.aborted) { stopReason = "aborted"; break; }
       if (!state.boardVisible) { stopReason = "board_not_visible"; break; }
-      if (state.readyOrders.length) { stopReason = "order_ready"; break; }
-      const before = state;
+      if (boundaryOrders(state).length) { stopReason = "order_ready"; break; }
+      let before = state;
       if (state.mergeCandidates.length && options.plannedAction?.type !== "produce") {
-        const candidate = requestedMerge
+        let candidate = requestedMerge
           ? state.mergeCandidates.find((entry) => Number(entry.from) === requestedMerge.from && Number(entry.to) === requestedMerge.to)
           : state.mergeCandidates[0];
-        const execution = await this.executeAtomicAndRead(buildAtomicMergeExpression(candidate.from, candidate.to), { type: "merge", from: candidate.from, to: candidate.to }, "merge_rejected", options.signal);
+        const readiness = await this.waitUntilMergeReady(state, candidate, options.signal);
+        if (!readiness.ok) return { ok: false, executed: false, reason: readiness.reason, error: readiness.error, timing: readiness.timing, actions };
+        state = readiness.state;
+        before = state;
+        candidate = state.mergeCandidates.find((entry) => Number(entry.from) === Number(candidate.from) && Number(entry.to) === Number(candidate.to));
+        if (!candidate) return { ok: false, executed: false, reason: "planned_merge_not_available", actions };
+        const execution = await this.executeAtomicAndRead(buildAtomicMergeExpression(candidate.from, candidate.to), { type: "merge", from: candidate.from, to: candidate.to }, "merge_rejected", options.signal, { beforeSignature: before.signature, requireChange: true });
         if (!execution.ok) return { ...execution.failure, actions };
         state = execution.state;
         const source = state.grids.find((grid) => grid.index === candidate.from), target = state.grids.find((grid) => grid.index === candidate.to);
@@ -229,12 +285,12 @@ class BoardAutomationRunner {
         const expectedModeId = options.plannedAction?.productionModeId ?? null;
         const uncertainAction = { type: "producer-touch", producer: selectedProducer.index, producerItemId: selectedProducer.itemId, productionModeId: expectedModeId ?? selectedProducer.currentProductionModeId ?? null, attributable: false, uncertain: true };
         if (expectedModeId != null && String(selectedProducer.currentProductionModeId) !== String(expectedModeId)) return { ok: false, executed: false, reason: "production_mode_mismatch", expectedModeId: String(expectedModeId), currentModeId: selectedProducer.currentProductionModeId, actions };
-        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal);
+        const firstExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal, { beforeSignature: before.signature, requireChange: false });
         if (!firstExecution.ok) return { ...firstExecution.failure, actions };
         state = firstExecution.state;
         if (state.signature === before.signature) {
           touches = 2;
-          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal);
+          const secondExecution = await this.executeAtomicAndRead(buildAtomicProducerTouchExpression(selectedProducer.index, expectedModeId), uncertainAction, "producer_touch_rejected", options.signal, { beforeSignature: before.signature, requireChange: true });
           if (!secondExecution.ok) return { ...secondExecution.failure, actions };
           state = secondExecution.state;
         }
@@ -245,7 +301,7 @@ class BoardAutomationRunner {
         if (!verified) { stopReason = "no_state_change"; break; }
       }
       if (!state?.ok) { stopReason = state?.reason || "state_read_failed"; break; }
-      if (state.readyOrders.length) { stopReason = "order_ready"; break; }
+      if (boundaryOrders(state).length) { stopReason = "order_ready"; break; }
     }
     return {
       ok: actions.every((action) => action.verified),
@@ -253,7 +309,8 @@ class BoardAutomationRunner {
       producer: selectedProducer,
       actions,
       stopReason,
-      completedBoundary: state.readyOrders,
+      completedBoundary: boundaryOrders(state),
+      observedState: state,
       final: { empty: state.empty, remainingCandidates: state.mergeCandidates.length, signature: state.signature }
     };
   }

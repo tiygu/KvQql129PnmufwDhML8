@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const { PNG } = require("pngjs");
@@ -34,11 +35,11 @@ function pixels(buffer) {
 }
 
 test("fixed PNG atlas fixtures reconstruct normal, rotated, offset, and transparent-padding icons", () => {
-  const atlas = png(4, 4, { "1,1": "red", "2,1": "green", "0,0": "red", "0,1": "green", "3,3": "blue" });
+  const atlas = png(4, 4, { "1,1": "red", "2,1": "green", "0,0": "red", "0,1": "green", "1,0": "yellow", "3,3": "blue" });
   const ordinary = reconstructIcon(atlas, { mimeType: "image/png", rect: { x: 1, y: 1, width: 2, height: 1 }, originalSize: { width: 2, height: 1 }, offset: { x: 0, y: 0 }, rotated: false });
   assert.deepEqual(pixels(ordinary), { width: 2, height: 1, pixels: { "0,0": COLORS.red, "1,0": COLORS.green } });
 
-  const rotated = reconstructIcon(atlas, { mimeType: "image/png", rect: { x: 0, y: 0, width: 1, height: 2 }, originalSize: { width: 2, height: 1 }, offset: { x: 0, y: 0 }, rotated: true });
+  const rotated = reconstructIcon(atlas, { mimeType: "image/png", rect: { x: 0, y: 0, width: 2, height: 1 }, originalSize: { width: 2, height: 1 }, offset: { x: 0, y: 0 }, rotated: true });
   assert.deepEqual(pixels(rotated), { width: 2, height: 1, pixels: { "0,0": COLORS.red, "1,0": COLORS.green } });
 
   const offset = reconstructIcon(atlas, { mimeType: "image/png", rect: { x: 3, y: 3, width: 1, height: 1 }, originalSize: { width: 3, height: 3 }, offset: { x: 1, y: -1 }, rotated: false });
@@ -124,6 +125,19 @@ test("resource and crop cache persists complete source metadata without duplicat
   assert.equal(resourceReads, 1);
   assert.equal(events.some((event) => event.type === "icon-acquisition-complete" && event.cached === true), true);
 
+  const wrongFile = path.join(dir, "wrong.png");
+  const wrongBody = png(1, 1, { "0,0": "blue" });
+  fs.writeFileSync(wrongFile, wrongBody);
+  database.saveIconCandidate({
+    itemId: "i1", cacheKey: "wrong-generic-icon", sourceType: "cocos-runtime-resource",
+    runtimeIdentifier: "icon", crop: { rect: { x: 9, y: 9, width: 1, height: 1 } }, rankScore: 1,
+    asset: { hash: crypto.createHash("sha256").update(wrongBody).digest("hex"), mimeType: "image/png", width: 1, height: 1, byteSize: wrongBody.length, filePath: wrongFile },
+  });
+  assert.equal(database.getSelectedIconCandidate("i1").runtimeIdentifier, "icon");
+  service.request("i1", { contextId: 7 });
+  await service.waitForIdle();
+  assert.equal(database.getSelectedIconCandidate("i1").runtimeIdentifier, "sprite:i1");
+
   const restartedService = new IconEvidenceService({
     database, cacheDir: path.join(dir, "icon-cache"), concurrency: 1,
     resolveSpriteFrame: service.resolveSpriteFrame,
@@ -135,7 +149,7 @@ test("resource and crop cache persists complete source metadata without duplicat
 
   service.request("i2", { contextId: 7 });
   await service.waitForIdle();
-  assert.equal(database.listIconAssets().length, 2);
+  assert.equal(database.listIconAssets().length, 3);
   const portableRoot = fs.mkdtempSync(path.join(os.tmpdir(), "icon-snapshot-"));
   const restoredDatabase = new AutomationDatabase(path.join(portableRoot, "automation.db"));
   try {
@@ -148,8 +162,11 @@ test("resource and crop cache persists complete source metadata without duplicat
     fs.rmSync(portableRoot, { recursive: true, force: true });
   }
   fs.rmSync(candidate.filePath);
-  assert.equal(database.getCatalogObject("item-identity", "i1").selectedIcon, null);
-  assert.equal(database.getCatalogReviewQueue().find((entry) => entry.objectId === "i1").reasons.some((reason) => reason.type === "icon-gap"), true);
+  const identity = database.getCatalogObject("item-identity", "i1");
+  assert.equal(identity.selectedIcon, null);
+  assert.equal(identity.completenessGaps.some((gap) => gap.type === "icon-gap"), true);
+  const queueEntry = database.getCatalogReviewQueue().find((entry) => entry.objectId === "i1");
+  assert.equal(queueEntry?.reasons.some((reason) => reason.type === "icon-gap") ?? false, false);
 }));
 
 test("identical normalized icons from different resources deduplicate by content hash", async () => withService(async ({ database, dir }) => {
@@ -211,6 +228,31 @@ test("image decoding and reconstruction yield the Node event loop to a worker", 
   running = false;
   assert.ok(turns > 1, `expected worker processing to leave the event loop responsive, observed ${turns} turns`);
 }));
+
+test("automation priority aborts an in-flight icon CDP task at its current boundary", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-interrupt-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  database.observeCatalogObject({ objectType: "item-identity", objectId: "i1", payload: { itemId: "i1" }, sourceType: "runtime" });
+  let safe = true;
+  const service = new IconEvidenceService({
+    database,
+    cacheDir: path.join(root, "cache"),
+    concurrency: 1,
+    isSafeBoundary: () => safe,
+    resolveSpriteFrame: ({ signal }) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(Object.assign(new Error("CDP command aborted"), { name: "AbortError" })), { once: true })),
+  });
+  try {
+    service.request("i1");
+    await new Promise((resolve) => setImmediate(resolve));
+    safe = false;
+    assert.equal(service.interruptForAutomation(), 1);
+    await service.waitForIdle();
+    assert.equal(service.getTask(1).status, "deferred");
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 test("Automation Runtime acquires icons in the background without changing Active planning eligibility", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-icon-"));
   fs.mkdirSync(path.join(root, "captures"));
@@ -235,6 +277,10 @@ test("Automation Runtime acquires icons in the background without changing Activ
     assert.deepEqual(runtime.getPlanningCatalog().items.map((item) => item.id), planningBefore);
     assert.match(runtime.getCatalogObject("item-identity", "i1").selectedIcon.url, /^\/api\/catalog\/icon\//);
     assert.equal(runtime.getCatalogView().items.find((item) => item.id === "i1").iconUrl != null, true);
+    runtime.database.observeCatalogObject({ objectType: "item-identity", objectId: "board-only", payload: { itemId: "board-only", level: 5 }, sourceType: "passive-runtime", sourceRef: "board-state", countDuplicate: false });
+    runtime.queueVisibleBoardIconEvidence({ board: { grids: [{ itemId: "board-only", level: 5 }] } });
+    await runtime.iconService.waitForIdle();
+    assert.match(runtime.getCatalogView().iconUrls["board-only"], /^\/api\/catalog\/icon\//);
     assert.equal(events.some((event) => event.type === "icon-acquisition-complete"), true);
     runtime.running = true;
     assert.throws(() => runtime.acquireCatalogIcon("i2"), (error) => error.code === "ICON_ACQUISITION_UNSAFE_BOUNDARY");

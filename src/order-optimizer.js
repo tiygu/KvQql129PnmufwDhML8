@@ -32,7 +32,7 @@ function rankPlans(plans, strategy = "efficiency", prioritySlot = null) {
     return [...feasible].sort((a, b) => common(a, b) || a.estimatedEnergy - b.estimatedEnergy || b.rewardCoins - a.rewardCoins);
   }
   if (strategy === "specified" && prioritySlot != null) {
-    return [...feasible].sort((a, b) => common(a, b) || Number(String(b.slot) === String(prioritySlot)) - Number(String(a.slot) === String(prioritySlot)) || b.efficiency - a.efficiency);
+    return [...feasible].sort((a, b) => Number(String(b.slot) === String(prioritySlot)) - Number(String(a.slot) === String(prioritySlot)) || common(a, b) || b.efficiency - a.efficiency);
   }
   return [...feasible].sort((a, b) => common(a, b) || b.efficiency - a.efficiency || a.estimatedEnergy - b.estimatedEnergy);
 }
@@ -271,13 +271,14 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
 
   let warehouseStoreCandidates = [];
   let warehouseRetrieveCandidates = [];
+  let specifiedResolvedPlan = null;
   if (gameState) {
     warehouseStoreCandidates = buildWarehouseStoreCandidates(normalizedState);
     const hasStochasticProduction = (catalog.producers || []).some((producer) => {
       const distributions = producer.modes?.length ? producer.modes.map((mode) => mode.drops || []) : [producer.drops || []];
       return distributions.some((drops) => drops.length !== 1 || Number(drops[0]?.probability) !== 1);
     });
-    for (const plan of plans) {
+    const detailPlan = (plan) => {
       const stateRevision = state.board?.signature || state.collectedAt || `${normalizedState.board.occupied}:${normalizedState.energy}:${normalizedState.warehouse.inventoryKnowledge.revision || "warehouse-unknown"}`;
       const spacePlan = hasStochasticProduction && normalizedState.board.spaceKnown
         ? planStochasticOrder(normalizedState, plan.slot, { catalogRevision: catalog.revision, stateRevision })
@@ -291,7 +292,7 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
         plan.feasible = false;
         plan.actionable = false;
         plan.explanation = "Human Catalog Ruling locks a production mode that is not currently executable; algorithmic mode switching is blocked.";
-        continue;
+        return;
       }
       if (spacePlan.status === "planned") {
         plan.actionable = true;
@@ -342,12 +343,28 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
           plan.nextAction = { ...plan.nextAction, productionModeId: modeStep.productionModeId, productionModeDecision: modeStep.productionModeDecision };
         }
       }
+    };
+    if (strategy === "specified") {
+      const requested = prioritySlot == null ? null : plans.find((plan) => String(plan.slot) === String(prioritySlot));
+      const fallbackCandidates = plans.filter((plan) => plan !== requested);
+      const rankedFallbacks = rankPlans(fallbackCandidates, "efficiency");
+      const rankedSlots = new Set(rankedFallbacks.map((plan) => String(plan.slot)));
+      const detailOrder = [requested, ...rankedFallbacks, ...fallbackCandidates.filter((plan) => !rankedSlots.has(String(plan.slot)))].filter(Boolean);
+      for (const plan of detailOrder) {
+        detailPlan(plan);
+        if (plan.ready || plan.nextAction) {
+          specifiedResolvedPlan = plan;
+          break;
+        }
+      }
+    } else {
+      for (const plan of plans) detailPlan(plan);
     }
   }
 
   for (const plan of plans) plan.affordable = plan.feasible && (plan.ready || !Number.isFinite(energyAvailable) || plan.estimatedEnergy <= energyAvailable);
   const feasible = plans.filter((plan) => plan.feasible);
-  const recommended = rankPlans(plans, strategy, prioritySlot)[0] || null;
+  const recommended = strategy === "specified" && gameState ? specifiedResolvedPlan : rankPlans(plans, strategy, prioritySlot)[0] || null;
   const lowestEnergy = [...feasible].sort((a, b) => a.estimatedEnergy - b.estimatedEnergy || b.rewardCoins - a.rewardCoins)[0] || null;
   const evidenceBlocks = plans.map((plan) => plan.evidenceBlock).filter(Boolean);
   const allCatalogBlocked = plans.length > 0 && plans.every((plan) => !!plan.evidenceBlock);
@@ -405,6 +422,7 @@ function buildOptimizationPlan({ catalog, state, boardScan, strategy = "efficien
     boundaryReason,
     strategy,
     prioritySlot: strategy === "specified" ? prioritySlot : null,
+    resolvedPrioritySlot: strategy === "specified" ? specifiedResolvedPlan?.slot ?? null : null,
   };
 }
 

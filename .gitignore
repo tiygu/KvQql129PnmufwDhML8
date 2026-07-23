@@ -3,3 +3,10 @@ node_modules/
 reports/
 *.log
 .scratch/
+.agents/
+.claude/
+.pi-subagents/
+.reasonix/
+[object Object]
+[object Object]-shm
+[object Object]-wal

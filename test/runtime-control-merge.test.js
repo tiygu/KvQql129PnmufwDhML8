@@ -626,6 +626,42 @@ test("the order loop replans a stale semantic merge without recording a mutation
   assert.deepEqual(events.map((event) => event.type), ["merge"]);
 });
 
+test("the order loop waits through transient semantic merge readiness instead of ending automation", async () => {
+  const fixture = createAdapter();
+  await fixture.adapter.ready();
+  let readinessChecks = 0;
+  fixture.live.boardView.canBoardGridBeDragging = () => {
+    readinessChecks += 1;
+    return readinessChecks > 2;
+  };
+  const state = normalizedBaseline();
+  const target = {
+    slot: "order-1",
+    feasible: true,
+    actionable: true,
+    ready: false,
+    nextAction: { type: "merge", from: 0, to: 1, itemId: "item-1", resultItemId: "item-2" },
+    boardSpaceFeasibility: { feasible: true },
+  };
+  const loop = new OrderCoinLoop({
+    collectState: (signal) => fixture.adapter.readState(signal),
+    planOrders: async () => ({ recommended: target, plans: [target], boundaryReason: null }),
+    runBoardAction: ({ merge, plannedAction, signal }) => fixture.adapter.execute(
+      { type: "run-board-action", merge, plannedAction },
+      { signal, options: { delayMs: 1 } },
+    ),
+    submitOrder: async () => { throw new Error("transient merge readiness must not submit an order"); },
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 1, initialState: state });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "max-actions-reached");
+  assert.equal(fixture.live.mergeExecutions(), 1);
+  assert.ok(readinessChecks > 2);
+  assert.deepEqual(result.actions.map((action) => action.type), ["merge"]);
+});
+
 test("the order loop executes a concrete live merge candidate when the selected plan has no next action", async () => {
   const fixture = createAdapter();
   await fixture.adapter.ready();

@@ -18,7 +18,7 @@ function selectWarehouseCandidate(state) {
 }
 
 class OrderCoinLoop {
-  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, loadWarehouseInventory = null, retrieveWarehouseItem = null, switchProductionMode = null, allowProductionModeSwitch = true, minEnergy = 0, minEmptySpaces = 2, onEvent = null }) {
+  constructor({ collectState, planOrders, runBoardAction, submitOrder, preflightStore = null, storeBoardItem = null, loadWarehouseInventory = null, retrieveWarehouseItem = null, switchProductionMode = null, reconcileBoardState = null, onActionTimeout = null, allowProductionModeSwitch = true, minEnergy = 0, minEmptySpaces = 2, onEvent = null, waitIfPaused = null }) {
     this.collectState = collectState;
     this.planOrders = planOrders;
     this.runBoardAction = runBoardAction;
@@ -28,8 +28,11 @@ class OrderCoinLoop {
     this.loadWarehouseInventory = loadWarehouseInventory;
     this.retrieveWarehouseItem = retrieveWarehouseItem;
     this.switchProductionMode = switchProductionMode;
+    this.reconcileBoardState = reconcileBoardState;
+    this.onActionTimeout = onActionTimeout;
     this.allowProductionModeSwitch = !!allowProductionModeSwitch;
     this.onEvent = onEvent;
+    this.waitIfPaused = waitIfPaused;
     this.minEnergy = Math.max(0, Number(minEnergy) || 0);
     this.minEmptySpaces = Math.max(0, Number(minEmptySpaces) || 0);
     this.targetSlot = null;
@@ -130,32 +133,39 @@ class OrderCoinLoop {
     return { continue: true };
   }
 
-  async run({ execute = false, maxActions = null, signal = null } = {}) {
+  async run({ execute = false, maxActions = null, signal = null, initialState = null } = {}) {
     const requestedLimit = Number(maxActions);
     const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
       ? Math.max(1, Math.floor(requestedLimit))
       : Infinity;
     const actions = [];
+    let nextState = initialState;
     for (let step = 0; step < limit; step += 1) {
       if (signal?.aborted) return { ok: false, executed: execute, reason: "aborted", targetSlot: this.targetSlot, actions };
-      const state = await this.collectState(signal);
+      const state = nextState || await this.collectState(signal);
+      nextState = null;
       const energy = Number(state.resources?.energy);
       if (Number.isFinite(energy) && energy <= this.minEnergy) {
         return { ok: true, executed: execute, reason: "energy-depleted", targetSlot: this.targetSlot, actions, state };
       }
-      let plan = await this.planOrders(state);
-      const retrieval = await this.tryWarehouseRetrieve({ plan, state, execute, signal, actions });
-      if (retrieval?.continue) continue;
-      if (retrieval?.result) return retrieval.result;
-      let target = this.targetSlot == null ? null : plan.plans.find((item) => String(item.slot) === this.targetSlot);
+      const plan = await this.planOrders(state);
       const actionContext = { hasMergeCandidate: (state.board?.mergeCandidates || []).length > 0 };
       const actionable = (candidate) => isPlanActionable(candidate, actionContext);
-      if (!actionable(target)) {
-        target = actionable(plan.recommended)
+      const lockedTarget = this.targetSlot == null ? null : plan.plans.find((item) => String(item.slot) === this.targetSlot);
+      let target = actionable(lockedTarget)
+        ? lockedTarget
+        : actionable(plan.recommended)
           ? plan.recommended
           : plan.plans.find(actionable) || null;
-        this.targetSlot = target ? String(target.slot) : null;
+      if (execute) await this.waitIfPaused?.(signal);
+      const preferredTarget = lockedTarget || plan.recommended;
+      const warehouseRetrievalSelected = preferredTarget?.nextAction?.type === "retrieve-from-warehouse";
+      if (warehouseRetrievalSelected || (!target && plan.warehouseInventoryLoadRequired)) {
+        const retrieval = await this.tryWarehouseRetrieve({ plan, state, execute, signal, actions });
+        if (retrieval?.continue) continue;
+        if (retrieval?.result) return retrieval.result;
       }
+      this.targetSlot = target ? String(target.slot) : null;
       if (!target) {
         const boundary = plan.boundaryReason || "no-feasible-order";
         if (boundary === "board-space-deadlock") {
@@ -178,7 +188,7 @@ class OrderCoinLoop {
       const order = state.orders.find((item) => String(item.slot) === this.targetSlot);
       if (order?.ready || target.ready) {
         if (!execute) return { ok: true, executed: false, reason: "order-ready", targetSlot: this.targetSlot, nextAction: { type: "submit-order", slot: this.targetSlot }, actions, state, plan };
-        const submitted = await this.submitOrder(this.targetSlot, { signal });
+        const submitted = await this.submitOrder(this.targetSlot, { signal, before: state });
         actions.push({ step: actions.length + 1, type: "submit-order", slot: this.targetSlot, ok: submitted.ok, reason: submitted.reason, before: submitted.before, after: submitted.after, coinsBefore: submitted.coinsBefore, coinsAfter: submitted.coinsAfter });
         this.onEvent?.(actions.at(-1));
         return { ok: submitted.ok, executed: true, reason: submitted.reason, targetSlot: this.targetSlot, actions, submission: submitted };
@@ -213,7 +223,16 @@ class OrderCoinLoop {
         : { type: "produce", producer };
       const nextAction = plannedAction || fallbackAction;
       if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction, actions, state, plan };
-      const boardResult = await this.runBoardAction({ producer, merge: nextAction.type === "merge" ? nextAction : null, plannedAction: nextAction, signal });
+      const boardPlannedAction = {
+        ...nextAction,
+        targetOrderSlot: this.targetSlot,
+      };
+      const boardResult = await this.runBoardAction({ producer, merge: nextAction.type === "merge" ? nextAction : null, plannedAction: boardPlannedAction, signal });
+      if (boardResult.replanRequested && boardResult.replanState) {
+        nextState = boardResult.replanState;
+        step -= 1;
+        continue;
+      }
       const verified = boardResult.ok && (boardResult.actions?.length > 0 || boardResult.stopReason === "order_ready");
       const diff = boardResult.actions?.[0] || boardResult.uncertainAction || null;
       const actualOutputs = (diff?.actualOutputItemIds || []).map(String).sort();
@@ -222,7 +241,15 @@ class OrderCoinLoop {
         && !predictedBranches.some((branch) => JSON.stringify((branch.outcomeItemIds || []).map(String).sort()) === JSON.stringify(actualOutputs));
       actions.push({ step: actions.length + 1, type: diff?.type || "board-boundary", producer, ok: verified, reason: boardResult.stopReason || boardResult.reason, diff, predictionDiverged, ...(predictionDiverged ? { replanReason: "actual-production-outside-predicted-branches" } : {}) });
       this.onEvent?.(actions.at(-1));
+      if (!verified && boardResult.pauseRequested) {
+        await this.onActionTimeout?.({ reason: boardResult.reason || "action_confirmation_timeout", timing: boardResult.timing || null, boardResult });
+        await this.waitIfPaused?.(signal);
+        if (signal?.aborted) return { ok: false, executed: true, reason: "aborted", targetSlot: this.targetSlot, actions, boardResult };
+        step -= 1;
+        continue;
+      }
       if (!verified) return { ok: false, executed: true, reason: boardResult.reason || boardResult.stopReason || "board-action-failed", targetSlot: this.targetSlot, actions, boardResult };
+      if (boardResult.observedState && this.reconcileBoardState) nextState = this.reconcileBoardState(state, boardResult.observedState, diff);
     }
     return { ok: true, executed: execute, reason: "max-actions-reached", targetSlot: this.targetSlot, actions };
   }

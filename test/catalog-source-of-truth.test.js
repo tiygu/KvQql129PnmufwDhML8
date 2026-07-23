@@ -156,13 +156,34 @@ test("运行时迁移后只从 SQLite 读取，刷新不再覆盖可变 JSON", a
     assert.equal(backend.getCatalogView().revision, backend.getPlanningCatalog().revision);
 
     backend.connect = async () => ({ probe: { context: { id: 1 } } });
-    backend.lab = { snapshot: async () => ({ fixture: true }) };
+    backend.lab = { snapshot: async () => ({ fixture: true, focusedControllers: { selectedItem: { itemId: "n1" } } }) };
     backend.buildCatalog = () => ({ rules: {}, coverage: {}, chains: [{ id: "n", complete: true }], items: [{ id: "n1", chainId: "n", level: 1, baseUnits: 1, mergeTarget: null }], producers: [] });
     const refreshed = await backend.refreshCatalogFromRuntime();
     assert.equal(refreshed.ok, true);
     assert.equal(backend.getCatalogView().items.some((item) => item.id === "n1"), true);
     assert.notEqual(fs.readFileSync(legacyPath, "utf8"), originalJson);
     assert.deepEqual(JSON.parse(fs.readFileSync(legacyPath, "utf8")), { chains: [], items: [], producers: [] });
+  } finally {
+    await backend.close(); fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("状态栏扫描在游戏未选中物品时返回可操作的前置条件错误", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-selection-required-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  try {
+    backend.connect = async () => ({ probe: { context: { id: 1 } } });
+    backend.lab = { snapshot: async () => ({
+      focusedControllers: { selectedItem: null },
+      gameplayState: { selectedItemUi: { selected: false, emptyContainerActive: true, prompt: "点击选中物品后查看详情" } },
+    }) };
+    backend.buildCatalog = () => ({ chains: [], items: [], producers: [] });
+
+    const result = await backend.captureCatalogFromRuntime();
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "catalog-scan-selection-required");
+    assert.match(result.captureFile, /^catalog-rescan-/);
   } finally {
     await backend.close(); fs.rmSync(dataDir, { recursive: true, force: true });
   }

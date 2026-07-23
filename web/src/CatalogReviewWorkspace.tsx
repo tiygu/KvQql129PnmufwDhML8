@@ -10,46 +10,124 @@ const reasonLabels: Record<string, string> = {
   "human-ruling-conflict": "裁决冲突",
 };
 
+const valueLabels: Record<string, string> = {
+  "item-identity": "物品身份",
+  "merge-relation": "合成关系",
+  "production-profile": "产出档案",
+  "production-mode": "产出档位",
+  observed: "已观察",
+  provisional: "暂定",
+  active: "生效",
+  enabled: "已启用",
+  paused: "已暂停",
+  eligible: "可采用",
+  accepted: "已接受",
+  rejected: "已否决",
+  confirm: "确认",
+  modify: "修改",
+  revoke: "撤销",
+  runtime: "运行时",
+  automatic: "自动",
+  uploaded: "上传",
+  screenshot: "截图",
+  resource: "资源",
+  selected: "已选择",
+  unselected: "未选择",
+};
+
+function valueLabel(value: any) {
+  const text = String(value ?? "未知");
+  return valueLabels[text] || text;
+}
+
+const fieldLabels: Record<string, string> = {
+  name: "名称",
+  level: "等级",
+  type: "类型",
+  itemId: "物品编号",
+  chainId: "合成链编号",
+  mergeTarget: "合成目标",
+  producerId: "产出物编号",
+  energyCost: "体力消耗",
+  probability: "概率",
+  drops: "产出分布",
+  iconUrl: "图标地址",
+};
+
+function fieldLabel(value: string) {
+  return fieldLabels[value] || value;
+}
+
 function display(value: any) {
   if (value === undefined) return "—";
   if (typeof value === "string") return value;
   return JSON.stringify(value);
 }
 
-function parseDraft(value: string) {
-  try { return JSON.parse(value); } catch { return value; }
+function parseObjectDraft(value: string) {
+  const parsed = JSON.parse(value);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("完整对象必须是 JSON 对象");
+  return parsed;
 }
 
-export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: (catalog?: any) => void; focusObject?: { objectType: string; objectId: string } | null }) {
+function markIconSelected(value: any, candidateId: number) {
+  const iconCandidates = (value?.iconCandidates || []).map((candidate: any) => ({
+    ...candidate,
+    selected: Number(candidate.id) === Number(candidateId),
+    selectionOrigin: Number(candidate.id) === Number(candidateId) ? "manual" : null,
+  }));
+  return { ...value, iconCandidates, selectedIcon: iconCandidates.find((candidate: any) => candidate.selected) || value?.selectedIcon || null };
+}
+
+export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: (catalog?: any) => void | Promise<void>; focusObject?: { objectType: string; objectId: string } | null }) {
   const queue = repository?.reviewQueue || [];
   const objects = repository?.objects || [];
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
-  const [fieldPath, setFieldPath] = useState("");
-  const [draft, setDraft] = useState("");
-  const [actor, setActor] = useState("local-operator");
+  const [objectDraft, setObjectDraft] = useState("{}");
+  const [actor, setActor] = useState("本地操作者");
   const [note, setNote] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const iconUploadRef = useRef<HTMLInputElement>(null);
+  const detailRequestId = useRef(0);
 
   const selectedSummary = useMemo(() => {
     const queuedKeys = new Set(queue.map((item: any) => `${item.objectType}:${item.objectId}`));
     const candidates = [...queue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
-    return candidates.find((item: any) => `${item.objectType}:${item.objectId}` === selectedKey) || candidates[0] || null;
+    if (!selectedKey) return null;
+    return candidates.find((item: any) => `${item.objectType}:${item.objectId}` === selectedKey) || null;
   }, [objects, queue, selectedKey]);
 
   const loadDetail = async (summary = selectedSummary) => {
-    if (!summary) { setDetail(null); return; }
-    const value = await controlApi.getCatalogObject(summary.objectType, summary.objectId);
-    setDetail(value);
-    const firstField = fieldPath || Object.keys(value.effectiveValue || {})[0] || "";
-    setFieldPath(firstField);
-    setDraft(display(value.effectiveValue?.[firstField]));
+    const requestId = ++detailRequestId.current;
+    if (!summary) { setDetail(null); setLoadingDetail(false); setLoadError(""); return; }
+    setDetail(null);
+    setLoadingDetail(true);
+    setLoadError("");
+    try {
+      const value = await controlApi.getCatalogObject(summary.objectType, summary.objectId);
+      if (requestId !== detailRequestId.current) return;
+      setDetail(value);
+      setObjectDraft(JSON.stringify(value.effectiveValue || value.algorithmCandidate || {}, null, 2));
+    } catch (error: any) {
+      if (requestId !== detailRequestId.current) return;
+      setLoadError(error.message || "审核对象加载失败");
+    } finally {
+      if (requestId === detailRequestId.current) setLoadingDetail(false);
+    }
   };
 
-  useEffect(() => { loadDetail().catch((error) => setMessage(error.message)); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
+  useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
   useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
+
+  const selectSummary = (entry: any) => {
+    const key = `${entry.objectType}:${entry.objectId}`;
+    if (selectedKey === key) loadDetail(entry);
+    else setSelectedKey(key);
+  };
 
   const fields = useMemo(() => Array.from(new Set([
     ...Object.keys(detail?.algorithmCandidate || {}),
@@ -57,69 +135,86 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
     ...Object.keys(detail?.humanValues || {}),
   ])).sort(), [detail]);
 
-  const selectField = (next: string) => {
-    setFieldPath(next);
-    setDraft(display(detail?.effectiveValue?.[next]));
-  };
-
-  const commit = async (decision: "confirm" | "modify") => {
-    if (!detail || !fieldPath || !note.trim() || !actor.trim()) { setMessage("请填写字段、操作者和备注"); return; }
+  const completeReview = async (decision: "confirm" | "modify") => {
+    if (!detail || !note.trim() || !actor.trim()) { setMessage("请填写操作者和审核备注"); return; }
     setBusy(true);
     try {
-      const value = decision === "confirm" ? detail.algorithmCandidate?.[fieldPath] : parseDraft(draft);
-      const updated = await controlApi.applyCatalogRuling({
-        objectType: detail.objectType, objectId: detail.objectId, fieldPath, decision, value,
-        actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision,
-        baseRulingId: detail.humanValues?.[fieldPath]?.id ?? null,
+      const payload = decision === "modify" ? parseObjectDraft(objectDraft) : undefined;
+      const updated = await controlApi.completeCatalogReview({
+        objectType: detail.objectType, objectId: detail.objectId, decision,
+        ...(payload ? { payload } : {}), actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision,
       });
       setDetail(updated);
-      setDraft(display(updated.effectiveValue?.[fieldPath]));
+      setObjectDraft(JSON.stringify(updated.effectiveValue || {}, null, 2));
       setNote("");
-      setMessage(updated.mergedStaleRevision ? "其他字段已变化；当前字段已安全合并" : "字段裁决已保存");
-      onChanged();
+      setMessage(updated.reviewStatus === "clear" ? "整对象审核已完成，已从待裁定队列移出" : "整对象已生效；仍有证据冲突需要处置");
+      await onChanged();
+      const currentKey = `${updated.objectType}:${updated.objectId}`;
+      const nextEntry = queue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
+      const nextReviewKey = updated.reviewStatus === "needs-review"
+        ? currentKey
+        : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
+      setSelectedKey(nextReviewKey);
+      if (nextReviewKey !== currentKey) setDetail(null);
     } catch (error: any) {
-      if (error.payload?.code === "CATALOG_REVISION_CONFLICT" && error.payload.currentObject) {
-        const current = error.payload.currentObject;
-        const rulingUnchanged = (current.humanValues?.[fieldPath]?.id ?? null) === (detail.humanValues?.[fieldPath]?.id ?? null);
-        const candidateUnchanged = JSON.stringify(current.algorithmCandidate?.[fieldPath] ?? null) === JSON.stringify(detail.algorithmCandidate?.[fieldPath] ?? null);
-        if (rulingUnchanged && candidateUnchanged) {
-          try {
-            const value = decision === "confirm" ? current.algorithmCandidate?.[fieldPath] : parseDraft(draft);
-            const updated = await controlApi.applyCatalogRuling({ objectType: current.objectType, objectId: current.objectId, fieldPath, decision, value, actor: actor.trim(), note: note.trim(), expectedRevision: current.revision, baseRulingId: current.humanValues?.[fieldPath]?.id ?? null });
-            setDetail(updated);
-            setDraft(display(updated.effectiveValue?.[fieldPath]));
-            setNote("");
-            setMessage("已重载最新 revision，并重新提交未冲突字段");
-            onChanged();
-          } catch (retryError: any) {
-            setDetail(retryError.payload?.currentObject || current);
-            setMessage("重提交期间 revision 再次变化；请核对最新值");
-          }
-        } else {
-          setDetail(current);
-          setMessage("同一字段或算法候选已变化；已重载最新值，请核对后重新提交");
-        }
-      } else setMessage(error.message);
+      if (error.payload?.currentObject) {
+        setDetail(error.payload.currentObject);
+        setObjectDraft(JSON.stringify(error.payload.currentObject.effectiveValue || error.payload.currentObject.algorithmCandidate || {}, null, 2));
+      }
+      setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新核对完整对象" : error.message);
     } finally { setBusy(false); }
   };
 
-  const revoke = async () => {
-    if (!detail?.humanValues?.[fieldPath] || !note.trim() || !actor.trim()) { setMessage("请选择已有裁决的字段并填写操作者和备注"); return; }
+  const setEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected") => {
+    if (!detail || !note.trim() || !actor.trim()) { setMessage("处置证据前请填写操作者和审核备注"); return null; }
+    const updated = await controlApi.setCatalogEvidenceDisposition({
+      objectType: detail.objectType, objectId: detail.objectId, evidenceId, disposition,
+      reason: `${actor.trim()}: ${note.trim()}`, expectedRevision: detail.revision,
+    });
+    setDetail(updated);
+    setObjectDraft(JSON.stringify(updated.effectiveValue || updated.algorithmCandidate || {}, null, 2));
+    return updated;
+  };
+
+  const updateEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected") => {
     setBusy(true);
     try {
-      const updated = await controlApi.revokeCatalogRuling({
-        objectType: detail.objectType, objectId: detail.objectId, fieldPath,
-        actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision,
-        baseRulingId: detail.humanValues[fieldPath].id,
-      });
-      setDetail(updated);
-      setDraft(display(updated.effectiveValue?.[fieldPath]));
+      const updated = await setEvidenceDisposition(evidenceId, disposition);
+      if (!updated) return;
       setNote("");
-      setMessage("裁决已撤销，当前算法候选已恢复显示");
-      onChanged();
+      setMessage(disposition === "eligible" ? "证据已恢复并重新评估" : disposition === "paused" ? "证据已暂停并重新评估" : "证据已否决并重新评估");
+      await onChanged();
     } catch (error: any) {
       if (error.payload?.currentObject) setDetail(error.payload.currentObject);
-      setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "字段已被其他控制台修改；请核对最新值" : error.message);
+      setMessage(error.message);
+    } finally { setBusy(false); }
+  };
+
+  const acceptEvidence = async (evidenceId: number) => {
+    if (!detail || !note.trim() || !actor.trim()) { setMessage("采用证据前请填写操作者和审核备注"); return; }
+    setBusy(true);
+    try {
+      const conflictEvidenceIds = new Set<number>((detail.reviewReasons || [])
+        .filter((reason: any) => reason.type === "evidence-conflict")
+        .flatMap((reason: any) => (reason.details?.variants || []).flatMap((variant: any[]) => variant.map((item: any) => Number(item.evidenceId)))));
+      let updated = detail;
+      const selected = updated.evidence?.find((evidence: any) => Number(evidence.id) === Number(evidenceId));
+      if (selected?.disposition !== "eligible") updated = await setEvidenceDisposition(evidenceId, "eligible") || updated;
+      for (const evidence of updated.evidence || []) {
+        if (Number(evidence.id) === Number(evidenceId) || evidence.disposition !== "eligible" || !conflictEvidenceIds.has(Number(evidence.id))) continue;
+        updated = await controlApi.setCatalogEvidenceDisposition({
+          objectType: updated.objectType, objectId: updated.objectId, evidenceId: evidence.id, disposition: "paused",
+          reason: `${actor.trim()}: 采用证据 ${evidenceId}；${note.trim()}`, expectedRevision: updated.revision,
+        });
+      }
+      setDetail(updated);
+      setObjectDraft(JSON.stringify(updated.effectiveValue || updated.algorithmCandidate || {}, null, 2));
+      setNote("");
+      setMessage("已采用该证据，并暂停同一冲突中的其他候选证据");
+      await onChanged();
+    } catch (error: any) {
+      if (error.payload?.currentObject) setDetail(error.payload.currentObject);
+      setMessage(error.message);
     } finally { setBusy(false); }
   };
 
@@ -149,12 +244,15 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   };
 
   const selectIcon = async (candidateId: number) => {
-    if (!detail || !actor.trim() || !note.trim()) { setMessage("选择图标前请填写操作员和备注"); return; }
+    if (!detail || !actor.trim()) { setMessage("选择图标前请填写操作员"); return; }
+    const previousDetail = detail;
+    const auditNote = note.trim() || "手动选择图标候选";
+    setDetail(markIconSelected(detail, candidateId));
     setBusy(true);
     try {
-      const updated = await controlApi.selectCatalogIcon({ objectId: detail.objectId, candidateId, actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision });
-      setDetail(updated); setNote(""); setMessage("已选择显示图标；人工选择优先于自动候选"); onChanged();
-    } catch (error: any) { if (error.payload?.currentObject) setDetail(error.payload.currentObject); setMessage(error.message); }
+      const updated = await controlApi.selectCatalogIcon({ objectId: detail.objectId, candidateId, actor: actor.trim(), note: auditNote, expectedRevision: detail.revision });
+      setDetail(markIconSelected(updated, candidateId)); setNote(""); setMessage("已选择显示图标；人工选择优先于自动候选"); await onChanged();
+    } catch (error: any) { setDetail(error.payload?.currentObject || previousDetail); setMessage(error.message); }
     finally { setBusy(false); }
   };
 
@@ -182,26 +280,27 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
 
   return <section className="catalog-review-workspace">
     <div className="panel review-queue">
-      <div className="panel-head"><div><span className="eyebrow">Catalog Review Queue</span><h2>审核队列</h2></div><b>{queue.length}</b></div>
-      <p className="review-help">集中显示新观测、推断变化、证据冲突、图标缺口和人工裁决冲突。</p>
-      <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedSummary?.objectType === entry.objectType && selectedSummary?.objectId === entry.objectId ? "active" : ""}`} onClick={() => setSelectedKey(`${entry.objectType}:${entry.objectId}`)}>
-        <span><strong>{entry.objectId}</strong><small>{entry.objectType} · r{entry.revision}</small></span>
+      <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
+      <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补不占用审核队列，也不阻止规划。</p>
+      <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
+        <span><strong>{entry.objectId}</strong><small>{valueLabel(entry.objectType)} · 证据成熟度：{valueLabel(entry.status)} · 规划资格：{valueLabel(entry.disposition)} · 版本 {entry.revision}</small></span>
         <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reasonLabels[reason.type] || reason.type}</i>)}</span>
-      </button>) : <div className="empty-state compact"><Check/><span>当前没有待审核项</span></div>}</div>
+      </button>) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
     </div>
     <div className="panel review-detail">
-      {!detail ? <div className="empty-state"><History/><span>从审核队列选择对象</span></div> : <>
-        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{detail.objectType} · {detail.status} · r{detail.revision}</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
+      {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
+        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{valueLabel(detail.objectType)} · 证据成熟度：{valueLabel(detail.status)} · 规划资格：{valueLabel(detail.disposition)} · 版本 {detail.revision}</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
         {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt={`${detail.objectId} icon`}/> : <Image/>}<div><strong>{detail.selectedIcon ? "精确运行时图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.assetHash} · ${detail.selectedIcon.width}×${detail.selectedIcon.height}` : "缺失仅影响视觉核对，不影响其他 Active 字段参与规划"}</span></div></div>}
         {detail.objectType === "item-identity" && <div className="icon-candidate-review">
-          <div className="icon-candidate-head"><div><h3>Icon candidate comparison</h3><p>Resource, screenshot, and uploaded evidence remain available for review.</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>Upload replacement</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>Revoke selection</button></div></div>
-          <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`candidate ${candidate.id}`}/><div><strong>{candidate.sourceType}</strong><span>{candidate.width} x {candidate.height} / {new Date(candidate.createdAt).toLocaleString()}</span><span className="candidate-hash">{candidate.assetHash}</span>{candidate.resourceUrl && <span className="candidate-hash">URL: {candidate.resourceUrl}</span>}<span>Crop: {candidate.crop?.pixelCrop ? `${candidate.crop.pixelCrop.x},${candidate.crop.pixelCrop.y} ${candidate.crop.pixelCrop.width}x${candidate.crop.pixelCrop.height}` : candidate.crop?.rect ? `${candidate.crop.rect.x},${candidate.crop.rect.y} ${candidate.crop.rect.width}x${candidate.crop.rect.height}` : "full image"}</span>{candidate.similarity?.frameSelection && <span>Stable frames: {candidate.similarity.frameSelection.acceptedFrameIndexes.length}/{candidate.similarity.frameSelection.frameHashes.length} / {candidate.similarity.frameSelection.reason}</span>}{candidate.similarity?.comparisons?.[0] && <span>Best match: {(candidate.similarity.comparisons[0].composite * 100).toFixed(1)}% / perceptual {(candidate.similarity.comparisons[0].metrics.perceptualHash * 100).toFixed(0)} / structure {(candidate.similarity.comparisons[0].metrics.structure * 100).toFixed(0)} / color {(candidate.similarity.comparisons[0].metrics.colorHistogram * 100).toFixed(0)} / contour {(candidate.similarity.comparisons[0].metrics.transparentContour * 100).toFixed(0)}</span>}</div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `Current / ${candidate.selectionOrigin || "automatic"}` : "Select candidate"}</button></article>) : <div className="empty-state compact"><Image/><span>No icon candidates yet</span></div>}</div>
-          {detail.iconSelectionHistory?.length > 0 && <div className="icon-selection-history"><h4>Icon selection history</h4>{[...detail.iconSelectionHistory].reverse().map((entry: any) => <p key={entry.id}><strong>{entry.action}</strong><span>{entry.actor} / {new Date(entry.createdAt).toLocaleString()} / {entry.assetHash || "no selection"} / {entry.note}</span></p>)}</div>}
+          <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>资源、截图和上传证据都会保留，可随时复核。</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
+          <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${candidate.id}`}/><div><strong>{valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} / {new Date(candidate.createdAt).toLocaleString()}</span><span className="candidate-hash">{candidate.assetHash}</span>{candidate.resourceUrl && <span className="candidate-hash">资源地址：{candidate.resourceUrl}</span>}<span>裁剪：{candidate.crop?.pixelCrop ? `${candidate.crop.pixelCrop.x},${candidate.crop.pixelCrop.y} ${candidate.crop.pixelCrop.width}×${candidate.crop.pixelCrop.height}` : candidate.crop?.rect ? `${candidate.crop.rect.x},${candidate.crop.rect.y} ${candidate.crop.rect.width}×${candidate.crop.rect.height}` : "完整图像"}</span>{candidate.similarity?.frameSelection && <span>稳定帧：{candidate.similarity.frameSelection.acceptedFrameIndexes.length}/{candidate.similarity.frameSelection.frameHashes.length} / {valueLabel(candidate.similarity.frameSelection.reason)}</span>}{candidate.similarity?.comparisons?.[0] && <span>最佳匹配：{(candidate.similarity.comparisons[0].composite * 100).toFixed(1)}% / 感知 {(candidate.similarity.comparisons[0].metrics.perceptualHash * 100).toFixed(0)} / 结构 {(candidate.similarity.comparisons[0].metrics.structure * 100).toFixed(0)} / 色彩 {(candidate.similarity.comparisons[0].metrics.colorHistogram * 100).toFixed(0)} / 轮廓 {(candidate.similarity.comparisons[0].metrics.transparentContour * 100).toFixed(0)}</span>}</div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
+          {detail.iconSelectionHistory?.length > 0 && <div className="icon-selection-history"><h4>图标选择历史</h4>{[...detail.iconSelectionHistory].reverse().map((entry: any) => <p key={entry.id}><strong>{valueLabel(entry.action)}</strong><span>{entry.actor} / {new Date(entry.createdAt).toLocaleString()} / {entry.assetHash || "未选择"} / {entry.note}</span></p>)}</div>}
         </div>}
         {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reasonLabels[reason.type] || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
-        <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <button className={`field-row ${fieldPath === field ? "active" : ""}`} key={field} onClick={() => selectField(field)}><strong>{field}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></button>)}</div>
-        <div className="ruling-editor"><label><span>字段</span><select value={fieldPath} onChange={(event) => selectField(event.target.value)}>{fields.map((field) => <option key={field}>{field}</option>)}</select></label><label className="wide"><span>人工值（JSON 或文本）</span><textarea value={draft} onChange={(event) => setDraft(event.target.value)}/></label><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录判断依据"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => commit("confirm")}><Check size={15}/>确认候选</button><button disabled={busy} onClick={() => commit("modify")}><Save size={15}/>保存修改</button><button disabled={busy || !detail.humanValues?.[fieldPath]} onClick={revoke}><RotateCcw size={15}/>撤销裁决</button></div>{message && <p className="review-message">{message}</p>}</div>
-        <div className="review-evidence"><div><h3>证据来源</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{evidence.sourceType}</strong><span>{evidence.sourceRef || "runtime"} · {evidence.observationCount} 次 · {evidence.disposition}</span></p>)}</div><div><h3>裁决历史</h3>{detail.rulingHistory?.length ? [...detail.rulingHistory].reverse().map((ruling: any) => <p key={ruling.id}><strong>{ruling.fieldPath} · {ruling.decision}</strong><span>{ruling.actor} · {new Date(ruling.createdAt).toLocaleString()} · {display(ruling.oldValue)} → {display(ruling.newValue)} · {ruling.note}</span></p>) : <p><span>暂无人工裁决</span></p>}</div><div><h3>对象演变</h3>{[...(detail.transitions || [])].reverse().map((transition: any) => <p key={`transition-${transition.id}`}><strong>{transition.fromStatus} → {transition.toStatus}</strong><span>{new Date(transition.createdAt).toLocaleString()} · {transition.fromDisposition} → {transition.toDisposition} · {transition.reason}</span></p>)}{[...(detail.versions || [])].reverse().map((version: any) => <p key={`version-${version.id}`}><strong>v{version.version} · {version.status}</strong><span>{new Date(version.createdAt).toLocaleString()} · {version.origin} · {display(version.payload)}</span></p>)}</div></div>
+        {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>数据待补：物品图标</strong><span>这属于完整性缺口，不影响本次语义审核完成，也不影响已生效字段参与规划。</span></div></div>}
+        <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
+        <div className="ruling-editor object-review-editor"><div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认完整候选”会原样接受服务端当前候选；如需修正，请在下方编辑完整 JSON 后保存整项修改。两个操作都会创建人工生效版本。</p></div><label className="wide"><span>完整对象 JSON</span><textarea value={objectDraft} onChange={(event) => setObjectDraft(event.target.value)} spellCheck={false}/></label><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>审核备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录核对依据或修改原因"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认完整候选并完成审核</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>保存整项修改并完成审核</button></div>{message && <p className="review-message">{message}</p>}</div>
+        <div className="review-evidence"><div><h3>证据来源与处置</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{valueLabel(evidence.sourceType)}</strong><span>{valueLabel(evidence.sourceRef || "runtime")} · {evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span>{display(evidence.payload)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div><div><h3>裁决历史</h3>{detail.rulingHistory?.length ? [...detail.rulingHistory].reverse().map((ruling: any) => <p key={ruling.id}><strong>{ruling.fieldPath} · {valueLabel(ruling.decision)}</strong><span>{ruling.actor} · {new Date(ruling.createdAt).toLocaleString()} · {display(ruling.oldValue)} → {display(ruling.newValue)} · {ruling.note}</span></p>) : <p><span>暂无人工裁决</span></p>}</div><div><h3>对象演变</h3>{[...(detail.transitions || [])].reverse().map((transition: any) => <p key={`transition-${transition.id}`}><strong>{valueLabel(transition.fromStatus)} → {valueLabel(transition.toStatus)}</strong><span>{new Date(transition.createdAt).toLocaleString()} · {valueLabel(transition.fromDisposition)} → {valueLabel(transition.toDisposition)} · {valueLabel(transition.reason)}</span></p>)}{[...(detail.versions || [])].reverse().map((version: any) => <p key={`version-${version.id}`}><strong>版本 {version.version} · {valueLabel(version.status)}</strong><span>{new Date(version.createdAt).toLocaleString()} · {valueLabel(version.origin)} · {display(version.payload)}</span></p>)}</div></div>
       </>}
     </div>
   </section>;

@@ -206,7 +206,19 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/catalog/evidence/disposition") {
         const body = await readJson(req);
         if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !body.evidenceId || !body.disposition || !body.reason || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-catalog-evidence-request" });
-        return writeJson(res, 200, runtime.setCatalogEvidenceDisposition(body.objectType, body.objectId, body.evidenceId, body.disposition, body.reason, Number(body.expectedRevision)));
+        const object = runtime.setCatalogEvidenceDisposition(body.objectType, body.objectId, body.evidenceId, body.disposition, body.reason, Number(body.expectedRevision));
+        broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+        return writeJson(res, 200, object);
+      }
+      if (route === "POST /api/catalog/review/complete") {
+        const body = await readJson(req);
+        const payloadValid = body.decision !== "modify" || (body.payload && typeof body.payload === "object" && !Array.isArray(body.payload));
+        if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !["confirm", "modify"].includes(body.decision) || !payloadValid || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) {
+          return writeJson(res, 400, { ok: false, error: "invalid-catalog-review-completion-request" });
+        }
+        const object = runtime.completeCatalogReview({ ...body, expectedRevision: Number(body.expectedRevision) });
+        broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+        return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/ruling") {
         const body = await readJson(req);
@@ -239,7 +251,13 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/connection/start") return writeJson(res, 200, await runtime.startConnectionRoute(await readJson(req)));
       if (route === "POST /api/connection/stop") return writeJson(res, 200, await runtime.stopConnectionRoute());
       if (route === "POST /api/automation/preview") return writeJson(res, 200, await runtime.preview(await readJson(req)));
-      if (route === "POST /api/automation/start") return writeJson(res, 202, runtime.startInBackground(await readJson(req)));
+      if (route === "POST /api/automation/start") {
+        const options = await readJson(req);
+        const result = options.mode === "automatic" && options.maxActions == null
+          ? runtime.startIdleInBackground(options)
+          : runtime.startInBackground(options);
+        return writeJson(res, 202, result);
+      }
       if (route === "POST /api/automation/idle/start") return writeJson(res, 202, runtime.startIdleInBackground(await readJson(req)));
       if (route === "POST /api/automation/stop") return writeJson(res, 200, runtime.stop());
       if (route === "POST /api/automation/pause") return writeJson(res, 200, runtime.pause());

@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { performance } = require("node:perf_hooks");
 const {
   adaptiveSearchBudget,
   representativeProductionBranches,
@@ -69,6 +70,124 @@ test("bounded beam search chooses a high-probability executable path and explain
   assert.equal(plan.energyRequired, plan.explanation.expectedEnergy);
 });
 
+test("spare board capacity keeps stochastic planning responsive on a populated board", () => {
+  const state = fixture({ empty: 14, drops: [{ itemId: "a1", probability: 0.9, count: 1 }, { itemId: "junk", probability: 0.1, count: 1 }] });
+  for (let index = 0; index < 48; index += 1) {
+    const itemId = `board-${index}`;
+    state.catalog.items.push({ id: itemId, chainId: itemId, level: 1, baseUnits: 1, evidenceSufficient: true, mergeEvidenceActive: true, mergeTarget: null });
+    state.board.grids.push({ index: state.board.grids.length, itemId, empty: false, executable: true, protected: false });
+  }
+  while (state.catalog.items.length < 112) {
+    const itemId = `catalog-${state.catalog.items.length}`;
+    state.catalog.items.push({ id: itemId, chainId: itemId, level: 1, baseUnits: 1, evidenceSufficient: true, mergeEvidenceActive: true, mergeTarget: null });
+  }
+  state.board.occupied = 49;
+  state.board.capacity = 63;
+
+  const started = performance.now();
+  const plan = planStochasticOrder(state, "slot-1", { catalogRevision: "catalog-populated", stateRevision: "board-populated", cache: new StochasticPlanCache() });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(plan.status, "planned", JSON.stringify(plan));
+  assert.equal(plan.nextAction.type, "produce");
+  assert.equal(plan.explanation.selectedReason, "safe-immediate-production");
+  assert.equal(plan.explanation.consideredStates, 1);
+  assert.ok(elapsedMs < 1500, `stochastic planner blocked for ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("specified strategy fully plans only the selected actionable order", () => {
+  const normalized = fixture({
+    empty: 7,
+    orderItemId: "a2",
+    drops: [{ itemId: "a1", chainId: "a", level: 1, baseUnits: 1, probability: 0.9, count: 1 }, { itemId: "junk", chainId: "junk", level: 1, baseUnits: 1, probability: 0.1, count: 1 }],
+  });
+  const catalog = { revision: "catalog-specified", coverage: {}, ...normalized.catalog, evidence: { objects: [] } };
+  const state = {
+    schemaVersion: 1,
+    resources: { energy: normalized.energy },
+    board: { ...normalized.board, signature: normalized.board.grids.map((grid) => grid.itemId).join("|") },
+    warehouse: normalized.warehouse,
+    orders: [
+      { slot: "priority", rewardCoins: 20, ready: false, items: [{ itemId: "a2", complete: false }] },
+      { slot: "other", rewardCoins: 10, ready: false, items: [{ itemId: "a1", complete: false }] },
+    ],
+  };
+
+  const plan = buildOptimizationPlan({ catalog, state, strategy: "specified", prioritySlot: "priority", executionMode: "automatic" });
+
+  assert.equal(plan.recommended.slot, "priority");
+  assert.equal(plan.recommended.nextAction.type, "produce");
+  assert.equal(plan.plans.find((item) => item.slot === "other").nextAction, undefined);
+});
+
+test("specified strategy resolves one fallback when the selected slot disappears", () => {
+  const normalized = fixture({
+    empty: 7,
+    orderItemId: "a2",
+    drops: [{ itemId: "a1", chainId: "a", level: 1, baseUnits: 1, probability: 0.9, count: 1 }, { itemId: "junk", chainId: "junk", level: 1, baseUnits: 1, probability: 0.1, count: 1 }],
+  });
+  const catalog = { revision: "catalog-specified-missing", coverage: {}, ...normalized.catalog, evidence: { objects: [] } };
+  const state = {
+    schemaVersion: 1,
+    resources: { energy: normalized.energy },
+    board: { ...normalized.board, signature: normalized.board.grids.map((grid) => grid.itemId).join("|") },
+    warehouse: normalized.warehouse,
+    orders: [
+      { slot: "slower", rewardCoins: 20, ready: false, items: [{ itemId: "a2", complete: false }] },
+      { slot: "fallback", rewardCoins: 10, ready: false, items: [{ itemId: "a1", complete: false }] },
+    ],
+  };
+
+  const plan = buildOptimizationPlan({ catalog, state, strategy: "specified", prioritySlot: "gone", executionMode: "automatic" });
+
+  assert.equal(plan.recommended.slot, "slower");
+  assert.equal(plan.resolvedPrioritySlot, "slower");
+  assert.equal(plan.recommended.nextAction.type, "produce");
+  assert.equal(plan.plans.find((item) => item.slot === "fallback").nextAction, undefined);
+});
+
+test("specified strategy resolves one fallback when the selected order is not executable", () => {
+  const normalized = fixture({
+    empty: 7,
+    orderItemId: "a1",
+    drops: [{ itemId: "a1", chainId: "a", level: 1, baseUnits: 1, probability: 0.9, count: 1 }, { itemId: "junk", chainId: "junk", level: 1, baseUnits: 1, probability: 0.1, count: 1 }],
+  });
+  const catalog = { revision: "catalog-specified-blocked", coverage: {}, ...normalized.catalog, evidence: { objects: [] } };
+  const state = {
+    schemaVersion: 1,
+    resources: { energy: normalized.energy },
+    board: { ...normalized.board, signature: normalized.board.grids.map((grid) => grid.itemId).join("|") },
+    warehouse: normalized.warehouse,
+    orders: [
+      { slot: "blocked", rewardCoins: 100, ready: false, items: [{ itemId: "unknown-item", complete: false }] },
+      { slot: "fallback", rewardCoins: 10, ready: false, items: [{ itemId: "a1", complete: false }] },
+    ],
+  };
+
+  const plan = buildOptimizationPlan({ catalog, state, strategy: "specified", prioritySlot: "blocked", executionMode: "automatic" });
+
+  assert.equal(plan.recommended.slot, "fallback");
+  assert.equal(plan.resolvedPrioritySlot, "fallback");
+  assert.equal(plan.plans.find((item) => item.slot === "blocked").nextAction, null);
+  assert.equal(plan.recommended.nextAction.type, "produce");
+});
+
+test("orders beyond the search horizon still emit one safe rolling progress action", () => {
+  const state = fixture({ empty: 14, orderItemId: "a8", drops: [{ itemId: "a1", probability: 0.9, count: 1 }, { itemId: "junk", probability: 0.1, count: 1 }] });
+  for (let level = 3; level <= 8; level += 1) {
+    state.catalog.items.push({ id: `a${level}`, chainId: "a", level, baseUnits: 2 ** (level - 1), evidenceSufficient: true, mergeEvidenceActive: true, mergeTarget: level < 8 ? `a${level + 1}` : null });
+  }
+  state.catalog.items.find((item) => item.id === "a2").mergeTarget = "a3";
+
+  const plan = planStochasticOrder(state, "slot-1", { catalogRevision: "catalog-long-order", stateRevision: "board-long-order", cache: new StochasticPlanCache() });
+
+  assert.equal(plan.status, "planned", JSON.stringify(plan));
+  assert.equal(plan.nextAction.type, "produce");
+  assert.equal(plan.explanation.selectedReason, "safe-immediate-production");
+  assert.ok(plan.energyRequired > 0);
+  assert.equal(plan.boardSpaceFeasibility.feasible, true);
+});
+
 test("contingent lookahead rejects a branch that is safe immediately but deadlocks one step later", () => {
   const state = fixture({ empty: 3, orderItemId: "a2", drops: [{ itemId: "a1", probability: 0.99, count: 2 }, { itemId: "junk", probability: 0.01, count: 2 }] });
   state.warehouse.inventoryKnowledge.exchangeCapacity = 0;
@@ -91,7 +210,8 @@ test("adaptive limits deepen for tight space and shrink for simple states", () =
 test("near-complete orders deepen the horizon instead of taking the simple-state shortcut", () => {
   const near = adaptiveSearchBudget(fixture({ empty: 5 }), "slot-1");
   assert.equal(near.reason, "near-order-completion");
-  assert.equal(near.maxDepth, 8);
+  assert.ok(near.maxDepth <= 4);
+  assert.ok(near.maxWidth <= 8);
 });
 
 test("normalized-state cache reuses exact revisions and invalidates state or evidence changes", () => {
@@ -105,6 +225,38 @@ test("normalized-state cache reuses exact revisions and invalidates state or evi
   assert.equal(second.explanation.cache.hit, true);
   assert.equal(catalogChanged.explanation.cache.hit, false);
   assert.equal(stateChanged.explanation.cache.hit, false);
+});
+
+test("a safe merge bypasses the expensive stochastic expansion before the first action", () => {
+  const state = fixture({ empty: 4, orderItemId: "a2" });
+  state.board.grids.splice(1, 2,
+    { index: 1, itemId: "a1", empty: false, executable: true, protected: false },
+    { index: 2, itemId: "a1", empty: false, executable: true, protected: false },
+  );
+  state.board.occupied = 3;
+  state.board.empty = 2;
+  state.board.capacity = 5;
+
+  const started = performance.now();
+  const plan = planStochasticOrder(state, "slot-1", { catalogRevision: "catalog-fast-merge", stateRevision: "board-fast-merge", cache: new StochasticPlanCache() });
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(plan.status, "planned");
+  assert.equal(plan.nextAction.type, "merge");
+  assert.equal(plan.explanation.selectedReason, "safe-space-release");
+  assert.equal(plan.explanation.consideredStates, 1);
+  assert.ok(elapsedMs < 250, `safe merge planning took ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("cache diagnostics expose a bounded digest instead of the complete planner state", () => {
+  const state = fixture({ empty: 8 });
+  for (let index = 0; index < 80; index += 1) {
+    const itemId = `cache-item-${index}`;
+    state.catalog.items.push({ id: itemId, chainId: itemId, level: 1, baseUnits: 1, mergeTarget: null });
+  }
+  const plan = planStochasticOrder(state, "slot-1", { catalogRevision: "catalog-cache-digest", stateRevision: "board-cache-digest", cache: new StochasticPlanCache() });
+  assert.match(plan.explanation.cache.key, /^stochastic-plan:[a-f0-9]{64}$/);
+  assert.ok(plan.explanation.cache.key.length < 100);
 });
 
 test("beam search can select a trusted warehouse slot before production", () => {

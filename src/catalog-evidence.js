@@ -62,17 +62,30 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
     for (const mode of producer.availableProductionModes || []) {
       const modeId = String(mode.modeId);
       const current = String(producer.currentProductionModeId) === modeId;
+      const theoretical = mode.theoreticalDistribution || mode.productionDistribution;
+      const energyCost = producer.energyCost == null ? null : Number(producer.energyCost);
+      const outputsPerAction = Number(theoretical?.outputsPerAction ?? 1);
+      const structuredOutputs = (theoretical?.outcomes || []).map((outcome) => ({
+        itemId: String(outcome.itemId ?? ""),
+        count: outputsPerAction,
+        probability: Number(outcome.probability),
+      }));
+      const hasStructuredMode = current && Number.isFinite(energyCost) && energyCost >= 0
+        && Number.isFinite(outputsPerAction) && outputsPerAction > 0 && structuredOutputs.length > 0
+        && structuredOutputs.every((output) => output.itemId && Number.isFinite(output.probability) && output.probability > 0 && output.probability <= 1);
       addObservation({
         objectType: "production-mode", objectId: `${producerItemId}:${modeId}`,
         payload: {
-          producerItemId, modeId, energyCost: current ? Number(producer.energyCost) : null, outputs: [],
+          producerItemId, modeId, energyCost: current ? energyCost : null,
+          outputs: hasStructuredMode ? structuredOutputs : [],
           unlocked: mode.unlocked !== false, current,
           switchEntry: producer.productionModeSwitchEntry || { status: "unknown", method: null },
         },
-        sourceType: "passive-runtime", sourceRef: `board-production-mode:${producer.index}:${modeId}`, countDuplicate: false,
+        sourceType: hasStructuredMode ? "structured-runtime" : "passive-runtime",
+        sourceRef: `${hasStructuredMode ? "board-production-mode-structure" : "board-production-mode"}:${producer.index}:${modeId}`,
+        countDuplicate: false,
       });
       if (typeof database.upsertTheoreticalProductionDistribution === "function") {
-        const theoretical = mode.theoreticalDistribution || mode.productionDistribution;
         if (theoretical?.outcomes?.length) {
           database.upsertTheoreticalProductionDistribution({
             producerItemId,

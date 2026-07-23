@@ -2,6 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const path = require("node:path");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const {
   normalizePlannerState,
   simulateDeterministicTransition,
@@ -9,6 +12,8 @@ const {
   comparePathScores,
 } = require("../src/space-planner");
 const { buildOptimizationPlan } = require("../src/order-optimizer");
+
+const execFileAsync = promisify(execFile);
 
 function fixture({ grids, empty, orderItem = "b2", energy = 3, frozen = false } = {}) {
   return {
@@ -203,4 +208,41 @@ test("order optimizer exposes the deterministic first action, space judgment, an
   assert.equal(plan.recommended.boardSpaceFeasibility.feasible, true);
   assert.match(plan.recommended.explanation.selected, /releases board space/);
   assert.ok(plan.recommended.explanation.consideredStates > 1);
+});
+
+test("deterministic search stays responsive while warehouse storage still requires native preflight", async () => {
+  const input = fixture({ grids: [], empty: 1 });
+  input.catalog.items = input.catalog.items.filter((item) => ["p", "b1", "b2"].includes(item.id));
+  input.state.board.grids = [];
+  for (let chain = 0; chain < 10; chain += 1) {
+    input.catalog.items.push(
+      { id: `x${chain}-1`, chainId: `x${chain}`, level: 1, baseUnits: 1, mergeTarget: `x${chain}-2` },
+      { id: `x${chain}-2`, chainId: `x${chain}`, level: 2, baseUnits: 2, mergeTarget: null },
+    );
+    input.state.board.grids.push(
+      { index: input.state.board.grids.length, itemId: `x${chain}-1`, normal: true, moveable: true },
+      { index: input.state.board.grids.length + 1, itemId: `x${chain}-1`, normal: true, moveable: true },
+    );
+  }
+  input.state.board.grids.push(
+    { index: input.state.board.grids.length, itemId: "p", normal: true, moveable: true, produceCount: 2, energyCost: 1 },
+    { index: input.state.board.grids.length + 1, itemId: "b1", normal: true, moveable: true },
+  );
+  input.state.board.width = 23;
+  input.state.board.height = 1;
+  input.state.board.occupied = input.state.board.grids.length;
+  input.state.board.empty = 1;
+  input.state.warehouse = { loaded: false, occupiedSlots: 0, totalSlots: 0 };
+
+  const plannerPath = path.resolve(__dirname, "..", "src", "space-planner.js");
+  const source = `
+    const { normalizePlannerState, planDeterministicOrder } = require(${JSON.stringify(plannerPath)});
+    const input = ${JSON.stringify(input)};
+    const result = planDeterministicOrder(normalizePlannerState(input), "o");
+    process.stdout.write(JSON.stringify({ status: result.status, consideredStates: result.explanation.consideredStates }));
+  `;
+  const { stdout } = await execFileAsync(process.execPath, ["-e", source], { timeout: 4000, windowsHide: true });
+  const result = JSON.parse(stdout);
+  assert.equal(result.status, "planned");
+  assert.ok(result.consideredStates > 1);
 });

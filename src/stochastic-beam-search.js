@@ -1,5 +1,6 @@
 "use strict";
 
+const { createHash } = require("node:crypto");
 const { canonicalJson } = require("./canonical-json");
 const { selectableProductionModes } = require("./production-modes");
 const {
@@ -30,14 +31,35 @@ function orderProgress(state, orderSlot) {
   return order.items.filter((item) => item.complete).length / order.items.length;
 }
 
+function orderMaterialProgress(state, orderSlot) {
+  const order = orderFor(state, orderSlot);
+  const missing = order?.items?.filter((item) => !item.complete) || [];
+  if (!missing.length) return order?.ready ? 1 : 0;
+  const items = new Map((state.catalog.items || []).map((item) => [String(item.id), item]));
+  const available = [...(state.board.grids || []).filter((grid) => !grid.empty), ...(state.warehouse?.inventoryKnowledge?.slots || []).filter((slot) => slot.occupied)];
+  let progress = 0;
+  for (const requirement of missing) {
+    const target = items.get(String(requirement.itemId));
+    const targetUnits = Number(target?.baseUnits || 0);
+    if (!target?.chainId || targetUnits <= 0) continue;
+    const availableUnits = available.reduce((sum, entry) => {
+      const item = items.get(String(entry.itemId || ""));
+      return String(item?.chainId) === String(target.chainId) && Number(item.level || 0) <= Number(target.level || 0)
+        ? sum + Number(item.baseUnits || 0) : sum;
+    }, 0);
+    progress += Math.min(1, availableUnits / targetUnits);
+  }
+  return progress / missing.length;
+}
+
 function adaptiveSearchBudget(state, orderSlot) {
   const order = orderFor(state, orderSlot);
   const remaining = order?.items?.filter((item) => !item.complete).length ?? Infinity;
   const tightSpace = Number(state.board.empty) <= 2;
   const nearCompletion = remaining <= 1;
   const simple = Number(state.board.empty) >= 4 && remaining > 1 && state.catalog.producers.length <= 1;
-  const maxDepth = tightSpace || nearCompletion ? 8 : simple ? 3 : 5;
-  const maxWidth = tightSpace || nearCompletion ? 32 : simple ? 8 : 16;
+  const maxDepth = tightSpace || nearCompletion ? 4 : simple ? 2 : 3;
+  const maxWidth = tightSpace || nearCompletion ? 8 : simple ? 4 : 6;
   return { maxDepth: Math.min(MAX_SEARCH_DEPTH, maxDepth), maxWidth: Math.min(MAX_BEAM_WIDTH, maxWidth), reason: simple ? "simple-state" : tightSpace ? "space-pressure" : nearCompletion ? "near-order-completion" : "standard" };
 }
 
@@ -90,13 +112,15 @@ function productionActions(state) {
   return actions;
 }
 
-function candidateActions(state, orderSlot) {
+function candidateActions(state, orderSlot, { includeWarehouseStore = state.board.empty <= 0 || state.warehouse.storeAvailability?.status === "available" } = {}) {
   const actions = [];
   if (orderSatisfied(state, orderSlot)) actions.push({ type: "submit-order", slot: String(orderSlot) });
   actions.push(...buildWarehouseRetrieveCandidates(state, orderSlot));
-  actions.push(...buildMergeCandidates(state));
+  actions.push(...buildMergeCandidates(state, null, { canonicalOnly: true }));
   actions.push(...productionActions(state));
-  actions.push(...buildWarehouseStoreCandidates(state));
+  if (includeWarehouseStore) {
+    actions.push(...buildWarehouseStoreCandidates(state));
+  }
   return actions.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }
 
@@ -108,7 +132,8 @@ function simulateCandidateAction(state, action) {
 }
 
 function hasImmediateRelease(state) {
-  return state.board.empty > 0 || state.orders.some((order) => order.ready) || buildMergeCandidates(state).length > 0;
+  return state.board.empty > 0 || state.orders.some((order) => order.ready)
+    || buildMergeCandidates(state, null, { canonicalOnly: true }).length > 0;
 }
 
 function contingentBranchSafe(state, orderSlot, depth, width, seen = new Set()) {
@@ -118,12 +143,16 @@ function contingentBranchSafe(state, orderSlot, depth, width, seen = new Set()) 
   const identity = canonicalJson(state);
   if (seen.has(identity)) return false;
   const nextSeen = new Set(seen).add(identity);
-  for (const action of candidateActions(state, orderSlot).slice(0, width)) {
+  for (const action of candidateActions(state, orderSlot, { includeWarehouseStore: false }).slice(0, width)) {
     if (action.type === "produce") {
       const outcomes = representativeProductionBranches(state, action, orderSlot).map((branch) => simulateProductionOutcome(state, action, branch.outcomeItemIds));
       if (outcomes.length && outcomes.every((transition) => transition.ok && contingentBranchSafe(transition.state, orderSlot, depth - 1, width, nextSeen))) return true;
       continue;
     }
+    const transition = simulateCandidateAction(state, action);
+    if (transition.ok && contingentBranchSafe(transition.state, orderSlot, depth - 1, width, nextSeen)) return true;
+  }
+  for (const action of buildWarehouseStoreCandidates(state).slice(0, width)) {
     const transition = simulateCandidateAction(state, action);
     if (transition.ok && contingentBranchSafe(transition.state, orderSlot, depth - 1, width, nextSeen)) return true;
   }
@@ -145,7 +174,8 @@ function nodeScore(node, orderSlot) {
 }
 
 function normalizedCacheKey(state, orderSlot, catalogRevision, stateRevision) {
-  return canonicalJson({ orderSlot: String(orderSlot), catalogRevision: String(catalogRevision || "unknown"), stateRevision: String(stateRevision || "unknown"), state });
+  const serialized = canonicalJson({ orderSlot: String(orderSlot), catalogRevision: String(catalogRevision || "unknown"), stateRevision: String(stateRevision || "unknown"), state });
+  return `stochastic-plan:${createHash("sha256").update(serialized).digest("hex")}`;
 }
 
 class StochasticPlanCache {
@@ -190,9 +220,123 @@ function planStochasticOrder(state, orderSlot, options = {}) {
     return result;
   }
 
+  const immediateMerges = buildMergeCandidates(state, null, { canonicalOnly: true })
+    .map((action) => ({ action, transition: simulateDeterministicTransition(state, action) }))
+    .filter(({ transition }) => transition.ok)
+    .map(({ action, transition }) => ({
+      action,
+      transition,
+      score: {
+        safe: true,
+        boardSpaceFeasible: transition.state.board.empty >= 0,
+        peakOccupied: state.board.occupied,
+        orderProgress: orderProgress(transition.state, orderSlot),
+        mapProgressCoins: 0,
+        opportunityLoss: Number(transition.opportunityCost || 0),
+        saleReturn: 0,
+        actionCount: 1,
+        tieBreaker: JSON.stringify(action),
+      },
+    }))
+    .sort((left, right) => comparePathScores(left.score, right.score));
+  if (immediateMerges.length) {
+    const selected = immediateMerges[0];
+    const result = {
+      status: "planned",
+      nextAction: selected.action,
+      boardSpaceFeasibility: {
+        feasible: true,
+        peakOccupied: state.board.occupied,
+        capacity: state.board.capacity,
+        minimumEmpty: selected.transition.state.board.empty,
+      },
+      energyRequired: 0,
+      score: selected.score,
+      explanation: {
+        selected: "merge safely releases board space before stochastic production expansion",
+        selectedReason: "safe-space-release",
+        expectedEnergy: 0,
+        expectedEnergyBasis: "deterministic merge",
+        representativeCoverage: 1,
+        requiresNativePreflight: false,
+        riskBranches: [],
+        selectedRiskBranches: [],
+        pruned: {},
+        consideredStates: 1,
+        goalDepth: 1,
+        searchBudget: budget,
+        cache: { hit: false, key },
+      },
+    };
+    cache.set(key, result);
+    return result;
+  }
+
+  const initialMaterialProgress = orderMaterialProgress(state, orderSlot);
+  const immediateProductions = [];
+  for (const action of productionActions(state)) {
+    const branches = representativeProductionBranches(state, action, orderSlot);
+    const outcomes = branches.map((branch) => {
+      const transition = simulateProductionOutcome(state, action, branch.outcomeItemIds);
+      const immediateSafe = transition.ok && hasImmediateRelease(transition.state);
+      const safe = immediateSafe && contingentBranchSafe(transition.state, orderSlot, 1, Math.min(4, budget.maxWidth));
+      return {
+        branch,
+        transition,
+        detail: {
+          kind: branch.kind,
+          probability: branch.probability,
+          outcomeItemIds: branch.outcomeItemIds,
+          safe,
+          peakOccupied: transition.ok ? transition.state.board.occupied : state.board.occupied,
+          minimumEmpty: transition.ok ? transition.state.board.empty : state.board.empty,
+          reason: transition.ok ? safe ? "bounded-contingent-branch-feasible" : immediateSafe ? "no-safe-contingent-continuation" : "board-space-no-release" : transition.reason,
+        },
+      };
+    });
+    if (!outcomes.length || outcomes.some((outcome) => !outcome.detail.safe)) continue;
+    const probabilityMass = outcomes.reduce((sum, outcome) => sum + Number(outcome.branch.probability || 0), 0) || outcomes.length;
+    const weightedProgress = outcomes.reduce((sum, outcome) => sum + orderMaterialProgress(outcome.transition.state, orderSlot) * (Number(outcome.branch.probability || 0) || 1), 0) / probabilityMass;
+    if (weightedProgress <= initialMaterialProgress + 1e-12) continue;
+    immediateProductions.push({
+      action: { ...action, predictedBranches: outcomes.map((outcome) => outcome.detail) },
+      outcomes,
+      expectedMaterialProgress: weightedProgress,
+      minimumEmpty: Math.min(...outcomes.map((outcome) => outcome.transition.state.board.empty)),
+      peakOccupied: Math.max(...outcomes.map((outcome) => outcome.transition.state.board.occupied)),
+    });
+  }
+  immediateProductions.sort((left, right) => right.expectedMaterialProgress - left.expectedMaterialProgress
+    || left.peakOccupied - right.peakOccupied || Number(left.action.energyCost || 0) - Number(right.action.energyCost || 0)
+    || JSON.stringify(left.action).localeCompare(JSON.stringify(right.action)));
+  if (immediateProductions.length) {
+    const selected = immediateProductions[0];
+    const result = {
+      status: "planned",
+      nextAction: selected.action,
+      boardSpaceFeasibility: { feasible: selected.minimumEmpty >= 0, peakOccupied: selected.peakOccupied, capacity: state.board.capacity, minimumEmpty: selected.minimumEmpty },
+      energyRequired: Number(selected.action.energyCost || 0),
+      score: { safe: true, boardSpaceFeasible: selected.minimumEmpty >= 0, peakOccupied: selected.peakOccupied, orderProgress: selected.expectedMaterialProgress, mapProgressCoins: 0, opportunityLoss: 0, saleReturn: 0, actionCount: 1, tieBreaker: JSON.stringify(selected.action) },
+      explanation: {
+        selected: "produce is the safe immediate fast path from the bounded stochastic beam with one-step contingency",
+        selectedReason: "safe-immediate-production",
+        expectedEnergy: Number(selected.action.energyCost || 0),
+        expectedEnergyBasis: "single rolling production action",
+        representativeCoverage: selected.outcomes.length,
+        requiresNativePreflight: false,
+        riskBranches: selected.action.predictedBranches,
+        selectedRiskBranches: selected.action.predictedBranches,
+        pruned: {}, consideredStates: 1, goalDepth: 1, searchBudget: budget, cache: { hit: false, key },
+      },
+    };
+    cache.set(key, result);
+    return result;
+  }
+
   let beam = [{ state, firstAction: null, depth: 0, peakOccupied: state.board.occupied, minimumEmpty: state.board.empty, energyUsed: 0, probability: 1, opportunityLoss: 0, safe: true, riskBranches: [] }];
   const visited = new Set([canonicalJson(state)]);
   const goals = [];
+  const rollingNodes = [];
   const pruned = {};
   const riskBranches = [];
   let consideredStates = 0;
@@ -206,8 +350,8 @@ function planStochasticOrder(state, orderSlot, options = {}) {
           const outcomes = branches.map((branch) => {
             const transition = simulateProductionOutcome(node.state, action, branch.outcomeItemIds);
             const immediateSafe = transition.ok && hasImmediateRelease(transition.state);
-            const contingentDepth = budget.reason === "simple-state" ? 1 : 2;
-            const safe = immediateSafe && contingentBranchSafe(transition.state, orderSlot, Math.min(contingentDepth, budget.maxDepth - node.depth - 1), budget.maxWidth);
+            const contingentDepth = 1;
+            const safe = immediateSafe && contingentBranchSafe(transition.state, orderSlot, Math.min(contingentDepth, budget.maxDepth - node.depth - 1), Math.min(4, budget.maxWidth));
             const detail = { kind: branch.kind, probability: branch.probability, outcomeItemIds: branch.outcomeItemIds, safe, peakOccupied: transition.ok ? transition.state.board.occupied : node.state.board.occupied, minimumEmpty: transition.ok ? transition.state.board.empty : node.state.board.empty, reason: transition.ok ? safe ? "bounded-contingent-branch-feasible" : immediateSafe ? "no-safe-contingent-continuation" : "board-space-no-release" : transition.reason };
             riskBranches.push(detail);
             return { branch, transition, detail };
@@ -230,6 +374,7 @@ function planStochasticOrder(state, orderSlot, options = {}) {
       }
     }
     const unique = [];
+    if (depth === 0) rollingNodes.push(...expanded);
     for (const node of expanded) {
       if (orderSatisfied(node.state, orderSlot)) goals.push(node);
       const stateIdentity = canonicalJson(node.state);
@@ -243,8 +388,55 @@ function planStochasticOrder(state, orderSlot, options = {}) {
 
   let result;
   if (!goals.length) {
-    const reason = pruned["stochastic-space-risk"] ? "stochastic-space-risk" : pruned["insufficient-energy"] ? "insufficient-energy" : "stochastic-path-not-found";
-    result = { status: "blocked", reason, nextAction: null, boardSpaceFeasibility: { feasible: false, peakOccupied: state.board.occupied, capacity: state.board.capacity, minimumEmpty: state.board.empty }, explanation: { selected: null, selectedReason: null, riskBranches, pruned, consideredStates, searchBudget: budget, cache: { hit: false, key } } };
+    const groupedRollingNodes = new Map();
+    for (const node of rollingNodes) {
+      const actionKey = JSON.stringify(node.firstAction);
+      if (!groupedRollingNodes.has(actionKey)) groupedRollingNodes.set(actionKey, []);
+      groupedRollingNodes.get(actionKey).push(node);
+    }
+    const rollingCandidates = [...groupedRollingNodes.values()].map((siblings) => {
+      const probabilityMass = siblings.reduce((sum, node) => sum + Number(node.probability || 0), 0) || siblings.length;
+      const weighted = (read) => siblings.reduce((sum, node) => sum + read(node) * (Number(node.probability || 0) || 1), 0) / probabilityMass;
+      return {
+        siblings,
+        node: siblings[0],
+        expectedMaterialProgress: weighted((node) => orderMaterialProgress(node.state, orderSlot)),
+        expectedEmpty: weighted((node) => Number(node.state.board.empty || 0)),
+        expectedEnergy: weighted((node) => Number(node.energyUsed || 0)),
+        peakOccupied: Math.max(...siblings.map((node) => Number(node.peakOccupied || 0))),
+        minimumEmpty: Math.min(...siblings.map((node) => Number(node.minimumEmpty || 0))),
+      };
+    }).filter((candidate) => candidate.expectedMaterialProgress > initialMaterialProgress + 1e-12
+      || candidate.expectedEmpty > Number(state.board.empty || 0)
+      || ["retrieve-from-warehouse", "store-to-warehouse", "switch-production-mode"].includes(candidate.node.firstAction?.type));
+    rollingCandidates.sort((left, right) => right.expectedMaterialProgress - left.expectedMaterialProgress
+      || right.expectedEmpty - left.expectedEmpty || left.expectedEnergy - right.expectedEnergy
+      || JSON.stringify(left.node.firstAction).localeCompare(JSON.stringify(right.node.firstAction)));
+    const rolling = rollingCandidates[0];
+    if (rolling) {
+      const preflightRequired = rolling.node.firstAction.type === "store-to-warehouse" && rolling.node.firstAction.storeAvailability?.status !== "available";
+      const nextAction = preflightRequired ? { ...rolling.node.firstAction, preflightRequired: true } : rolling.node.firstAction;
+      result = {
+        status: "planned", nextAction,
+        boardSpaceFeasibility: { feasible: rolling.minimumEmpty >= 0, peakOccupied: rolling.peakOccupied, capacity: state.board.capacity, minimumEmpty: rolling.minimumEmpty },
+        energyRequired: rolling.expectedEnergy,
+        score: { ...nodeScore(rolling.node, orderSlot), orderProgress: rolling.expectedMaterialProgress },
+        explanation: {
+          selected: `${nextAction.type} is the first safe rolling action beyond the bounded stochastic horizon`,
+          selectedReason: "bounded-rolling-progress",
+          expectedEnergy: rolling.expectedEnergy,
+          expectedEnergyBasis: "safe immediate representative branches",
+          representativeCoverage: rolling.siblings.length,
+          requiresNativePreflight: preflightRequired,
+          riskBranches: nextAction.predictedBranches || [],
+          selectedRiskBranches: nextAction.predictedBranches || [],
+          pruned, consideredStates, goalDepth: null, searchBudget: budget, cache: { hit: false, key },
+        },
+      };
+    } else {
+      const reason = pruned["stochastic-space-risk"] ? "stochastic-space-risk" : pruned["insufficient-energy"] ? "insufficient-energy" : "stochastic-path-not-found";
+      result = { status: "blocked", reason, nextAction: null, boardSpaceFeasibility: { feasible: false, peakOccupied: state.board.occupied, capacity: state.board.capacity, minimumEmpty: state.board.empty }, explanation: { selected: null, selectedReason: null, riskBranches, pruned, consideredStates, searchBudget: budget, cache: { hit: false, key } } };
+    }
   } else {
     const groupedGoals = new Map();
     for (const goal of goals) {

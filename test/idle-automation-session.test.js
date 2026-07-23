@@ -264,6 +264,134 @@ test("observation-mode bounded start remains preview-only when omitted or invali
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
+test("bounded automation start does not wait for background icon acquisition", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "start-icon-priority-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  let releaseIcons;
+  runtime.iconService.waitForIdle = () => new Promise((resolve) => { releaseIcons = resolve; });
+  let interruptions = 0;
+  runtime.iconService.interruptForAutomation = () => { interruptions += 1; return 0; };
+  runtime.connect = async () => {};
+  runtime.createRuntime = () => ({ run: async () => ({ ok: true, reason: "planned", actions: [] }) });
+  const startPromise = runtime.start({ mode: "observation" });
+  const winner = await Promise.race([startPromise.then(() => "start"), new Promise((resolve) => setTimeout(() => resolve("timeout"), 30))]);
+  releaseIcons?.();
+  await startPromise;
+  assert.equal(winner, "start");
+  assert.equal(interruptions, 1);
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("stopping during a bounded CDP read completes as aborted instead of automation-error", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bounded-stop-abort-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  runtime.iconService.waitForIdle = async () => {};
+  runtime.connect = async () => {};
+  runtime.createRuntime = () => ({
+    run: ({ signal }) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(Object.assign(new Error("CDP command aborted"), { name: "AbortError" })), { once: true })),
+  });
+
+  const running = runtime.start({ mode: "automatic" });
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.stop();
+  const result = await running;
+
+  assert.equal(result.reason, "aborted");
+  assert.equal(runtime.database.listSessions(1)[0].status, "stopped");
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("a zero-action bounded session persists its explainable boundary", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bounded-zero-action-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  runtime.iconService.waitForIdle = async () => {};
+  runtime.connect = async () => {};
+  runtime.createRuntime = () => ({ run: async () => ({ ok: true, executed: true, reason: "waiting-no-feasible-order", actions: [] }) });
+
+  const result = await runtime.start({ mode: "automatic" });
+  const boundary = runtime.database.listRecentActions(1)[0];
+
+  assert.equal(result.reason, "waiting-no-feasible-order");
+  assert.equal(boundary.action_type, "boundary");
+  assert.equal(boundary.reason, "waiting-no-feasible-order");
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("a bounded automation error persists one diagnostic action without duplicating recorded actions", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bounded-error-history-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  runtime.iconService.waitForIdle = async () => {};
+  runtime.connect = async () => {};
+  runtime.createRuntime = (_options, sessionId, nextSequence) => ({
+    run: async () => {
+      runtime.database.logAction({ sessionId, sequence: nextSequence(), type: "merge", reason: "merge-complete", ok: true });
+      throw Object.assign(new Error("CDP WebSocket closed"), { code: "CDP_SOCKET_CLOSED" });
+    },
+  });
+
+  await assert.rejects(runtime.start({ mode: "automatic" }), /CDP WebSocket closed/);
+  const session = runtime.database.listSessions(1)[0];
+  const actions = runtime.database.listRecentActions(10)
+    .filter((action) => Number(action.session_id) === session.id)
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence));
+
+  assert.equal(session.status, "error");
+  assert.deepEqual(actions.map((action) => action.action_type), ["merge", "error"]);
+  assert.equal(actions[1].reason, "automation-error");
+  assert.equal(actions[1].ok, 0);
+  assert.deepEqual(JSON.parse(actions[1].details_json), {
+    message: "CDP WebSocket closed",
+    code: "CDP_SOCKET_CLOSED",
+  });
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("an idle automation error persists its message and code", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "idle-error-history-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  runtime.connect = async () => {};
+  runtime.collectState = async () => {
+    throw Object.assign(new Error("catalog target mismatch"), { code: "CATALOG_TARGET_MISMATCH" });
+  };
+
+  await assert.rejects(runtime.startIdle({ mode: "automatic" }), /catalog target mismatch/);
+  const session = runtime.database.listSessions(1)[0];
+  const actions = runtime.database.listRecentActions(10).filter((action) => Number(action.session_id) === session.id);
+
+  assert.equal(session.status, "error");
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].action_type, "error");
+  assert.equal(actions[0].reason, "automation-error");
+  assert.equal(actions[0].ok, 0);
+  assert.deepEqual(JSON.parse(actions[0].details_json), {
+    message: "catalog target mismatch",
+    code: "CATALOG_TARGET_MISMATCH",
+  });
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test("background start defers heavy runtime work until after the accepted response", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "background-start-deferred-"));
+  const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  let started = false;
+  runtime.start = async () => { started = true; return { ok: true, reason: "done" }; };
+
+  const accepted = runtime.startInBackground({ mode: "automatic" });
+
+  assert.equal(accepted.accepted, true);
+  assert.equal(started, false);
+  await new Promise((resolve) => setImmediate(resolve));
+  await runtime.activeRunPromise;
+  assert.equal(started, true);
+  runtime.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
 test("idle runtime and scheduler events share one monotonic action sequence", () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "idle-sequence-"));
   const runtime = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });

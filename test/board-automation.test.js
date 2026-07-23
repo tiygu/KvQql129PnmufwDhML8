@@ -138,3 +138,105 @@ test("中止信号在下一原子动作前结束循环", async () => {
   assert.equal(result.actions.length, 0);
   assert.equal(client.calls.length, 1);
 });
+
+test("棋盘动作在一秒内未确认时暂停边界且不发送后续输入", async () => {
+  let clock = 0;
+  const unchanged = state({
+    signature: "a|a|",
+    grids: [{ index: 1, itemId: "a", empty: false }, { index: 2, itemId: "a", empty: false }],
+    mergeCandidates: [{ from: 1, to: 2, itemId: "a", mergeTarget: "a2" }],
+    producers: [],
+  });
+  const client = new FakeClient(Array.from({ length: 20 }, () => unchanged));
+  const runner = new BoardAutomationRunner({
+    client,
+    contextId: 7,
+    confirmationTimeoutMs: 1000,
+    pollIntervalMs: 100,
+    now: () => clock,
+    wait: async (milliseconds) => { clock += milliseconds; return true; },
+  });
+
+  const result = await runner.run({
+    merge: { from: 1, to: 2 },
+    plannedAction: { type: "merge", from: 1, to: 2 },
+    maxActions: 3,
+    execute: true,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "action_confirmation_timeout");
+  assert.equal(result.pauseRequested, true);
+  assert.ok(clock <= 1000, `confirmation used ${clock}ms`);
+  assert.equal(client.calls.filter((call) => call.expression.includes('type: "merge"')).length, 1);
+});
+
+test("新产出物仍在动画中时等待可拖动再执行合并", async () => {
+  let clock = 0;
+  let reads = 0;
+  let ready = false;
+  let merged = false;
+  const before = state({
+    signature: "a|a|",
+    grids: [
+      { index: 1, itemId: "a", empty: false, actionReady: false },
+      { index: 2, itemId: "a", empty: false, actionReady: true },
+    ],
+    mergeCandidates: [{ from: 1, to: 2, itemId: "a", mergeTarget: "a2" }],
+    producers: [],
+  });
+  const after = state({
+    signature: "|a2",
+    empty: 1,
+    grids: [
+      { index: 1, itemId: "", empty: true, actionReady: true },
+      { index: 2, itemId: "a2", empty: false, actionReady: true },
+    ],
+    mergeCandidates: [],
+    producers: [],
+  });
+  const client = {
+    calls: [],
+    mergeCalls: 0,
+    mergeWhileReady: false,
+    async evaluate(expression, contextId, options) {
+      this.calls.push({ expression, contextId, options });
+      if (expression === BOARD_CONTROL_STATE_EXPRESSION) {
+        reads += 1;
+        if (reads >= 2) ready = true;
+        if (merged) return after;
+        return {
+          ...before,
+          grids: before.grids.map((grid) => grid.index === 1 ? { ...grid, actionReady: ready } : grid),
+        };
+      }
+      if (expression.includes('type: "merge"')) {
+        this.mergeCalls += 1;
+        this.mergeWhileReady = ready;
+        if (ready) merged = true;
+        return { ok: true, type: "merge" };
+      }
+      throw new Error("unexpected expression");
+    },
+  };
+  const runner = new BoardAutomationRunner({
+    client,
+    contextId: 7,
+    confirmationTimeoutMs: 300,
+    pollIntervalMs: 50,
+    now: () => clock,
+    wait: async (milliseconds) => { clock += milliseconds; return true; },
+  });
+
+  const result = await runner.run({
+    merge: { from: 1, to: 2 },
+    plannedAction: { type: "merge", from: 1, to: 2 },
+    maxActions: 1,
+    execute: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(client.mergeCalls, 1);
+  assert.equal(client.mergeWhileReady, true);
+  assert.equal(result.actions[0].actualTarget, "a2");
+});

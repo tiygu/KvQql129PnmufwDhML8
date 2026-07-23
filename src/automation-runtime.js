@@ -5,6 +5,7 @@ const fsp = require("node:fs/promises");
 const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
+const { Worker } = require("node:worker_threads");
 const { ZipArchive } = require("archiver");
 const { AdapterLab } = require("./lab");
 const { getConfig } = require("./config");
@@ -25,6 +26,37 @@ const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
 const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
 const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
+
+function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(path.join(__dirname, "planning-worker.js"), { workerData: input });
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const fail = (message, code) => {
+      const error = new Error(message);
+      error.code = code;
+      if (code === "ABORT_ERR") error.name = "AbortError";
+      worker.terminate().catch(() => {});
+      finish(reject, error);
+    };
+    const onAbort = () => fail("planning aborted", "ABORT_ERR");
+    worker.once("message", (message) => {
+      if (!message?.ok) return fail(message?.error || "planning worker failed", "PLANNING_WORKER_ERROR");
+      finish(resolve, message.plan);
+    });
+    worker.once("error", (error) => finish(reject, error));
+    worker.once("exit", (code) => {
+      if (!settled && code !== 0) fail(`planning worker exited with code ${code}`, "PLANNING_WORKER_EXIT");
+    });
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -51,6 +83,63 @@ function waitForPromiseOrAbort(promise, signal = null) {
   });
 }
 
+function buildAutomationErrorDetails(error) {
+  return {
+    message: error?.message || String(error),
+    code: error?.code == null ? null : String(error.code),
+  };
+}
+
+function passiveCatalogStateFingerprint(state) {
+  if (!state) return null;
+  const items = [];
+  for (const grid of state.board?.grids || []) items.push(["board", String(grid.itemId || ""), Number(grid.level) || null]);
+  for (const order of state.orders || []) for (const item of order.items || []) items.push(["order", String(item.itemId || ""), Number(item.level) || null]);
+  items.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  const producers = (state.producers || []).map((producer) => ({
+    index: producer.index,
+    itemId: String(producer.itemId || ""),
+    energyCost: producer.energyCost ?? null,
+    currentProductionModeId: producer.currentProductionModeId ?? null,
+    productionModeSwitchEntry: producer.productionModeSwitchEntry || null,
+    availableProductionModes: producer.availableProductionModes || [],
+  })).sort((left, right) => String(left.itemId).localeCompare(String(right.itemId)) || Number(left.index) - Number(right.index));
+  return crypto.createHash("sha256").update(JSON.stringify({ items, producers })).digest("hex");
+}
+
+function reconcileBoardObservation(state, observed, action = null) {
+  const next = structuredClone(state);
+  next.collectedAt = new Date().toISOString();
+  next.scene = "board";
+  next.board = {
+    ...(next.board || {}),
+    available: !!observed?.ok,
+    visible: !!observed?.boardVisible,
+    width: observed?.width ?? next.board?.width ?? null,
+    height: observed?.height ?? next.board?.height ?? null,
+    occupied: Number(observed?.occupied ?? next.board?.occupied ?? 0),
+    empty: Number(observed?.empty ?? next.board?.empty ?? 0),
+    signature: observed?.signature ?? next.board?.signature ?? "",
+    grids: (observed?.grids || []).map((grid) => ({ ...grid, itemId: String(grid.itemId || "") })),
+    mergeCandidates: (observed?.mergeCandidates || []).map((candidate) => ({ ...candidate })),
+    requiredItemCounts: { ...(observed?.requiredItemCounts || {}) },
+  };
+  next.orders = (observed?.orders || []).map((order) => {
+    const items = (order.items || []).map((item) => ({ itemId: String(item.itemId || ""), complete: !!item.complete, status: item.status ?? null }));
+    return { ...order, slot: String(order.slot || ""), items, requiredItemIds: items.map((item) => item.itemId).filter(Boolean), missingItemIds: items.filter((item) => !item.complete).map((item) => item.itemId).filter(Boolean), ready: items.length > 0 && items.every((item) => item.complete) };
+  });
+  next.producers = (observed?.producers || []).map((producer) => ({ ...producer, itemId: String(producer.itemId || "") }));
+  if (action?.type === "produce" && action.verified !== false) {
+    const producer = (state.producers || []).find((item) => Number(item.index) === Number(action.producer));
+    const energyCost = Number(producer?.energyCost);
+    if (Number.isFinite(energyCost) && Number.isFinite(Number(next.resources?.energy))) {
+      next.resources.energy = Math.max(0, Number(next.resources.energy) - energyCost);
+      if (next.energy) next.energy.amount = next.resources.energy;
+    }
+  }
+  return next;
+}
+
 class AutomationRuntime {
   constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true, runtimeControl = null } = {}) {
     this.rootDir = rootDir;
@@ -65,6 +154,11 @@ class AutomationRuntime {
     this.connectPromise = null;
     this.connectController = null;
     this.lastState = buildGameState();
+    this.lastPlan = null;
+    this.planningCatalogCache = new Map();
+    this.catalogProjectionCache = new Map();
+    this.catalogViewCache = new Map();
+    this.iconEvidenceRetryAt = new Map();
     this.running = false;
     this.abortController = null;
     this.pauseGate = new PauseGate();
@@ -74,6 +168,9 @@ class AutomationRuntime {
     this.sessionKind = null;
     this.actionBoundaryPending = false;
     this.passiveCatalogState = null;
+    this.deferredPassiveCatalogState = null;
+    this.deferredPassiveCatalogDiffs = [];
+    this.lastPassiveCatalogStateFingerprint = null;
     this.passiveCatalogDiffs = [];
     this.passiveCatalogDrainPromise = null;
     this.closing = false;
@@ -133,27 +230,54 @@ class AutomationRuntime {
       throw empty;
     }
     this.catalogGate = new CatalogReviewGate(this.database);
+    for (const conflict of this.database.listCatalogConflicts()) {
+      this.catalogGate.evaluateObject(conflict.objectType, conflict.objectId);
+    }
+    this.database.invalidateAutomaticIconSelections((candidate) => {
+      if (candidate.sourceType === "screenshot-runtime") {
+        return candidate.crop?.backgroundRemoval?.applied === true
+          && candidate.similarity?.qualityGate?.status === "eligible";
+      }
+      if (candidate.sourceType !== "cocos-runtime-resource"
+        || !/^(?:icon|item[_-]?icon)$/i.test(String(candidate.runtimeIdentifier || ""))) return true;
+      const identity = this.database.getCatalogObject("item-identity", candidate.itemId);
+      const resourceIdentifier = identity?.effectiveValue?.iconResourceIdentifier
+        ?? identity?.effectiveValue?.iconResource;
+      const resourceName = String(resourceIdentifier || "").split(/[\\/]/).filter(Boolean).at(-1);
+      return !resourceName || /^(?:icon|item[_-]?icon)$/i.test(resourceName);
+    }, { reason: "automatic-icon-quality-gate" });
     this.iconService = new IconEvidenceService({
       database: this.database,
       cacheDir: path.join(this.dataDir, "icon-cache"),
       concurrency: 2,
-      resolveSpriteFrame: async ({ itemId, itemIdentity }) => {
-        const selection = await this.connect();
-        return resolveCocosSpriteFrame({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity });
+      resolveSpriteFrame: async ({ itemId, itemIdentity, signal }) => {
+        const selection = await this.connect(signal);
+        return resolveCocosSpriteFrame({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity, signal });
       },
-      readResource: async ({ resourceUrl, mimeType }) => {
-        await this.connect();
-        return readCdpResource({ client: this.lab.client, resourceUrl, mimeType });
+      readResource: async ({ resourceUrl, mimeType, signal }) => {
+        await this.connect(signal);
+        return readCdpResource({ client: this.lab.client, resourceUrl, mimeType, signal });
       },
-      resolveScreenshotBounds: async ({ itemId, itemIdentity }) => {
-        const selection = await this.connect();
-        return resolveScreenshotTarget({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity });
+      resolveScreenshotBounds: async ({ itemId, itemIdentity, signal }) => {
+        const selection = await this.connect(signal);
+        return resolveScreenshotTarget({ client: this.lab.client, contextId: selection.probe.context.id, itemId, itemIdentity, signal });
       },
-      captureScreenshot: async () => {
-        await this.connect();
-        return captureCdpScreenshot({ client: this.lab.client });
+      captureScreenshot: async ({ signal }) => {
+        await this.connect(signal);
+        return captureCdpScreenshot({ client: this.lab.client, signal });
       },
-      onEvent: (event) => this.emit(event.type, event),
+      isSafeBoundary: () => !this.running && !this.actionBoundaryPending,
+      onEvent: (event) => {
+        const itemId = String(event.itemId || "");
+        if (event.type === "icon-acquisition-complete") {
+          const rejected = event.candidate?.sourceType === "screenshot-runtime" && event.candidate?.similarity?.qualityGate?.status === "rejected";
+          if (rejected) this.iconEvidenceRetryAt.set(itemId, Date.now() + 300_000);
+          else this.iconEvidenceRetryAt.delete(itemId);
+        } else if (event.type === "icon-acquisition-error") {
+          this.iconEvidenceRetryAt.set(itemId, Date.now() + 60_000);
+        }
+        this.emit(event.type, event);
+      },
     });
   }
 
@@ -203,7 +327,20 @@ class AutomationRuntime {
 
   getCatalogView({ includeRepositoryObjects = true } = {}) {
     const executionMode = this.getSettings().mode;
-    const projection = this.database.getCatalogProjection({ includeProvisional: true, executionMode });
+    const revision = includeRepositoryObjects ? this.database.getCatalogUiRevision() : this.database.getCatalogPresentationRevision();
+    const cacheKey = `${revision}:${executionMode}:${includeRepositoryObjects ? "full" : "summary"}`;
+    const cached = this.catalogViewCache.get(cacheKey);
+    if (cached) return cached;
+    const semanticRevision = this.database.getCatalogSemanticRevision();
+    const projectionKey = `${semanticRevision}:${executionMode}:provisional`;
+    let projection = this.catalogProjectionCache.get(projectionKey);
+    if (!projection) {
+      projection = this.database.getCatalogProjection({ includeProvisional: true, executionMode });
+      this.catalogProjectionCache.clear();
+      this.catalogProjectionCache.set(projectionKey, projection);
+    }
+    const selectedIconHashes = this.database.getSelectedIconHashes();
+    const iconUrls = Object.fromEntries(Object.entries(selectedIconHashes).map(([itemId, hash]) => [itemId, `/api/catalog/icon/${hash}`]));
     const repository = { summary: this.database.getCatalogRepositorySummary() };
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
@@ -212,15 +349,22 @@ class AutomationRuntime {
       repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
       repository.uncertainProductionActions = this.database.listUncertainProductionActions();
     }
-    return {
+    const result = {
       revision: projection.revision,
       stats: projection.stats,
       coverage: projection.coverage,
       chains: projection.chains,
-      items: projection.items.map((item) => ({ ...item, iconUrl: item.iconHash ? `/api/catalog/icon/${item.iconHash}` : null })),
+      items: projection.items.map((item) => {
+        const iconHash = selectedIconHashes[String(item.id)] || item.iconHash;
+        return { ...item, iconHash: iconHash || null, iconUrl: iconHash ? `/api/catalog/icon/${iconHash}` : null };
+      }),
+      iconUrls,
       producers: projection.producers,
       repository,
     };
+    for (const key of this.catalogViewCache.keys()) if (!key.startsWith(`${revision}:`)) this.catalogViewCache.delete(key);
+    this.catalogViewCache.set(cacheKey, result);
+    return result;
   }
 
   getCatalogObject(objectType, objectId) {
@@ -231,8 +375,15 @@ class AutomationRuntime {
   }
 
   getPlanningCatalog({ includeProvisional = false, executionMode = "assisted" } = {}) {
+    const revision = this.database.getCatalogSemanticRevision();
+    const key = `${revision}:${includeProvisional ? "provisional" : "active"}:${executionMode}`;
+    const cached = this.planningCatalogCache.get(key);
+    if (cached) return cached;
     const catalog = buildPlanningCatalogFromRepository(this.database, null, { includeProvisional, executionMode });
-    return { ...catalog, evidence: buildCatalogEvidenceIndex(this.database) };
+    const result = { ...catalog, evidence: buildCatalogEvidenceIndex(this.database) };
+    for (const cachedKey of this.planningCatalogCache.keys()) if (!cachedKey.startsWith(`${revision}:`)) this.planningCatalogCache.delete(cachedKey);
+    this.planningCatalogCache.set(key, result);
+    return result;
   }
 
   exportCatalog() {
@@ -253,7 +404,28 @@ class AutomationRuntime {
     if (this.running || this.actionBoundaryPending) throw Object.assign(new Error("icon acquisition requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
     const object = this.database.getCatalogObject("item-identity", String(itemId));
     if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
+    this.iconEvidenceRetryAt.delete(String(itemId));
     return this.iconService.request(String(itemId), { itemIdentity: { itemId: String(itemId), ...(object.effectiveValue || object.algorithmCandidate || {}) } });
+  }
+
+  queueVisibleBoardIconEvidence(state) {
+    if (this.closing || this.running || this.actionBoundaryPending) return [];
+    const queued = [];
+    const itemIds = [...new Set((state?.board?.grids || []).map((grid) => String(grid.itemId || "")).filter(Boolean))];
+    for (const itemId of itemIds) {
+      if (this.database.getSelectedIconCandidate(itemId)) continue;
+      if (Number(this.iconEvidenceRetryAt.get(itemId) || 0) > Date.now()) continue;
+      const object = this.database.getCatalogObject("item-identity", itemId);
+      if (!object) continue;
+      try {
+        queued.push(this.iconService.request(itemId, { itemIdentity: { itemId, ...(object.effectiveValue || object.algorithmCandidate || {}) } }));
+        if (queued.length >= 2) break;
+      } catch (error) {
+        if (error?.code === "ICON_ACQUISITION_QUEUE_FULL") break;
+        this.emit("icon-acquisition-error", { itemId, error: error.message });
+      }
+    }
+    return queued;
   }
 
   getCatalogIconTask(taskId) {
@@ -315,6 +487,12 @@ class AutomationRuntime {
     return this.database.applyCatalogRuling(input);
   }
 
+  completeCatalogReview(input) {
+    const object = this.database.completeCatalogReview(input);
+    this.emit("catalog-state-updated", { object });
+    return object;
+  }
+
   revokeCatalogRuling(input) {
     return this.database.revokeCatalogRuling(input);
   }
@@ -327,8 +505,13 @@ class AutomationRuntime {
     const captureFile = `${capturePrefix}-${Date.now()}.json`;
     snapshot.__captureFile = captureFile;
     await fsp.writeFile(path.join(captureDir, captureFile), JSON.stringify(snapshot, null, 2), "utf8");
+    const selectedItem = snapshot.focusedControllers?.selectedItem;
+    const selectedItemUi = snapshot.gameplayState?.selectedItemUi;
+    if (!selectedItem && selectedItemUi?.selected !== true) {
+      return { ok: false, reason: "catalog-scan-selection-required", captureFile };
+    }
     const scanned = this.buildCatalog([snapshot]);
-    if (!scanned.chains.length) return { ok: false, reason: "selected-item-status-not-found", captureFile };
+    if (!scanned.chains.length) return { ok: false, reason: "selected-item-chain-data-not-found", captureFile };
     return { ok: true, captureFile, capturePath: path.join(captureDir, captureFile), scanned };
   }
 
@@ -509,11 +692,20 @@ class AutomationRuntime {
 
   queuePassiveCatalogEvidence({ state = null, actionDiff = null } = {}) {
     if (this.closing) return;
-    if (state) this.passiveCatalogState = state;
-    if (actionDiff) {
-      this.passiveCatalogDiffs.push(actionDiff);
-      if (this.passiveCatalogDiffs.length > 16) this.passiveCatalogDiffs.splice(0, this.passiveCatalogDiffs.length - 16);
+    if (state) {
+      const fingerprint = passiveCatalogStateFingerprint(state);
+      if (this.running) this.deferredPassiveCatalogState = state;
+      else if (fingerprint !== this.lastPassiveCatalogStateFingerprint) {
+        this.lastPassiveCatalogStateFingerprint = fingerprint;
+        this.passiveCatalogState = state;
+      }
     }
+    if (actionDiff) {
+      const target = this.running ? this.deferredPassiveCatalogDiffs : this.passiveCatalogDiffs;
+      target.push(actionDiff);
+      if (target.length > 16) target.splice(0, target.length - 16);
+    }
+    if (!this.passiveCatalogState && !this.passiveCatalogDiffs.length) return;
     if (this.passiveCatalogDrainPromise) return;
     this.passiveCatalogDrainPromise = new Promise((resolve) => setImmediate(() => {
       const pendingState = this.passiveCatalogState;
@@ -522,9 +714,9 @@ class AutomationRuntime {
       try {
         const observed = new Set(collectPassiveCatalogEvidence(this.database, { state: pendingState }));
         for (const diff of pendingDiffs) for (const objectId of collectPassiveCatalogEvidence(this.database, { actionDiff: diff })) observed.add(objectId);
-        const productionModeIds = [...observed].filter((key) => key.startsWith("production-mode:")).map((key) => key.slice("production-mode:".length));
-        if (productionModeIds.length) {
-          for (const object of this.catalogGate.evaluateAll({ objectIds: productionModeIds })) this.emit("catalog-state-updated", { object });
+        const observedObjectIds = [...new Set([...observed].map((key) => key.slice(key.indexOf(":") + 1)).filter(Boolean))];
+        if (observedObjectIds.length) {
+          for (const object of this.catalogGate.evaluateAll({ objectIds: observedObjectIds })) this.emit("catalog-state-updated", { object });
         }
         if (observed.size) this.emit("catalog-passive-evidence", { objects: [...observed] });
       } catch (error) {
@@ -537,6 +729,14 @@ class AutomationRuntime {
     }));
   }
 
+  flushDeferredPassiveCatalogState() {
+    const state = this.deferredPassiveCatalogState;
+    const diffs = this.deferredPassiveCatalogDiffs.splice(0);
+    this.deferredPassiveCatalogState = null;
+    if (diffs.length) this.passiveCatalogDiffs.push(...diffs);
+    if (state || diffs.length) this.queuePassiveCatalogEvidence({ state });
+  }
+
   invalidateWarehouseInventoryKnowledge(reason) {
     this.warehouseInventoryKnowledgeInvalidated = true;
     this.warehouseInventoryInvalidationReason = String(reason || "warehouse-inventory-invalidated");
@@ -546,20 +746,26 @@ class AutomationRuntime {
   async dashboard() {
     const settings = this.getSettings();
     let state = this.lastState;
-    let connected = false;
+    let connected = !!(this.lab && this.selection?.probe);
     let connectionError = null;
-    try {
-      state = await this.collectState();
-      connected = true;
-    } catch (error) {
-      connectionError = error?.message || String(error);
+    if (!this.running || !state || !connected) {
+      try {
+        state = await this.collectState();
+        connected = true;
+      } catch (error) {
+        connectionError = error?.message || String(error);
+      }
     }
     const connectionRoute = await this.connectionService.status();
     if (this.connectionAutoStartEnabled && !connectionRoute.listening && !connectionRoute.starting) {
       this.ensureConnectionRoute().catch((error) => this.emit("connection-route-error", { error: error.message }));
     }
+    if (connected) this.queueVisibleBoardIconEvidence(state);
     const planningCatalog = this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode });
-    const plan = buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode });
+    const plan = this.running && this.lastPlan
+      ? this.lastPlan
+      : buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode });
+    this.lastPlan = plan;
     return {
       connected,
       connectionError,
@@ -582,8 +788,8 @@ class AutomationRuntime {
   getSettings() {
     const defaults = {
       mode: "observation",
-      delayMs: 1200,
-      settleMs: 1800,
+      delayMs: 100,
+      settleMs: 500,
       autoMapUpgrade: false,
       strategy: "efficiency",
       prioritySlot: null,
@@ -591,6 +797,8 @@ class AutomationRuntime {
       salePolicy: { automaticEnabled: false, rules: [] },
     };
     const merged = { ...defaults, ...this.database.getSetting("automation", {}) };
+    merged.delayMs = Math.max(50, Math.min(250, Number(merged.delayMs) || defaults.delayMs));
+    merged.settleMs = Math.max(300, Math.min(1000, Number(merged.settleMs) || defaults.settleMs));
     delete merged.maxActions;
     return merged;
   }
@@ -598,8 +806,8 @@ class AutomationRuntime {
   saveSettings(settings = {}) {
     const normalized = {
       mode: ["observation", "assisted", "automatic"].includes(settings.mode) ? settings.mode : "observation",
-      delayMs: Math.max(300, Math.min(10000, Number(settings.delayMs) || 1200)),
-      settleMs: Math.max(300, Math.min(15000, Number(settings.settleMs) || 1800)),
+      delayMs: Math.max(50, Math.min(250, Number(settings.delayMs) || 100)),
+      settleMs: Math.max(300, Math.min(1000, Number(settings.settleMs) || 500)),
       autoMapUpgrade: !!settings.autoMapUpgrade,
       strategy: ["efficiency", "min-energy", "fastest", "specified"].includes(settings.strategy) ? settings.strategy : "efficiency",
       prioritySlot: settings.prioritySlot == null || settings.prioritySlot === "" ? null : String(settings.prioritySlot),
@@ -648,10 +856,26 @@ class AutomationRuntime {
   createRuntime(options, sessionId = null, nextSequence = null) {
     const runtimeControl = this.ensureRuntimeControl();
     const collectState = (signal = null) => this.collectState(signal);
+    let sequence = 0;
+    const emittedActions = new WeakSet();
+    const recordEvent = (event) => {
+      if (event && typeof event === "object") {
+        if (emittedActions.has(event)) return;
+        emittedActions.add(event);
+      }
+      const actionSequence = nextSequence ? nextSequence() : ++sequence;
+      if (sessionId) this.database.logAction({ sessionId, sequence: actionSequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
+      this.queuePassiveCatalogEvidence({ actionDiff: { ...(event.diff || event), actionId: `${sessionId || "runtime"}:${actionSequence}`, reason: event.reason } });
+      this.emit("automation-action", { action: event });
+    };
     const execute = (command, signal) => runtimeControl.execute(command, { signal, options });
     const orderLoop = new OrderCoinLoop({
       collectState,
-      planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot, salePolicy: options.salePolicy, executionMode: options.mode }),
+      planOrders: async (state) => {
+        const plan = await buildOptimizationPlanInWorker({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot, salePolicy: options.salePolicy, executionMode: options.mode }, { signal: this.abortController?.signal || null });
+        this.lastPlan = plan;
+        return plan;
+      },
       runBoardAction: ({ producer, merge, plannedAction, signal }) => execute({ type: "run-board-action", producer, merge, plannedAction }, signal),
       submitOrder: (slot, { signal, before }) => execute({ type: "submit-order", slot, before }, signal),
       preflightStore: (index, { signal }) => execute({ type: "preflight-warehouse-store", index }, signal),
@@ -659,21 +883,22 @@ class AutomationRuntime {
       loadWarehouseInventory: ({ signal }) => execute({ type: "load-warehouse-inventory" }, signal),
       retrieveWarehouseItem: (action, request) => execute({ type: "retrieve-from-warehouse", action, request: { inventory: request.inventory, before: request.before } }, request.signal),
       switchProductionMode: (index, modeId, request) => execute({ type: "switch-production-mode", index, modeId, request: { expectedCurrentModeId: request.expectedCurrentModeId } }, request.signal),
+      reconcileBoardState: reconcileBoardObservation,
+      onActionTimeout: ({ reason, timing }) => {
+        this.pauseGate.pause();
+        this.emit("automation-status", { running: true, paused: true, reason, message: "动作确认超时", timing });
+      },
+      onEvent: recordEvent,
       allowProductionModeSwitch: options.mode !== "observation",
+      waitIfPaused: (signal) => this.pauseGate.wait(signal),
     });
-    let sequence = 0;
     return new FullAutomationLoop({
       collectState,
       autoMapUpgrade: !!options.autoMapUpgrade,
       navigate: (target, { signal }) => execute({ type: "navigate", target }, signal),
       runOrderCycle: (runOptions) => orderLoop.run(runOptions),
       completeMapMission: ({ signal }) => execute({ type: "complete-map-mission" }, signal),
-      onEvent: (event) => {
-        const actionSequence = nextSequence ? nextSequence() : ++sequence;
-        if (sessionId) this.database.logAction({ sessionId, sequence: actionSequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
-        this.queuePassiveCatalogEvidence({ actionDiff: { ...(event.diff || event), actionId: `${sessionId || "runtime"}:${actionSequence}`, reason: event.reason } });
-        this.emit("automation-action", { action: event });
-      },
+      onEvent: recordEvent,
       waitIfPaused: (signal) => this.pauseGate.wait(signal),
     });
   }
@@ -747,10 +972,13 @@ class AutomationRuntime {
     };
     if (this.running || this.actionBoundaryPending) throw new Error("自动化任务已在运行");
     this.actionBoundaryPending = true;
+    this.running = true;
     try {
-      await this.iconService.waitForIdle();
+      this.iconService.interruptForAutomation();
       await this.connect();
-      this.running = true;
+    } catch (error) {
+      this.running = false;
+      throw error;
     } finally {
       this.actionBoundaryPending = false;
     }
@@ -760,16 +988,35 @@ class AutomationRuntime {
     this.sessionKind = "bounded";
     this.activeSessionId = sessionId;
     this.emit("automation-status", { running: true, paused: false, sessionId });
+    let sequence = 0;
     try {
-      const loop = this.createRuntime(options, sessionId);
-      const result = await loop.run({ execute: options.mode !== "observation", maxActions: options.maxActions ?? null, signal: this.abortController.signal });
-      this.database.endSession(sessionId, result.ok ? "complete" : "failed");
+      const loop = this.createRuntime(options, sessionId, () => ++sequence);
+      let result;
+      try {
+        result = await loop.run({ execute: options.mode !== "observation", maxActions: options.maxActions ?? null, signal: this.abortController.signal });
+      } catch (error) {
+        if (error?.name !== "AbortError") throw error;
+        result = { ok: false, executed: options.mode !== "observation", reason: "aborted", actions: [] };
+      }
+      if (!result.actions?.length && sequence === 0) {
+        this.database.logAction({ sessionId, sequence: ++sequence, type: "boundary", reason: result.reason, ok: result.ok, details: { nextAction: result.nextAction || null } });
+      }
+      this.database.endSession(sessionId, result.reason === "aborted" ? "stopped" : result.ok ? "complete" : "failed");
       return result;
     } catch (error) {
+      this.database.logAction({
+        sessionId,
+        sequence: ++sequence,
+        type: "error",
+        reason: "automation-error",
+        ok: false,
+        details: buildAutomationErrorDetails(error),
+      });
       this.database.endSession(sessionId, "error");
       throw error;
     } finally {
       this.running = false;
+      this.flushDeferredPassiveCatalogState();
       this.abortController = null;
       this.pauseGate.reset();
       this.activeSessionId = null;
@@ -782,7 +1029,8 @@ class AutomationRuntime {
     if (this.activeRunPromise || this.running) {
       return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
     }
-    this.activeRunPromise = this.start(options)
+    this.activeRunPromise = new Promise((resolve) => setImmediate(resolve))
+      .then(() => this.start(options))
       .then((result) => {
         this.emit("automation-complete", { result });
         return result;
@@ -810,7 +1058,7 @@ class AutomationRuntime {
     this.idleSession = new IdleAutomationSession({
       ensureConnection: (signal) => this.connect(signal),
       collectState: (signal) => this.collectState(signal),
-      planState: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }),
+      planState: (state) => buildOptimizationPlanInWorker({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }, { signal: this.abortController?.signal || null }),
       runBoundedSession: ({ signal }) => this.createRuntime(settings, sessionId, () => ++idleSequence).run({ execute: true, maxActions: null, signal }),
       getRuntimeCheckpoint: () => this.runtimeControl?.checkpoint?.() || null,
       reconcileBeforeMutation: (checkpoint, signal) => this.reconcileRuntimeControlForMutation(checkpoint, signal),
@@ -826,10 +1074,19 @@ class AutomationRuntime {
       this.database.endSession(sessionId, result.reason === "aborted" ? "stopped" : result.ok ? "complete" : "failed");
       return result;
     } catch (error) {
+      this.database.logAction({
+        sessionId,
+        sequence: ++idleSequence,
+        type: "error",
+        reason: "automation-error",
+        ok: false,
+        details: buildAutomationErrorDetails(error),
+      });
       this.database.endSession(sessionId, "error");
       throw error;
     } finally {
       this.running = false;
+      this.flushDeferredPassiveCatalogState();
       this.abortController = null;
       this.idleSession = null;
       this.pauseGate.reset();
@@ -841,7 +1098,9 @@ class AutomationRuntime {
 
   startIdleInBackground(options = {}) {
     if (this.activeRunPromise || this.running) return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
-    this.activeRunPromise = this.startIdle(options).then((result) => { this.emit("automation-complete", { result }); return result; })
+    this.activeRunPromise = new Promise((resolve) => setImmediate(resolve))
+      .then(() => this.startIdle(options))
+      .then((result) => { this.emit("automation-complete", { result }); return result; })
       .catch((error) => { this.emit("automation-error", { error: error?.message || String(error) }); return { ok: false, reason: "automation-error", error: error?.message || String(error) }; })
       .finally(() => { this.activeRunPromise = null; });
     return { ok: true, accepted: true, reason: "idle-automation-started" };
@@ -885,4 +1144,4 @@ class AutomationRuntime {
   }
 }
 
-module.exports = { AutomationRuntime, mergeCatalogs, waitForPromiseOrAbort };
+module.exports = { AutomationRuntime, buildOptimizationPlanInWorker, mergeCatalogs, waitForPromiseOrAbort };

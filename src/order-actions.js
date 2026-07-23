@@ -38,8 +38,8 @@ class OrderSubmitter {
     this.evaluateTimeoutMs = Math.max(5000, Number(evaluateTimeoutMs));
   }
 
-  async submit(slot, { execute = false, signal = null } = {}) {
-    const before = await this.collectState(signal);
+  async submit(slot, { execute = false, signal = null, before: knownBefore = null } = {}) {
+    const before = knownBefore || await this.collectState(signal);
     const order = before.orders.find((item) => String(item.slot) === String(slot));
     if (!order) return { ok: false, executed: false, reason: "order_slot_not_found", slot: String(slot), before };
     if (!order.ready) return { ok: false, executed: false, reason: "order_not_ready", order, before };

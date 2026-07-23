@@ -3,6 +3,90 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { OrderCoinLoop } = require("../src/order-coin-loop");
+const { BOARD_CONTROL_STATE_EXPRESSION, BoardAutomationRunner } = require("../src/board-runner");
+
+test("订单循环首步复用调用方提供的实时状态", async () => {
+  const initialState = { resources: { energy: 10 }, board: { empty: 3, mergeCandidates: [] }, orders: [] };
+  let collections = 0;
+  const loop = new OrderCoinLoop({
+    collectState: async () => { collections += 1; throw new Error("first step must reuse initial state"); },
+    planOrders: async () => ({ plans: [], recommended: null, boundaryReason: "no-feasible-order", warehouseStoreCandidates: [] }),
+    runBoardAction: async () => ({ ok: true }),
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, initialState });
+
+  assert.equal(result.reason, "waiting-no-feasible-order");
+  assert.equal(collections, 0);
+});
+
+test("可执行棋盘合成优先于无关的仓库库存加载请求", async () => {
+  const state = {
+    resources: { energy: 10 },
+    warehouse: { inventoryKnowledge: { status: "unknown" } },
+    board: { empty: 3, mergeCandidates: [{ from: 1, to: 2 }], grids: [] },
+    orders: [{ slot: "a", ready: false }],
+  };
+  const target = {
+    slot: "a",
+    feasible: true,
+    actionable: true,
+    nextAction: { type: "merge", from: 1, to: 2 },
+    boardSpaceFeasibility: { feasible: true },
+  };
+  let inventoryLoads = 0;
+  let boardActions = 0;
+  const loop = new OrderCoinLoop({
+    collectState: async () => state,
+    planOrders: async () => ({
+      plans: [target],
+      recommended: target,
+      warehouseInventoryLoadRequired: true,
+      warehouseLoadRequest: { itemIds: ["unrelated"] },
+    }),
+    loadWarehouseInventory: async () => { inventoryLoads += 1; throw new Error("board action must win"); },
+    runBoardAction: async () => {
+      boardActions += 1;
+      return { ok: true, actions: [{ type: "merge", from: 1, to: 2 }], stopReason: "max_actions_reached" };
+    },
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 1 });
+
+  assert.equal(inventoryLoads, 0);
+  assert.equal(boardActions, 1);
+  assert.equal(result.actions[0].type, "merge");
+});
+
+test("规划期间收到暂停后会在棋盘动作执行前等待恢复", async () => {
+  const state = {
+    resources: { energy: 10 },
+    board: { empty: 3, mergeCandidates: [{ from: 1, to: 2 }], grids: [] },
+    orders: [{ slot: "a", ready: false }],
+  };
+  const target = { slot: "a", feasible: true, actionable: true, nextAction: { type: "merge", from: 1, to: 2 }, boardSpaceFeasibility: { feasible: true } };
+  let releasePause;
+  let boardActions = 0;
+  const loop = new OrderCoinLoop({
+    collectState: async () => state,
+    planOrders: async () => ({ plans: [target], recommended: target }),
+    waitIfPaused: async () => new Promise((resolve) => { releasePause = resolve; }),
+    runBoardAction: async () => {
+      boardActions += 1;
+      return { ok: true, actions: [{ type: "merge" }], stopReason: "max_actions_reached" };
+    },
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const running = loop.run({ execute: true, maxActions: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(boardActions, 0);
+  releasePause();
+  await running;
+  assert.equal(boardActions, 1);
+});
 
 test("订单金币循环在每个棋盘动作后重规划并在订单满足后提交", async () => {
   let reads = 0;
@@ -312,4 +396,153 @@ test("verified production-mode switch replans while failed switch stops before p
   assert.equal(result.reason, "production-mode-switch-not-observed");
   assert.equal(switches, 1);
   assert.equal(productions, 0);
+});
+
+test("连续棋盘动作使用已确认的轻量状态重规划而不重复全量采集", async () => {
+  let collections = 0;
+  const plannedSignatures = [];
+  const initial = { resources: { energy: 10 }, board: { empty: 2, signature: "p||", mergeCandidates: [] }, orders: [{ slot: "a", ready: false }] };
+  const loop = new OrderCoinLoop({
+    collectState: async () => { collections += 1; return initial; },
+    reconcileBoardState: (before, observed) => ({ ...before, board: { ...before.board, ...observed } }),
+    planOrders: async (current) => {
+      plannedSignatures.push(current.board.signature);
+      const producer = current.board.signature === "p||" ? 0 : 1;
+      const target = { slot: "a", feasible: true, actionable: true, ready: false, nextAction: { type: "produce", producer }, boardSpaceFeasibility: { feasible: true }, producerSteps: [{ gridIndex: producer }] };
+      return { plans: [target], recommended: target };
+    },
+    runBoardAction: async ({ producer }) => ({
+      ok: true,
+      actions: [{ type: "produce", producer, verified: true }],
+      stopReason: "max_actions_reached",
+      observedState: { signature: producer === 0 ? "p|a|" : "p|a|b", empty: producer === 0 ? 1 : 0, mergeCandidates: [] },
+    }),
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 2 });
+
+  assert.equal(result.ok, true);
+  assert.equal(collections, 1);
+  assert.deepEqual(plannedSignatures, ["p||", "p|a|"]);
+});
+
+test("动作确认后的重规划超过一秒仍继续发送下一次输入", async () => {
+  let clock = 0;
+  let boardActions = 0;
+  let timeouts = 0;
+  const state = { resources: { energy: 10 }, board: { empty: 3, signature: "p|||", mergeCandidates: [] }, orders: [{ slot: "a", ready: false }] };
+  const loop = new OrderCoinLoop({
+    now: () => clock,
+    actionIntervalBudgetMs: 1000,
+    collectState: async () => state,
+    reconcileBoardState: (before, observed) => ({ ...before, board: { ...before.board, ...observed } }),
+    planOrders: async () => {
+      if (boardActions > 0) clock += 1001;
+      const target = { slot: "a", feasible: true, actionable: true, nextAction: { type: "produce", producer: 0 }, boardSpaceFeasibility: { feasible: true }, producerSteps: [{ gridIndex: 0 }] };
+      return { plans: [target], recommended: target };
+    },
+    runBoardAction: async () => {
+      boardActions += 1;
+      return { ok: true, actions: [{ type: "produce", verified: true }], stopReason: "max_actions_reached", observedState: { signature: "p|a||", empty: 2, mergeCandidates: [] } };
+    },
+    onActionTimeout: async ({ reason, timing }) => {
+      timeouts += 1;
+      assert.equal(reason, "action_interval_timeout");
+      assert.equal(timing.stage, "replan");
+    },
+    waitIfPaused: async () => {},
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 2 });
+
+  assert.equal(result.reason, "max-actions-reached");
+  assert.equal(timeouts, 0);
+  assert.equal(boardActions, 2);
+});
+
+test("规划器错误直接上抛且不会误触发暂停", async () => {
+  let boardActions = 0;
+  let timeouts = 0;
+  const timeout = Object.assign(new Error("planning timeout"), { code: "PLANNING_TIMEOUT", timing: { stage: "replan", elapsedMs: 1000, budgetMs: 1000 } });
+  const loop = new OrderCoinLoop({
+    collectState: async () => ({ resources: { energy: 10 }, board: { empty: 3, mergeCandidates: [] }, orders: [] }),
+    planOrders: async () => { throw timeout; },
+    runBoardAction: async () => { boardActions += 1; return { ok: true, actions: [] }; },
+    submitOrder: async () => ({ ok: true }),
+    onActionTimeout: async ({ reason, timing }) => {
+      timeouts += 1;
+      assert.equal(reason, "action_interval_timeout");
+      assert.equal(timing.budgetMs, 1000);
+    },
+    waitIfPaused: async () => {},
+  });
+  await assert.rejects(loop.run({ execute: true, maxActions: 1 }), (error) => error === timeout);
+  assert.equal(timeouts, 0);
+  assert.equal(boardActions, 0);
+});
+
+test("非目标订单已满足时继续执行锁定目标的棋盘动作而不在 order_ready 边界空转", async () => {
+  const readyOtherOrder = [{ slot: "b", items: [{ itemId: "b1" }] }];
+  const boardStates = [
+    {
+      ok: true,
+      boardVisible: true,
+      signature: "p||",
+      empty: 2,
+      grids: [{ index: 0, itemId: "p", empty: false }, { index: 1, itemId: "", empty: true }, { index: 2, itemId: "", empty: true }],
+      readyOrders: readyOtherOrder,
+      mergeCandidates: [],
+      producers: [{ index: 0, itemId: "p", produceCount: 10, energyCost: 1 }],
+    },
+    {
+      ok: true,
+      boardVisible: true,
+      signature: "p|a1|",
+      empty: 1,
+      grids: [{ index: 0, itemId: "p", empty: false }, { index: 1, itemId: "a1", empty: false }, { index: 2, itemId: "", empty: true }],
+      readyOrders: readyOtherOrder,
+      mergeCandidates: [],
+      producers: [{ index: 0, itemId: "p", produceCount: 9, energyCost: 1 }],
+    },
+  ];
+  const client = {
+    producerTouches: 0,
+    async evaluate(expression) {
+      if (expression === BOARD_CONTROL_STATE_EXPRESSION) return boardStates.shift();
+      if (expression.includes('type: "producer-touch"')) {
+        this.producerTouches += 1;
+        return { ok: true, type: "producer-touch" };
+      }
+      throw new Error("unexpected expression");
+    },
+  };
+  const runner = new BoardAutomationRunner({ client, contextId: 7, delayMs: 50 });
+  runner.waitForSettle = async () => {};
+  const target = {
+    slot: "a",
+    feasible: true,
+    actionable: true,
+    ready: false,
+    nextAction: { type: "produce", producer: 0 },
+    boardSpaceFeasibility: { feasible: true },
+    producerSteps: [{ gridIndex: 0 }],
+  };
+  const loop = new OrderCoinLoop({
+    collectState: async () => ({
+      resources: { energy: 10 },
+      board: { empty: 2, signature: "p||", mergeCandidates: [] },
+      orders: [{ slot: "a", ready: false }, { slot: "b", ready: true }],
+    }),
+    planOrders: async () => ({ plans: [target], recommended: target }),
+    runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }),
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 1 });
+
+  assert.equal(client.producerTouches, 1);
+  assert.equal(result.actions[0].type, "produce");
+  assert.equal(result.actions[0].reason, "max_actions_reached");
 });
