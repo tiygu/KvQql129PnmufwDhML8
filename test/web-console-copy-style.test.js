@@ -85,6 +85,58 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, /setSelectedKey\(nextReviewKey\)/);
 });
 
+test("图鉴审核默认只展示领域摘要，原始数据和完整历史收进只读技术详情", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const defaultDetail = source.slice(
+    source.indexOf('<div className="human-review-reason">'),
+    source.indexOf('<details className="technical-review-details'),
+  );
+  const technicalDetail = source.slice(
+    source.indexOf('<details className="technical-review-details'),
+    source.indexOf("</details>", source.indexOf('<details className="technical-review-details')) + "</details>".length,
+  );
+
+  assert.match(defaultDetail, /证据摘要/);
+  assert.match(defaultDetail, /有意义的差异/);
+  assert.doesNotMatch(defaultDetail, /objectId|assetHash|sourceRef|rankScore|完整对象 JSON|rulingHistory|transitions|versions/);
+  assert.match(technicalDetail, /只读技术详情/);
+  assert.match(technicalDetail, /完整对象 JSON/);
+  assert.match(technicalDetail, /readOnly/);
+  assert.doesNotMatch(technicalDetail, /onChange=\{\(event\) => setObjectDraft/);
+  assert.match(technicalDetail, /内部对象标识/);
+  assert.match(technicalDetail, /完整证据历史/);
+  assert.match(technicalDetail, /对象演变/);
+});
+
+test("图鉴审核展示以后再看集合，并从规划结果与版本基线生成人话解释", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const reasonBody = source.slice(source.indexOf("function humanReadableReason"), source.indexOf("function parseObjectDraft"));
+  const differenceBody = source.slice(source.indexOf("function meaningfulDifferences"), source.indexOf("function humanReadableReason"));
+
+  assert.match(source, /repository\?\.laterQueue/);
+  assert.match(source, />以后再看</);
+  assert.match(source, /不影响当前规划/);
+  assert.match(reasonBody, /reviewResolution\?\.planningResult/);
+  assert.match(reasonBody, /planning-recovery-pending/);
+  assert.match(differenceBody, /reviewCandidateSnapshot\(detail\)/);
+  assert.match(differenceBody, /reviewBaselineSnapshot\(detail\)/);
+  assert.doesNotMatch(differenceBody, /JSON\.stringify\(oldValue/);
+});
+
+test("图鉴差异使用冲突证据候选，产出档案展示实际领域字段", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const candidateBody = source.slice(source.indexOf("function reviewCandidate"), source.indexOf("function meaningfulDifferences"));
+  const fieldMap = source.slice(source.indexOf("const domainFieldOrder"), source.indexOf("function domainFields"));
+
+  assert.match(candidateBody, /evidence-conflict/);
+  assert.match(candidateBody, /detail\?\.evidence/);
+  assert.match(candidateBody, /evidence\.disposition === "eligible"/);
+  assert.match(candidateBody, /display\(evidence\.payload\) !== display\(baseline\)/);
+  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"energyCost"/);
+  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"theoreticalDistribution"/);
+  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"observedDistribution"/);
+});
+
 test("图鉴证据风险入口直接定位第一个真实阻塞项", () => {
   const source = read("web/src/App.tsx");
   assert.match(source, /const evidenceReviewTarget = [\s\S]*blocker\.reviewTarget/);

@@ -346,6 +346,7 @@ class AutomationRuntime {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
       repository.reviewQueue = this.database.getCatalogReviewQueue();
+      repository.laterQueue = this.database.getCatalogCompletenessQueue();
       repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
       repository.uncertainProductionActions = this.database.listUncertainProductionActions();
     }

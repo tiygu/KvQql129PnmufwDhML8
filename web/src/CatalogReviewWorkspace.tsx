@@ -84,20 +84,75 @@ function display(value: any) {
   return JSON.stringify(value);
 }
 
-function catalogObjectTitle(detail: any) {
+function catalogObjectTitle(detail: any, summary: any) {
+  if (summary?.displayTitle) return summary.displayTitle;
   const value = detail?.effectiveValue || detail?.algorithmCandidate || {};
-  const confirmedName = detail?.humanValues?.name?.value;
+  const confirmedName = ["name", "displayName", "title", "description", "descriptionKey"]
+    .map((field) => detail?.humanValues?.[field]?.value)
+    .find((candidate) => String(candidate || "").trim());
   const candidateName = confirmedName || value.name || value.displayName || value.title || value.description || value.descriptionKey;
   if (String(candidateName || "").trim()) return confirmedName ? String(candidateName).trim() : `疑似“${String(candidateName).trim()}”`;
   const level = Number(value.level);
   return Number.isFinite(level) && level > 0 ? `未命名物品（第 ${level} 级）` : "未命名物品";
 }
 
+const domainFieldOrder: Record<string, string[]> = {
+  "item-identity": ["name", "displayName", "descriptionKey", "level", "type", "iconResourceIdentifier", "saleValue"],
+  "merge-relation": ["level", "mergeTarget", "requiredCount"],
+  "production-profile": ["level", "energyCost", "theoreticalDistribution", "observedDistribution", "candidateOutputs", "productionModes"],
+  "production-mode": ["energyCost", "outputs", "unlocked", "switchEntry"],
+};
+
+function domainFields(detail: any) {
+  const available = new Set([
+    ...Object.keys(detail?.candidateVersion?.payload || {}),
+    ...Object.keys(detail?.algorithmCandidate || {}),
+    ...Object.keys(detail?.effectiveValue || {}),
+    ...Object.keys(detail?.humanValues || {}),
+  ]);
+  return (domainFieldOrder[detail?.objectType] || []).filter((field) => available.has(field));
+}
+
+function reviewBaselineSnapshot(detail: any) {
+  const hasEvidenceConflict = (detail?.reviewReasons || []).some((reason: any) => reason.type === "evidence-conflict");
+  if (detail?.candidateVersion) return detail?.activeVersion?.payload || {};
+  if (hasEvidenceConflict) return detail?.effectiveValue || detail?.activeVersion?.payload || {};
+  if (Object.keys(detail?.humanValues || {}).length) return detail?.effectiveValue || {};
+  return {};
+}
+
+function reviewCandidateSnapshot(detail: any) {
+  const hasEvidenceConflict = (detail?.reviewReasons || []).some((reason: any) => reason.type === "evidence-conflict");
+  if (hasEvidenceConflict) {
+    const baseline = reviewBaselineSnapshot(detail);
+    const conflictingEvidence = (detail?.evidence || []).find((evidence: any) =>
+      evidence.disposition === "eligible" && display(evidence.payload) !== display(baseline));
+    if (conflictingEvidence?.payload) return conflictingEvidence.payload;
+  }
+  return detail?.candidateVersion?.payload || detail?.algorithmCandidate || {};
+}
+
+function meaningfulDifferences(detail: any, fields: string[]) {
+  const candidate = reviewCandidateSnapshot(detail);
+  const baseline = reviewBaselineSnapshot(detail);
+  return fields.flatMap((field) => {
+    const oldValue = baseline[field];
+    const newValue = candidate[field];
+    return display(oldValue ?? null) === display(newValue ?? null)
+      ? []
+      : [{ field, oldValue, newValue }];
+  });
+}
+
 function humanReadableReason(detail: any) {
+  const planningResult = detail?.reviewResolution?.planningResult;
+  if (planningResult && planningResult.recovered !== true) return reviewReasonMetadata["planning-recovery-pending"].explanation;
   const reasons = detail?.reviewReasons || [];
   const priority = ["planning-recovery-pending", "evidence-conflict", "human-ruling-conflict", "inference-change", "new-observation"];
   const reason = priority.find((type) => reasons.some((entry: any) => entry.type === type));
-  return reviewReasonMetadata[reason || "new-observation"].explanation;
+  if (reason) return reviewReasonMetadata[reason].explanation;
+  if (detail?.completenessGaps?.length) return reviewReasonMetadata["icon-gap"].explanation;
+  return reviewReasonMetadata["new-observation"].explanation;
 }
 
 function parseObjectDraft(value: string) {
@@ -117,6 +172,7 @@ function markIconSelected(value: any, candidateId: number) {
 
 export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: (catalog?: any) => void | Promise<void>; focusObject?: { objectType: string; objectId: string } | null }) {
   const queue = repository?.reviewQueue || [];
+  const laterQueue = repository?.laterQueue || [];
   const objects = repository?.objects || [];
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
@@ -134,11 +190,11 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
 
   const selectedSummary = useMemo(() => {
-    const queuedKeys = new Set(queue.map((item: any) => `${item.objectType}:${item.objectId}`));
-    const candidates = [...queue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
+    const queuedKeys = new Set([...queue, ...laterQueue].map((item: any) => `${item.objectType}:${item.objectId}`));
+    const candidates = [...queue, ...laterQueue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
     if (!selectedKey) return null;
     return candidates.find((item: any) => `${item.objectType}:${item.objectId}` === selectedKey) || null;
-  }, [objects, queue, selectedKey]);
+  }, [laterQueue, objects, queue, selectedKey]);
 
   const loadDetail = async (summary = selectedSummary) => {
     const requestId = ++detailRequestId.current;
@@ -150,7 +206,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       const value = await controlApi.getCatalogObject(summary.objectType, summary.objectId);
       if (requestId !== detailRequestId.current) return;
       setDetail(value);
-      setObjectDraft(JSON.stringify(value.algorithmCandidate || value.effectiveValue || {}, null, 2));
+      setObjectDraft(JSON.stringify(value.candidateVersion?.payload || value.algorithmCandidate || value.effectiveValue || {}, null, 2));
     } catch (error: any) {
       if (requestId !== detailRequestId.current) return;
       setLoadError(error.message || "审核对象加载失败");
@@ -173,13 +229,16 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
     ...Object.keys(detail?.effectiveValue || {}),
     ...Object.keys(detail?.humanValues || {}),
   ])).sort(), [detail]);
+  const visibleFields = useMemo(() => domainFields(detail), [detail]);
+  const reviewCandidate = useMemo(() => reviewCandidateSnapshot(detail), [detail]);
+  const visibleDifferences = useMemo(() => meaningfulDifferences(detail, visibleFields), [detail, visibleFields]);
 
   const completeReview = async (decision: "confirm" | "modify") => {
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     setBusy(true);
     try {
       const snapshot = decision === "confirm"
-        ? structuredClone(detail.algorithmCandidate || {})
+        ? structuredClone(reviewCandidate)
         : parseObjectDraft(objectDraft);
       const requestKey = `${detail.objectType}:${detail.objectId}:${detail.revision}:${decision}:${JSON.stringify(snapshot)}`;
       if (completionRequest.current?.key !== requestKey) {
@@ -196,7 +255,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       });
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
-      setObjectDraft(JSON.stringify(updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
+      setObjectDraft(JSON.stringify(updated.candidateVersion?.payload || updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
       setNote("");
       completionRequest.current = null;
       const planningRecovered = updated.reviewResolution?.planningResult?.recovered === true;
@@ -336,31 +395,75 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   return <>
     {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
     <section className="catalog-review-workspace">
-    <div className="panel review-queue">
-      <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
-      <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补不占用审核队列，也不阻止规划。</p>
-      <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
-        <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus || "需要处理"}</small></span>
-        <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reviewReasonMetadata[reason.type]?.label || reason.type}</i>)}</span>
-      </button>) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
-    </div>
-    <div className="panel review-detail">
-      {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{latestAuditSummary.actor} 已{latestAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{latestAuditSummary.displayTitle}” · {latestAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
-      {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
-        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail)}</h2><small>{valueLabel(detail.objectType)} · 需要处理</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
-        <div className="human-review-reason"><AlertTriangle size={18}/><div><strong>为什么需要处理</strong><p>{humanReadableReason(detail)}</p></div></div>
-        {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt={`${detail.objectId} icon`} onClick={() => setLightboxSrc(detail.selectedIcon.url)}/> : <Image/>}<div><strong>{detail.selectedIcon ? "精确运行时图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.assetHash} · ${detail.selectedIcon.width}×${detail.selectedIcon.height}` : "缺失仅影响视觉核对，不影响其他 Active 字段参与规划"}</span></div></div>}
-        {detail.objectType === "item-identity" && <div className="icon-candidate-review">
-          <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>资源、截图和上传证据都会保留，可随时复核。</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
-          <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${candidate.id}`} onClick={() => setLightboxSrc(candidate.url)}/><div><strong>{valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} / {new Date(candidate.createdAt).toLocaleString()}</span><span className="candidate-hash">{candidate.assetHash}</span>{candidate.resourceUrl && <span className="candidate-hash">资源地址：{candidate.resourceUrl}</span>}<span>裁剪：{candidate.crop?.pixelCrop ? `${candidate.crop.pixelCrop.x},${candidate.crop.pixelCrop.y} ${candidate.crop.pixelCrop.width}×${candidate.crop.pixelCrop.height}` : candidate.crop?.rect ? `${candidate.crop.rect.x},${candidate.crop.rect.y} ${candidate.crop.rect.width}×${candidate.crop.rect.height}` : "完整图像"}</span>{candidate.similarity?.frameSelection && <span>稳定帧：{candidate.similarity.frameSelection.acceptedFrameIndexes.length}/{candidate.similarity.frameSelection.frameHashes.length} / {valueLabel(candidate.similarity.frameSelection.reason)}</span>}{candidate.similarity?.comparisons?.[0] && <span>最佳匹配：{(candidate.similarity.comparisons[0].composite * 100).toFixed(1)}% / 感知 {(candidate.similarity.comparisons[0].metrics.perceptualHash * 100).toFixed(0)} / 结构 {(candidate.similarity.comparisons[0].metrics.structure * 100).toFixed(0)} / 色彩 {(candidate.similarity.comparisons[0].metrics.colorHistogram * 100).toFixed(0)} / 轮廓 {(candidate.similarity.comparisons[0].metrics.transparentContour * 100).toFixed(0)}</span>}</div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
-          {detail.iconSelectionHistory?.length > 0 && <div className="icon-selection-history"><h4>图标选择历史</h4>{[...detail.iconSelectionHistory].reverse().map((entry: any) => <p key={entry.id}><strong>{valueLabel(entry.action)}</strong><span>{entry.actor} / {new Date(entry.createdAt).toLocaleString()} / {entry.assetHash || "未选择"} / {entry.note}</span></p>)}</div>}
-        </div>}
-        {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reviewReasonMetadata[reason.type]?.label || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
-        {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>数据待补：物品图标</strong><span>这属于完整性缺口，不影响本次语义审核完成，也不影响已生效字段参与规划。</span></div></div>}
-        <div className="candidate-snapshot"><h3>本次将确认的完整候选</h3><div className="candidate-facts">{fields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(detail.algorithmCandidate?.[field])}</strong></div>)}</div></div>
-        <div className="ruling-editor object-review-editor"><div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交上方完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></div>{message && <p className="review-message" role="status">{message}</p>}{detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}<details className="technical-review-details wide"><summary>技术详情</summary><label className="wide"><span>完整对象 JSON</span><textarea value={objectDraft} onChange={(event) => setObjectDraft(event.target.value)} spellCheck={false}/></label><div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div></details></div>
-        <div className="review-evidence"><div><h3>证据来源与处置</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{valueLabel(evidence.sourceType)}</strong><span>{valueLabel(evidence.sourceRef || "runtime")} · {evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span>{display(evidence.payload)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div><div><h3>裁决历史</h3>{detail.rulingHistory?.length ? [...detail.rulingHistory].reverse().map((ruling: any) => <p key={ruling.id}><strong>{ruling.fieldPath} · {valueLabel(ruling.decision)}</strong><span>{ruling.actor} · {new Date(ruling.createdAt).toLocaleString()} · {display(ruling.oldValue)} → {display(ruling.newValue)} · {ruling.note}</span></p>) : <p><span>暂无人工裁决</span></p>}</div><div><h3>对象演变</h3>{[...(detail.transitions || [])].reverse().map((transition: any) => <p key={`transition-${transition.id}`}><strong>{valueLabel(transition.fromStatus)} → {valueLabel(transition.toStatus)}</strong><span>{new Date(transition.createdAt).toLocaleString()} · {valueLabel(transition.fromDisposition)} → {valueLabel(transition.toDisposition)} · {valueLabel(transition.reason)}</span></p>)}{[...(detail.versions || [])].reverse().map((version: any) => <p key={`version-${version.id}`}><strong>版本 {version.version} · {valueLabel(version.status)}</strong><span>{new Date(version.createdAt).toLocaleString()} · {valueLabel(version.origin)} · {display(version.payload)}</span></p>)}</div></div>
-      </>}
-    </div>
-  </section></>;
+      <div className="panel review-queue">
+        <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
+        <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补等完整性缺口放在“以后再看”，不影响当前规划。</p>
+        <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
+          <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus || "需要处理"}</small></span>
+          <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reviewReasonMetadata[reason.type]?.label || reason.type}</i>)}</span>
+        </button>) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
+        <details className="later-review-queue">
+          <summary><span>以后再看</span><b>{laterQueue.length}</b></summary>
+          <p>这里只收纳不影响当前规划的完整性缺口。</p>
+          <div className="review-queue-list">{laterQueue.length ? laterQueue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
+            <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus}</small></span>
+            <span className="reason-chips">{entry.gaps.map((gap: any, index: number) => <i className={gap.type} key={`${gap.type}-${index}`}>{reviewReasonMetadata[gap.type]?.label || gap.type}</i>)}</span>
+          </button>) : <div className="empty-state compact"><Check/><span>当前没有待补对象</span></div>}</div>
+        </details>
+      </div>
+      <div className="panel review-detail">
+        {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{latestAuditSummary.actor} 已{latestAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{latestAuditSummary.displayTitle}” · {latestAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
+        {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
+          <div className="panel-head">
+            <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
+            <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div>
+          </div>
+          <div className="human-review-reason"><AlertTriangle size={18}/><div><strong>{selectedSummary?.actionStatus === "以后再看" ? "为什么以后再看" : "为什么需要处理"}</strong><p>{humanReadableReason(detail)}</p></div></div>
+          <div className="review-evidence-summary">
+            <div><strong>证据摘要</strong><span>{detail.evidenceSummary?.evidenceCount || 0} 个来源记录 · {detail.evidenceSummary?.observationCount || 0} 次观测</span></div>
+            <div className="reason-chips">{[...new Set((detail.evidenceSummary?.sources || []).map((source: any) => valueLabel(source.sourceType)))].map((source) => <i key={String(source)}>{String(source)}</i>)}</div>
+          </div>
+          {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt="物品展示图标" onClick={() => setLightboxSrc(detail.selectedIcon.url)}/> : <Image/>}<div><strong>{detail.selectedIcon ? "已取得真实图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.width}×${detail.selectedIcon.height}，可用于区分同名对象` : "缺失仅影响视觉核对，不影响已生效字段参与规划"}</span></div></div>}
+          {detail.objectType === "item-identity" && <div className="icon-candidate-review">
+            <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>通过真实图标区分同名对象；识别评分和资源标识收在只读技术详情中。</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
+            <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any, index: number) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${index + 1}`} onClick={() => setLightboxSrc(candidate.url)}/><div><strong>候选 {index + 1} · {valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} · {new Date(candidate.createdAt).toLocaleString()}</span></div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
+          </div>}
+          {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reviewReasonMetadata[reason.type]?.label || reason.type}{reason.fieldPath && visibleFields.includes(reason.fieldPath) ? ` · ${fieldLabel(reason.fieldPath)}` : ""}</span>)}</div>}
+          {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>以后再看：物品图标</strong><span>这属于完整性缺口，不进入主阻塞队列，不影响本次语义审核或当前规划。</span></div></div>}
+          <div className="candidate-snapshot">
+            <h3>本次将确认的完整候选</h3>
+            <div className="candidate-facts">{visibleFields.length ? visibleFields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(reviewCandidate[field])}</strong></div>) : <p>当前候选没有需要操作者核对的领域字段。</p>}</div>
+          </div>
+          <div className="meaningful-differences">
+            <h3>有意义的差异</h3>
+            {visibleDifferences.length ? visibleDifferences.map((difference) => <p key={difference.field}><strong>{fieldLabel(difference.field)}</strong><span>{display(difference.oldValue)} → {display(difference.newValue)}</span></p>) : <p>候选与当前生效的领域信息一致；本次只需确认语义审核原因。</p>}
+          </div>
+          {selectedSummary?.actionStatus !== "以后再看" && <div className="ruling-editor object-review-editor">
+            <div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div>
+            <label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label>
+            <label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label>
+            <div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></div>
+            {message && <p className="review-message" role="status">{message}</p>}
+            {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
+          </div>}
+          <details className="technical-review-details">
+            <summary>只读技术详情</summary>
+            <div className="technical-identity"><strong>内部对象标识</strong><code>{detail.objectType}/{detail.objectId}</code></div>
+            <label><span>完整对象 JSON</span><textarea value={objectDraft} readOnly spellCheck={false}/></label>
+            <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
+            <div className="technical-history-grid">
+              <div><h3>完整证据历史</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{valueLabel(evidence.sourceType)} · {valueLabel(evidence.disposition)}</strong><span>{valueLabel(evidence.sourceRef || "runtime")} · {evidence.observationCount} 次</span><code>{display(evidence.payload)}</code></p>)}</div>
+              <div><h3>裁决历史</h3>{detail.rulingHistory?.length ? [...detail.rulingHistory].reverse().map((ruling: any) => <p key={ruling.id}><strong>{ruling.fieldPath} · {valueLabel(ruling.decision)}</strong><span>{ruling.actor} · {new Date(ruling.createdAt).toLocaleString()} · {display(ruling.oldValue)} → {display(ruling.newValue)} · {ruling.note}</span></p>) : <p><span>暂无人工裁决</span></p>}</div>
+              <div><h3>对象演变</h3>{[...(detail.transitions || [])].reverse().map((transition: any) => <p key={`transition-${transition.id}`}><strong>{valueLabel(transition.fromStatus)} → {valueLabel(transition.toStatus)}</strong><span>{new Date(transition.createdAt).toLocaleString()} · {valueLabel(transition.fromDisposition)} → {valueLabel(transition.toDisposition)} · {valueLabel(transition.reason)}</span></p>)}{[...(detail.versions || [])].reverse().map((version: any) => <p key={`version-${version.id}`}><strong>版本 {version.version} · {valueLabel(version.status)}</strong><span>{new Date(version.createdAt).toLocaleString()} · {valueLabel(version.origin)}</span><code>{display(version.payload)}</code></p>)}</div>
+              {detail.objectType === "item-identity" && <div><h3>图标识别技术记录</h3>{detail.iconCandidates?.map((candidate: any) => <p key={candidate.id}><code>{display(candidate)}</code></p>)}{detail.iconSelectionHistory?.map((entry: any) => <p key={entry.id}><code>{display(entry)}</code></p>)}</div>}
+            </div>
+          </details>
+          <details className="advanced-review-actions">
+            <summary>高级诊断与证据处置</summary>
+            <div className="review-evidence"><div><h3>证据采用与否决</h3>{detail.evidence?.map((evidence: any, index: number) => <p key={evidence.id}><strong>证据 {index + 1} · {valueLabel(evidence.sourceType)}</strong><span>{evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div></div>
+          </details>
+        </>}
+      </div>
+    </section>
+  </>;
 }

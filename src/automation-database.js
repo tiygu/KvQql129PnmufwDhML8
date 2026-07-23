@@ -70,10 +70,74 @@ function validateCatalogReviewPayload(identity, payload) {
 
 function catalogDisplayTitle(payload) {
   const value = payload || {};
-  const name = value.name || value.displayName || value.title || value.description || value.descriptionKey;
+  const name = catalogTitleValue(value);
   if (String(name || "").trim()) return String(name).trim();
   const level = Number(value.level);
   return Number.isFinite(level) && level > 0 ? `未命名物品（第 ${level} 级）` : "未命名物品";
+}
+
+const CATALOG_TITLE_FIELDS = ["name", "displayName", "title", "description", "descriptionKey"];
+
+function catalogTitleValue(payload) {
+  return CATALOG_TITLE_FIELDS.map((field) => payload?.[field]).find((value) => String(value || "").trim()) || null;
+}
+
+function catalogReviewTitle({ candidatePayload, evidencePayload, humanValues, activeVersion }) {
+  const humanTitle = CATALOG_TITLE_FIELDS
+    .map((field) => humanValues instanceof Map ? humanValues.get(field)?.value : humanValues?.[field]?.value)
+    .find((value) => String(value || "").trim()) || null;
+  const confirmedSnapshotTitle = activeVersion?.origin === "user" ? catalogTitleValue(activeVersion.payload) : null;
+  const candidateTitle = catalogTitleValue(candidatePayload) || catalogTitleValue(evidencePayload);
+  const title = String(humanTitle || confirmedSnapshotTitle || candidateTitle || "").trim();
+  const level = Number(candidatePayload?.level ?? evidencePayload?.level ?? activeVersion?.payload?.level);
+  if (title) {
+    const confirmed = humanTitle || confirmedSnapshotTitle;
+    return {
+      titleKey: title,
+      displayTitle: confirmed ? title : `疑似“${title}”`,
+      level: Number.isFinite(level) && level > 0 ? level : null,
+    };
+  }
+  const displayTitle = Number.isFinite(level) && level > 0 ? `未命名物品（第 ${level} 级）` : "未命名物品";
+  return { titleKey: displayTitle, displayTitle, level: Number.isFinite(level) && level > 0 ? level : null };
+}
+
+function disambiguateCatalogTitles(entries) {
+  const titleGroups = new Map();
+  for (const entry of entries) {
+    if (!titleGroups.has(entry.titleKey)) titleGroups.set(entry.titleKey, []);
+    titleGroups.get(entry.titleKey).push(entry);
+  }
+  const chainPositions = new Map();
+  for (const group of titleGroups.values()) {
+    const byLevel = new Map();
+    for (const entry of group) {
+      const levelKey = entry.level == null ? "unknown" : String(entry.level);
+      if (!byLevel.has(levelKey)) byLevel.set(levelKey, []);
+      byLevel.get(levelKey).push(entry);
+    }
+    for (const levelGroup of byLevel.values()) {
+      if (levelGroup.length < 2) continue;
+      levelGroup.sort((left, right) => `${left.objectType}:${left.objectId}`.localeCompare(`${right.objectType}:${right.objectId}`));
+      levelGroup.forEach((entry, index) => chainPositions.set(`${entry.objectType}:${entry.objectId}`, {
+        position: index + 1,
+        count: levelGroup.length,
+      }));
+    }
+  }
+  return entries.map(({ titleKey, level, ...entry }) => ({
+    ...entry,
+    displayTitle: (() => {
+      const sameTitle = titleGroups.get(titleKey).length > 1;
+      if (!sameTitle) return entry.displayTitle;
+      const chainPosition = chainPositions.get(`${entry.objectType}:${entry.objectId}`);
+      if (chainPosition) {
+        const levelText = level == null ? "" : `第 ${level} 级 · `;
+        return `${entry.displayTitle}（${levelText}链位置 ${chainPosition.position}/${chainPosition.count}）`;
+      }
+      return level != null ? `${entry.displayTitle}（第 ${level} 级）` : entry.displayTitle;
+    })(),
+  }));
 }
 
 function meaningfulCatalogDifferences(before, after) {
@@ -957,9 +1021,13 @@ class AutomationDatabase {
       if (!conflictsByObject.has(key)) conflictsByObject.set(key, []);
       conflictsByObject.get(key).push(conflict);
     }
-    const versions = this.db.prepare("SELECT id,object_id,version,payload_json FROM catalog_repository_versions ORDER BY object_id,version").all();
+    const versions = this.db.prepare("SELECT id,object_id,version,origin,payload_json FROM catalog_repository_versions ORDER BY object_id,version").all();
     const versionById = new Map(versions.map((version) => [Number(version.id), version]));
     const latestVersionByObject = new Map(versions.map((version) => [Number(version.object_id), version]));
+    const latestEvidenceByObject = new Map();
+    for (const evidence of this.db.prepare("SELECT object_id,payload_json FROM catalog_repository_evidence ORDER BY id").all()) {
+      latestEvidenceByObject.set(Number(evidence.object_id), parseJson(evidence.payload_json) || {});
+    }
     const activeRulingsByObject = new Map();
     for (const ruling of this.db.prepare("SELECT * FROM catalog_repository_rulings ORDER BY object_id,id").all()) {
       const objectId = Number(ruling.object_id);
@@ -973,7 +1041,7 @@ class AutomationDatabase {
       const objectId = Number(resolution.object_id);
       if (!latestResolutionByObject.has(objectId)) latestResolutionByObject.set(objectId, parseJson(resolution.planning_result_json));
     }
-    return rows.map((row) => {
+    const entries = rows.map((row) => {
       const semanticReasons = [];
       if (row.status === "observed") semanticReasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
       if (row.candidate_version_id != null) semanticReasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
@@ -996,14 +1064,18 @@ class AutomationDatabase {
             message: planningResult.status === "failed" ? "审核结论已保存，规划尚未恢复" : "审核结论已保存，正在重新规划",
           }]
         : semanticReasons;
-      const title = catalogDisplayTitle(algorithmCandidate);
-      const displayTitle = row.candidate_version_id != null && !title.startsWith("未命名物品")
-        ? `疑似“${title}”`
-        : title;
+      const activeRulings = activeRulingsByObject.get(Number(row.id)) || new Map();
+      const activeVersionRow = versionById.get(Number(row.active_version_id));
+      const title = catalogReviewTitle({
+        candidatePayload: algorithmCandidate,
+        evidencePayload: latestEvidenceByObject.get(Number(row.id)),
+        humanValues: activeRulings,
+        activeVersion: activeVersionRow ? { origin: activeVersionRow.origin, payload: parseJson(activeVersionRow.payload_json) || {} } : null,
+      });
       return {
         objectType: row.object_type,
         objectId: row.object_id,
-        displayTitle,
+        ...title,
         revision: Number(row.revision),
         status: row.status,
         disposition: row.disposition,
@@ -1013,6 +1085,36 @@ class AutomationDatabase {
         updatedAt: row.updated_at,
       };
     }).filter((entry) => entry.reasons.length > 0);
+    return disambiguateCatalogTitles(entries);
+  }
+
+  getCatalogCompletenessQueue() {
+    const blockingKeys = new Set(this.getCatalogReviewQueue().map((entry) => `${entry.objectType}:${entry.objectId}`));
+    const entries = this.db.prepare("SELECT * FROM catalog_repository_objects ORDER BY updated_at DESC,object_type,object_id").all().flatMap((row) => {
+      if (blockingKeys.has(`${row.object_type}:${row.object_id}`)) return [];
+      const detail = this._catalogObjectResult(row);
+      if (!detail.completenessGaps.length) return [];
+      const title = catalogReviewTitle({
+        candidatePayload: detail.candidateVersion?.payload || detail.algorithmCandidate,
+        evidencePayload: detail.evidence.at(-1)?.payload,
+        humanValues: detail.humanValues,
+        activeVersion: detail.activeVersion,
+      });
+      return [{
+        objectType: detail.objectType,
+        objectId: detail.objectId,
+        ...title,
+        revision: detail.revision,
+        status: detail.status,
+        disposition: detail.disposition,
+        reviewStatus: detail.reviewStatus,
+        actionStatus: "以后再看",
+        gaps: detail.completenessGaps,
+        planningImpact: "不影响当前规划",
+        updatedAt: detail.updatedAt,
+      }];
+    });
+    return disambiguateCatalogTitles(entries);
   }
 
   _iconCandidate(row) {

@@ -48,6 +48,15 @@ async function main() {
   });
   seedReviewCandidate(runtime, { objectId: "browser-next", name: "下一候选", level: 2 });
   let first = seedReviewCandidate(runtime, { objectId: "browser-first", name: "园艺手套", level: 1 });
+  runtime.database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: "browser-later",
+    payload: { itemId: "browser-later", chainId: "review-chain", level: 3, baseUnits: 4, name: "候补图标" },
+    sourceType: "runtime-capture",
+    sourceRef: "browser-later.json",
+    countDuplicate: false,
+  });
+  runtime.catalogGate.evaluateObject("item-identity", "browser-later");
   first = runtime.database.applyCatalogRuling({
     objectType: first.objectType,
     objectId: first.objectId,
@@ -99,6 +108,12 @@ async function main() {
   try {
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
     await page.getByRole("button", { name: "图鉴" }).click();
+    await page.getByText("以后再看", { exact: true }).click();
+    const laterEntry = page.getByRole("button", { name: /疑似“候补图标”/ });
+    await laterEntry.click();
+    await page.getByRole("heading", { name: "疑似“候补图标”" }).waitFor();
+    await page.getByText("不影响当前规划", { exact: false }).first().waitFor();
+
     const firstQueueEntry = page.getByRole("button", { name: /疑似“园艺手套”/ });
     await firstQueueEntry.waitFor();
     await firstQueueEntry.click();

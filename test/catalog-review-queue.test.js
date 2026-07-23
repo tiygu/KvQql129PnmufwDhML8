@@ -236,3 +236,153 @@ test("图标缺口不进入语义审核队列但在对象详情保留完整性�
   assert.equal(object.completenessGaps.some((gap) => gap.type === "icon-gap" && gap.fieldPath === "iconResourceIdentifier"), true);
   assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectId === "without-icon"), false);
 }));
+
+test("审核队列标题按人工确认、疑似候选和未命名降级且同名候选用等级区分", () => withDatabase((database) => {
+  for (const [objectId, level, name] of [
+    ["internal-candidate-a", 1, "园艺手套"],
+    ["internal-candidate-b", 2, "园艺手套"],
+    ["internal-unnamed", 3, null],
+    ["internal-confirmed", 4, "待人工确认"],
+  ]) {
+    database.observeCatalogObject({
+      objectType: "item-identity",
+      objectId,
+      payload: {
+        itemId: objectId,
+        chainId: "internal-chain-id",
+        level,
+        baseUnits: 2 ** (level - 1),
+        ...(name ? { name } : {}),
+      },
+      sourceType: "structural-inference",
+      sourceRef: `${objectId}.json`,
+      countDuplicate: false,
+    });
+    new CatalogReviewGate(database).evaluateObject("item-identity", objectId);
+  }
+
+  let confirmed = database.getCatalogObject("item-identity", "internal-confirmed");
+  confirmed = database.applyCatalogRuling({
+    objectType: confirmed.objectType,
+    objectId: confirmed.objectId,
+    fieldPath: "name",
+    decision: "confirm",
+    value: "人工确认手套",
+    actor: "operator",
+    note: "核对名称",
+    expectedRevision: confirmed.revision,
+    baseRulingId: null,
+  });
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: confirmed.objectId,
+    payload: {
+      itemId: confirmed.objectId,
+      chainId: "internal-chain-id",
+      level: 4,
+      baseUnits: 8,
+      name: "新候选名称",
+    },
+    sourceType: "structured-runtime",
+    sourceRef: "changed.json",
+    countDuplicate: false,
+  });
+  new CatalogReviewGate(database).evaluateObject("item-identity", confirmed.objectId);
+
+  const queue = database.getCatalogReviewQueue();
+  const confirmedEntry = queue.find((entry) => entry.objectId === "internal-confirmed");
+  const sameNameEntries = queue.filter((entry) => ["internal-candidate-a", "internal-candidate-b"].includes(entry.objectId));
+  const unnamedEntry = queue.find((entry) => entry.objectId === "internal-unnamed");
+
+  assert.equal(confirmedEntry.displayTitle, "人工确认手套");
+  assert.deepEqual(sameNameEntries.map((entry) => entry.displayTitle).sort(), [
+    "疑似“园艺手套”（第 1 级）",
+    "疑似“园艺手套”（第 2 级）",
+  ]);
+  assert.equal(unnamedEntry.displayTitle, "未命名物品（第 3 级）");
+  for (const entry of queue) {
+    assert.equal(entry.displayTitle.includes(entry.objectId), false);
+    assert.equal(entry.displayTitle.includes("internal-chain-id"), false);
+  }
+}));
+
+test("仅有完整性缺口的对象进入以后再看而不进入主阻塞队列", () => withDatabase((database) => {
+  const object = activeIdentity(database, "later-icon", {
+    name: "园艺铲",
+    iconResource: null,
+    iconEvidenceStatus: "missing",
+  });
+
+  assert.deepEqual(object.reviewReasons, []);
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectId === object.objectId), false);
+  assert.deepEqual(database.getCatalogCompletenessQueue().map((entry) => ({
+    objectId: entry.objectId,
+    actionStatus: entry.actionStatus,
+    gapTypes: entry.gaps.map((gap) => gap.type),
+    planningImpact: entry.planningImpact,
+  })), [{
+    objectId: "later-icon",
+    actionStatus: "以后再看",
+    gapTypes: ["icon-gap"],
+    planningImpact: "不影响当前规划",
+  }]);
+}));
+
+test("已确认无名快照后的新名称证据仍显示为疑似候选", () => withDatabase((database) => {
+  let object = activeIdentity(database, "confirmed-unnamed", { name: null });
+  object = database.completeCatalogReview({
+    objectType: object.objectType,
+    objectId: object.objectId,
+    decision: "confirm",
+    snapshot: object.algorithmCandidate,
+    actor: "operator",
+    requestId: "confirm-unnamed",
+    expectedRevision: object.revision,
+  });
+  database.finalizeCatalogReviewPlanning("confirm-unnamed", { status: "ready", recovered: true });
+  database.observeCatalogObject({
+    objectType: object.objectType,
+    objectId: object.objectId,
+    payload: {
+      itemId: object.objectId,
+      chainId: "changed-chain",
+      level: 2,
+      baseUnits: 2,
+      name: "新发现的手套",
+    },
+    sourceType: "structured-runtime",
+    sourceRef: "changed-name.json",
+    countDuplicate: false,
+  });
+  new CatalogReviewGate(database).evaluateObject(object.objectType, object.objectId);
+
+  const entry = database.getCatalogReviewQueue().find((candidate) => candidate.objectId === object.objectId);
+  assert.equal(entry.displayTitle, "疑似“新发现的手套”");
+}));
+
+test("同名同级对象使用稳定链位置区分且不暴露内部标识", () => withDatabase((database) => {
+  for (const objectId of ["same-level-internal-b", "same-level-internal-a"]) {
+    database.observeCatalogObject({
+      objectType: "item-identity",
+      objectId,
+      payload: {
+        itemId: objectId,
+        chainId: `${objectId}-chain`,
+        level: 2,
+        baseUnits: 2,
+        name: "同名剪刀",
+      },
+      sourceType: "structural-inference",
+      sourceRef: `${objectId}.json`,
+      countDuplicate: false,
+    });
+    new CatalogReviewGate(database).evaluateObject("item-identity", objectId);
+  }
+
+  const titles = database.getCatalogReviewQueue().map((entry) => entry.displayTitle).sort();
+  assert.deepEqual(titles, [
+    "疑似“同名剪刀”（第 2 级 · 链位置 1/2）",
+    "疑似“同名剪刀”（第 2 级 · 链位置 2/2）",
+  ]);
+  assert.equal(titles.some((title) => title.includes("internal")), false);
+}));
