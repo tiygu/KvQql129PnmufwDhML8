@@ -9,6 +9,7 @@ const { MapMissionCompleter } = require("./map-actions");
 const { SceneNavigator } = require("./scene-navigation");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { ProductionModeExecutor } = require("./production-mode-actions");
+const { SaleActionExecutor } = require("./sale-actions");
 
 /**
  * Runtime Semantic Control Bridge interface implemented by both adapters.
@@ -74,7 +75,7 @@ class LegacyRuntimeControlAdapter {
     return {
       adapterId: "legacy-cdp",
       contextId: this.selection.probe.context.id,
-      capabilities: ["state", "board", "order", "navigation", "map-mission", "warehouse", "production-mode"],
+      capabilities: ["state", "board", "order", "navigation", "map-mission", "warehouse", "production-mode", "sale"],
     };
   }
 
@@ -135,6 +136,10 @@ class LegacyRuntimeControlAdapter {
     if (command.type === "switch-production-mode") {
       const productionModes = new ProductionModeExecutor({ client: this.lab.client, contextId, settleMs, evaluateTimeoutMs });
       return productionModes.switch(command.index, command.modeId, { ...command.request, execute: true, signal });
+    }
+    if (command.type === "sell-item") {
+      const sale = new SaleActionExecutor({ client: this.lab.client, contextId, collectState, settleMs, evaluateTimeoutMs });
+      return sale.execute(command.suggestion, { confirmed: true, signal });
     }
     throw Object.assign(new Error(`unsupported runtime control command: ${command.type}`), {
       code: "RUNTIME_CONTROL_COMMAND_UNSUPPORTED",

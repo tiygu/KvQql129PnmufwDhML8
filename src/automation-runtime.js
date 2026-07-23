@@ -10,7 +10,6 @@ const { AdapterLab } = require("./lab");
 const { getConfig } = require("./config");
 const { buildGameState } = require("./game-state");
 const { buildOptimizationPlan } = require("./order-optimizer");
-const { MapMissionCompleter } = require("./map-actions");
 const { OrderCoinLoop } = require("./order-coin-loop");
 const { FullAutomationLoop } = require("./full-automation-loop");
 const { AutomationDatabase } = require("./automation-database");
@@ -19,7 +18,6 @@ const { buildCatalog } = require("../scripts/build-item-catalog.cjs");
 const { migrateLegacyCatalog } = require("./catalog-migration");
 const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./catalog-review-gate");
 const { PauseGate } = require("./pause-gate");
-const { SaleActionExecutor } = require("./sale-actions");
 const { normalizeSalePolicy } = require("./sale-policy");
 const { IdleAutomationSession } = require("./idle-automation-session");
 const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource } = require("./icon-evidence");
@@ -664,10 +662,10 @@ class AutomationRuntime {
       const plan = buildOptimizationPlan({ catalog, state: before, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: "assisted" });
       const suggestion = (plan.saleSuggestions || []).find((candidate) => Number(candidate.sourceIndex) === Number(sourceIndex) && String(candidate.itemId) === String(itemId) && Number(candidate.expectedCoins) === Number(expectedCoins));
       if (!suggestion) return { ok: false, executed: false, reason: "sale-suggestion-stale-or-unavailable" };
-      const executor = new SaleActionExecutor({ client: this.lab.client, contextId: this.selection.probe.context.id, collectState: () => this.collectState(), settleMs: settings.settleMs });
+      const runtimeControl = this.ensureRuntimeControl();
       const sessionId = this.database.startSession("assisted-sale", { explicitUserConfirmation: true, suggestion });
       try {
-        const result = await executor.execute(suggestion, { confirmed: true });
+        const result = await runtimeControl.execute({ type: "sell-item", suggestion }, { options: { settleMs: settings.settleMs } });
         this.database.logAction({ sessionId, sequence: 1, type: "sell-item", reason: result.reason, ok: result.ok, before: result.before, after: result.after, details: { suggestion, verification: result.verification } });
         this.database.endSession(sessionId, result.ok ? "complete" : "failed");
         this.emit("automation-action", { action: { type: "sell-item", ok: result.ok, reason: result.reason, suggestion } });
@@ -687,11 +685,10 @@ class AutomationRuntime {
     try {
       await this.iconService.waitForIdle();
       await this.connect();
-      const contextId = this.selection.probe.context.id;
-      const completer = new MapMissionCompleter({ client: this.lab.client, contextId, collectState: () => this.collectState(), settleMs: 1800 });
+      const runtimeControl = this.ensureRuntimeControl();
       const sessionId = this.database.startSession("map-mission", { explicitUserAction: true });
       try {
-        const result = await completer.complete({ execute: true });
+        const result = await runtimeControl.execute({ type: "complete-map-mission" }, { options: { settleMs: 1800 } });
         this.database.logAction({ sessionId, sequence: 1, type: "complete-map-mission", reason: result.reason, ok: result.ok, before: result.before, after: result.after, details: { missionBefore: result.missionBefore, missionAfter: result.missionAfter } });
         this.database.endSession(sessionId, result.ok ? "complete" : "failed");
         this.emit("automation-action", { action: { type: "complete-map-mission", ok: result.ok, reason: result.reason } });
