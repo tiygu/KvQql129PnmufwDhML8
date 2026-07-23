@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>抛弃式原型：四类对象审核</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, "PingFang SC", sans-serif; background:#090d12; color:#eaf0f6; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; background:radial-gradient(circle at 70% 0,#172334 0,#090d12 40%); }
+    button, input, select { font:inherit; } button { cursor:pointer; }
+    .shell { display:grid; grid-template-columns:288px minmax(0,1fr); min-height:100vh; }
+    .queue { border-right:1px solid #27313d; padding:22px 14px 90px; background:#0c1118e8; }
+    .eyebrow { color:#7f91a5; font-size:12px; letter-spacing:.08em; text-transform:uppercase; }
+    h1 { font-size:19px; margin:7px 0 5px; } .sub { color:#92a2b3; font-size:13px; margin:0 0 18px; }
+    .queue button { width:100%; border:1px solid transparent; background:transparent; color:inherit; text-align:left; padding:12px; border-radius:12px; margin:4px 0; }
+    .queue button:hover { background:#151d27; } .queue button.active { background:#18263a; border-color:#386ca4; }
+    .qtop { display:flex; justify-content:space-between; gap:8px; font-size:12px; color:#aab7c6; }
+    .qtitle { display:block; font-weight:700; margin:5px 0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .qreason { color:#f5b96a; font-size:12px; } .later { margin-top:22px; border-top:1px solid #27313d; padding-top:14px; color:#788898; font-size:13px; }
+    main { padding:30px clamp(18px,4vw,58px) 110px; min-width:0; } .topline { display:flex; justify-content:space-between; align-items:center; gap:16px; }
+    .badge { display:inline-flex; padding:5px 9px; border-radius:999px; background:#4b2718; color:#ffbd7a; font-size:12px; }
+    .independent { display:inline-flex; margin-left:9px; padding:4px 8px; border:1px solid #3d658c; border-radius:999px; color:#9dccff; font-size:12px; vertical-align:middle; }
+    .title { display:flex; align-items:center; gap:15px; margin:14px 0 20px; } .icon { width:62px; height:62px; display:grid; place-items:center; border:1px dashed #5c6a78; border-radius:16px; background:#141b23; color:#8999aa; }
+    .title h2 { margin:0 0 6px; font-size:clamp(23px,3vw,34px); } .title p { color:#95a5b5; margin:0; }
+    .reason { border:1px solid #7b4a27; border-left:4px solid #f2a65a; background:#20170f; padding:15px 17px; border-radius:12px; line-height:1.55; }
+    .reason button { color:#ffca8d; border:0; background:none; padding:0; text-decoration:underline; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr); gap:18px; margin-top:18px; }
+    .card { background:#111821; border:1px solid #273442; border-radius:15px; padding:18px; min-width:0; }
+    .card h3 { margin:0 0 14px; font-size:15px; } .muted { color:#8c9cac; }
+    .compare { display:grid; grid-template-columns:1fr 30px 1fr; gap:10px; align-items:center; }
+    .choice { border:1px solid #344250; border-radius:12px; padding:13px; } .choice.suggested { border-color:#3d8c6d; background:#11261e; }
+    .choice small { color:#91a2b3; display:block; margin-bottom:5px; } .arrow { text-align:center; color:#718295; }
+    .field { display:grid; grid-template-columns:110px minmax(0,1fr); align-items:center; gap:12px; margin:11px 0; }
+    .field input,.field select { width:100%; border:1px solid #3a4652; background:#0b1117; color:#edf3f9; border-radius:9px; padding:10px; }
+    .chain { display:flex; gap:8px; overflow:auto; padding:5px 2px 10px; }
+    .node { min-width:116px; border:1px solid #344250; background:#0d141c; color:#dce5ee; border-radius:11px; padding:11px; text-align:left; }
+    .node.focus { outline:2px solid #65a9ff; } .node.unknown { border-style:dashed; color:#9eabb8; }
+    .relation { display:block; width:100%; color:#9dccff; background:none; border:0; text-align:left; padding:7px 0; }
+    .evidence { display:grid; gap:8px; } .evidence div { padding:10px 12px; background:#0c1218; border-radius:9px; line-height:1.45; }
+    .evidence b { color:#9badbf; font-size:12px; display:block; } details { margin-top:16px; color:#9badbf; } pre { overflow:auto; background:#080c10; padding:12px; border-radius:9px; font-size:11px; }
+    .actions { position:sticky; bottom:16px; margin-top:20px; display:flex; justify-content:flex-end; gap:10px; background:#101820e8; backdrop-filter:blur(12px); border:1px solid #2b3946; padding:11px; border-radius:14px; }
+    .actions button { border-radius:9px; border:1px solid #40505f; background:#17212b; color:#dce6f0; padding:10px 15px; }
+    .actions .primary { background:#2877d0; border-color:#4491e6; color:white; font-weight:700; }
+    .switcher { position:fixed; z-index:20; left:50%; bottom:18px; transform:translateX(-50%); display:flex; align-items:center; gap:13px; padding:9px 12px; border-radius:999px; background:#f3f6fa; color:#101820; box-shadow:0 12px 35px #0009; }
+    .switcher button { border:0; background:#dce4ed; border-radius:50%; width:30px; height:30px; }
+    .toast { position:fixed; right:22px; top:20px; max-width:360px; padding:13px 16px; background:#183222; border:1px solid #3b8c5c; border-radius:11px; display:none; z-index:30; }
+    body[data-variant="B"] .shell { grid-template-columns:1fr; } body[data-variant="B"] .queue { border:0; border-bottom:1px solid #27313d; padding:16px 22px; display:flex; gap:8px; overflow:auto; }
+    body[data-variant="B"] .queue header, body[data-variant="B"] .later { display:none; } body[data-variant="B"] .queue button { min-width:220px; margin:0; }
+    body[data-variant="B"] main { max-width:1180px; width:100%; margin:auto; } body[data-variant="B"] .grid { grid-template-columns:1fr 1fr; }
+    body[data-variant="C"] .shell { grid-template-columns:230px minmax(0,1fr); } body[data-variant="C"] main { padding-top:18px; }
+    body[data-variant="C"] .grid { display:block; } body[data-variant="C"] .card { border-radius:0; border-width:0 0 1px; background:transparent; padding:18px 0; }
+    body[data-variant="C"] .title { margin:8px 0 12px; } body[data-variant="C"] .reason { padding:10px 13px; }
+    @media (max-width:720px) {
+      .shell, body[data-variant="C"] .shell { grid-template-columns:1fr; } .queue { border:0; border-bottom:1px solid #27313d; padding:12px; display:flex; overflow:auto; }
+      .queue header,.later { display:none; } .queue button { min-width:205px; } main { padding:18px 14px 105px; } .grid,body[data-variant="B"] .grid { grid-template-columns:1fr; }
+      .title .icon { width:48px;height:48px; } .compare { grid-template-columns:1fr; } .arrow { transform:rotate(90deg); } .field { grid-template-columns:1fr; gap:5px; }
+      .actions { justify-content:stretch; flex-wrap:wrap; } .actions button { flex:1; white-space:nowrap; }
+    }
+  </style>
+</head>
+<body>
+  <!-- 三种信息密度布局，使用 ?variant=A|B|C 切换；这是抛弃式验证稿，不连接真实数据。 -->
+  <div class="toast" id="toast"></div>
+  <div class="shell">
+    <aside class="queue">
+      <header><span class="eyebrow">Catalog review</span><h1>阻塞审核队列</h1><p class="sub">4 项需要处理 · 按订单影响排序</p></header>
+      <button class="active" data-object="identity"><span class="qtop"><span>物品身份</span><span>订单「修复温室」</span></span><span class="qtitle">疑似“超长名称的园艺工具收纳箱…”</span><span class="qreason">名称冲突</span></button>
+      <button data-object="merge"><span class="qtop"><span>合成关系</span><span>订单「修复温室」</span></span><span class="qtitle">园艺手套 → 未命名物品</span><span class="qreason">链条断裂</span></button>
+      <button data-object="profile"><span class="qtop"><span>产出档案</span><span>订单「准备花圃」</span></span><span class="qtitle">疑似“老旧工具箱”</span><span class="qreason">候选产物不一致</span></button>
+      <button data-object="mode"><span class="qtop"><span>产出档位</span><span>订单「准备花圃」</span></span><span class="qtitle">老旧工具箱 · 节省档</span><span class="qreason">产出分布冲突</span></button>
+      <div class="later">以后再看：3 项资料待补充<br />仅缺图标，不影响当前规划</div>
+    </aside>
+    <main id="main"></main>
+  </div>
+  <nav class="switcher"><button id="prev">←</button><strong id="variantLabel"></strong><button id="next">→</button></nav>
+  <script>
+    const objects = {
+      identity:{type:"物品身份",title:"疑似“超长名称的园艺工具收纳箱（春季限定版）”",meta:"第 3 级 · 工具 · 图像尚未取得",reason:"这个物品出现了两个不同名称，导致订单“修复温室”无法确定合成目标。请核对正确名称。",current:"园艺箱",suggested:"园艺工具箱",panel:"身份字段",fields:[["名称","园艺工具箱"],["等级","第 3 级"],["类型","工具"]]},
+      merge:{type:"合成关系",title:"尚未出现的第 3 级合成物",meta:"等待更多线索 · 独立审核",reason:"第 3 级物品尚未在游戏中出现，现在无法可靠判断它是什么。正常推进订单时会顺带完成对应合成并记录结果，不需要从审核界面操作棋盘。",current:"园艺手套（第 2 级）× 2",suggested:"等待游戏内首次合成结果",panel:"已知关系",waiting:true,fields:[["来源物","园艺手套（第 2 级）"],["所需数量","2"],["结果物","等待首次观测"]]},
+      profile:{type:"产出档案",title:"疑似“老旧工具箱”的产出档案",meta:"真实产出观测 · 1 组归因冲突",reason:"同一次“园艺箱”产出被两个产出档案同时认领，系统无法可靠归因。其他可归因且互不矛盾的真实观测已经直接采用；请只裁决这组冲突。",current:"归入“老旧工具箱”",suggested:"归入“高级工具箱”",panel:"冲突观测",evidenceOnly:true,fields:[["实际产物","园艺箱"],["动作时间","14:32:08"],["当前归因","老旧工具箱"]]},
+      mode:{type:"产出档位",title:"老旧工具箱 · 节省档",meta:"单次 4 体力 · 3 种可能产物",reason:"两组真实产出记录对同一次动作给出了不同归因，系统暂停融合以免污染规划分布。理论分布仍临时参与规划；请只裁决冲突来源。",current:"采用动作记录 A",suggested:"采用动作记录 B",panel:"自动规划分布",evidenceOnly:true,fields:[["档位名称","节省档"],["当前样本","24 次 · 尚未达到融合门槛"],["规划采用","暂时沿用理论分布"]]}
+    };
+    let selected="identity", dirty=false;
+    const variants={A:"A — 队列 + 双栏裁决",B:"B — 横向队列 + 工作台",C:"C — 紧凑诊断文档"};
+    function variant(){ const v=new URLSearchParams(location.search).get("variant")||"A"; return variants[v]?v:"A"; }
+    function chain(){
+      return `<div class="chain"><button class="node">园艺刷<br><small>第 1 级</small></button><button class="node">园艺手套<br><small>第 2 级</small></button><button class="node ${selected==="identity"?"focus":""}" data-jump="identity">园艺工具箱<br><small>第 3 级</small></button><button class="node unknown ${selected==="merge"?"focus":""}" data-jump="merge">未命名物品<br><small>第 4 级 · 断点</small></button><button class="node">园艺剪<br><small>第 5 级</small></button></div>`;
+    }
+    function render(){
+      document.body.dataset.variant=variant(); document.querySelector("#variantLabel").textContent=variants[variant()];
+      const o=objects[selected];
+      document.querySelector("#main").innerHTML=`<div class="topline"><span class="eyebrow">${o.type} · 需要处理</span><span class="badge">阻塞 1 个订单</span></div>
+        <div class="title"><div class="icon">无图</div><div><h2>${o.title}<span class="independent">独立审核</span></h2><p>${o.meta}</p></div></div>
+        <div class="reason">${o.reason} <button data-focus>定位冲突</button></div>
+        <div class="grid"><section>
+          <div class="card"><h3>完整合成链 · 点击只切换焦点</h3>${chain()}<button class="relation" data-jump="merge">由 2 个“园艺手套（第 2 级）”合成 →</button><button class="relation" data-jump="profile">由“老旧工具箱”产出 →</button><button class="relation">用于订单“修复温室” →</button></div>
+          <div class="card" id="conflict"><h3>冲突裁决</h3><div class="compare"><div class="choice"><small>当前采用</small>${o.current}</div><span class="arrow">→</span><div class="choice suggested"><small>建议采用</small>${o.suggested}</div></div></div>
+        </section><aside>
+          <div class="card"><h3>${o.panel}</h3>${o.fields.map(([k,v])=>`<label class="field"><span>${k}</span><input value="${v}" ${o.waiting||o.evidenceOnly?"disabled":""}></label>`).join("")}${o.waiting?`<p class="muted">正常推进订单时顺带收集；观测到真实结果后自动回到审核队列。</p>`:""}${o.evidenceOnly?`<p class="muted">一致且可归因的真实观测已自动采用，不在这里重复审核。</p>`:""}</div>
+          ${selected==="mode"?`<div class="card evidence"><h3>分布证据分层</h3><div><b>配置写的是</b>手套 70% · 剪刀 30%</div><div><b>实际观察到 · 24 次</b>两组记录存在动作归因冲突，等待裁决</div><div><b>规划准备采用</b>样本达到融合门槛前，暂时沿用理论分布</div></div>`:""}
+          <details><summary>技术详情</summary><pre>{ "objectType": "${selected}", "internalId": "TECHNICAL_ONLY", "stage": "provisional" }</pre></details>
+        </aside></div>
+        <div class="actions"><button id="skip">暂时跳过</button><button id="advanced">高级诊断</button><button class="primary" id="confirm">${o.waiting?"返回自动化继续收集":o.evidenceOnly?"保留当前观测归因":dirty?"修改后确认":"确认无误"}</button></div>`;
+      document.querySelectorAll(".queue button[data-object]").forEach(b=>b.classList.toggle("active",b.dataset.object===selected));
+      document.querySelectorAll("input").forEach(i=>i.addEventListener("input",()=>{dirty=true; document.querySelector("#confirm").textContent="修改后确认";}));
+      document.querySelectorAll("[data-jump]").forEach(b=>b.onclick=()=>{selected=b.dataset.jump;dirty=false;render();toast("只切换了审核焦点；关联对象尚未确认。");});
+      document.querySelector("[data-focus]").onclick=()=>document.querySelector("#conflict").scrollIntoView({behavior:"smooth",block:"center"});
+      document.querySelector("#skip").onclick=()=>{const order=Object.keys(objects),i=order.indexOf(selected);selected=order[(i+1)%order.length];dirty=false;render();toast("已移到本轮队列后方；生效数据和规划资格没有变化。");};
+      document.querySelector("#advanced").onclick=()=>toast("高级诊断：暂停对象、证据处置和只读 JSON 入口；危险动作会先显示影响。");
+      document.querySelector("#confirm").onclick=()=>toast(o.waiting?"已返回自动化；正常订单推进会顺带收集首次合成结果。":o.evidenceOnly?"已记录这组冲突的观测归因；其他一致观测未被重复审核。":dirty?"已生成修改审计摘要；重新规划后仍受阻，因此保留当前上下文。":"已按当前候选确认；重新规划恢复后才进入下一项。");
+    }
+    function toast(text){const el=document.querySelector("#toast");el.textContent=text;el.style.display="block";clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>el.style.display="none",4200);}
+    function cycle(delta){const keys=Object.keys(variants),i=keys.indexOf(variant()),next=keys[(i+delta+keys.length)%keys.length];const u=new URL(location.href);u.searchParams.set("variant",next);history.replaceState({},"",u);render();}
+    document.querySelectorAll(".queue button[data-object]").forEach(b=>b.onclick=()=>{selected=b.dataset.object;dirty=false;render();});
+    document.querySelector("#prev").onclick=()=>cycle(-1); document.querySelector("#next").onclick=()=>cycle(1);
+    addEventListener("keydown",e=>{if(["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName))return;if(e.key==="ArrowLeft")cycle(-1);if(e.key==="ArrowRight")cycle(1);});
+    render();
+  </script>
+</body>
+</html>
