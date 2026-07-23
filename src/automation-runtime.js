@@ -370,9 +370,40 @@ class AutomationRuntime {
 
   getCatalogObject(objectType, objectId) {
     const object = this.database.getCatalogObject(objectType, objectId);
-    if (!object || objectType !== "item-identity") return object;
+    if (!object) return object;
     const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
-    return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
+    if (objectType === "item-identity") {
+      return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
+    }
+    if (objectType !== "merge-relation") return object;
+    const items = this.database.listCatalogObjects({ objectType: "item-identity" }).map((summary) => {
+      const identity = this.database.getCatalogObject(summary.objectType, summary.objectId);
+      const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
+      const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
+        .find((candidate) => String(candidate || "").trim());
+      const level = Number(value.level);
+      const selectedIcon = this.database.getSelectedIconCandidate(summary.objectId);
+      return {
+        objectId: summary.objectId,
+        name: String(name || "未命名物品").trim(),
+        level: Number.isInteger(level) && level > 0 ? level : null,
+        chainId: value.chainId == null ? null : String(value.chainId),
+        iconUrl: selectedIcon ? `/api/catalog/icon/${selectedIcon.assetHash}` : null,
+        reviewStatus: identity?.reviewStatus || "clear",
+      };
+    });
+    const relations = this.database.listCatalogObjects({ objectType: "merge-relation" }).map((summary) => {
+      const relation = this.database.getCatalogObject(summary.objectType, summary.objectId);
+      const value = relation?.effectiveValue || relation?.algorithmCandidate || {};
+      return {
+        objectId: summary.objectId,
+        itemId: String(value.itemId ?? summary.objectId),
+        requiredCount: Number(value.requiredCount ?? 2),
+        mergeTarget: value.mergeTarget == null || value.mergeTarget === "" ? null : String(value.mergeTarget),
+        reviewStatus: relation?.reviewStatus || "clear",
+      };
+    });
+    return { ...object, relationContext: { items, relations } };
   }
 
   getPlanningCatalog({ includeProvisional = false, executionMode = "assisted" } = {}) {

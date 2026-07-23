@@ -33,6 +33,25 @@ function provisionalIdentity(database, objectId = "review-item") {
   return new CatalogReviewGate(database).evaluateObject("item-identity", objectId);
 }
 
+function activeIdentity(database, { objectId, name, level, chainId = "flower-chain" }) {
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId,
+    payload: {
+      itemId: objectId,
+      chainId,
+      level,
+      baseUnits: 2 ** (level - 1),
+      name,
+      type: "花材",
+    },
+    sourceType: "runtime-capture",
+    sourceRef: `${objectId}.json`,
+    countDuplicate: false,
+  });
+  return new CatalogReviewGate(database).evaluateObject("item-identity", objectId);
+}
+
 test("确认无误以一个事务保存完整快照、结论和 Catalog Audit Summary，并按请求幂等", () => withDatabase((database) => {
   const before = provisionalIdentity(database);
   const snapshot = structuredClone(before.algorithmCandidate);
@@ -187,6 +206,69 @@ test("修改后确认保存完整 Item Identity 和稳定审计说明且不确�
   assert.equal(database.listCatalogReviewResolutions({
     objectType: "merge-relation",
     objectId: identity.objectId,
+  }).length, 0);
+}));
+
+test("Merge Relation 领域校验定位自环、等级倒退、一物多后继和链条断裂且保持生效快照", () => withDatabase((database) => {
+  activeIdentity(database, { objectId: "flower-1", name: "花苞", level: 1 });
+  activeIdentity(database, { objectId: "flower-2", name: "初绽花", level: 2 });
+  activeIdentity(database, { objectId: "flower-3", name: "盛放花", level: 3 });
+  activeIdentity(database, { objectId: "flower-5", name: "冠冕花", level: 5 });
+  activeIdentity(database, { objectId: "other-3", name: "异链花", level: 3, chainId: "other-chain" });
+  database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId: "flower-2",
+    payload: {
+      itemId: "flower-2",
+      chainId: "flower-chain",
+      level: 2,
+      requiredCount: 2,
+      mergeTarget: "flower-3",
+    },
+    sourceType: "runtime-capture",
+    sourceRef: "flower-2-relation.json",
+    countDuplicate: false,
+  });
+  const before = new CatalogReviewGate(database).evaluateObject("merge-relation", "flower-2");
+  const submit = (requestId, changes) => database.completeCatalogReview({
+    objectType: before.objectType,
+    objectId: before.objectId,
+    decision: "modify",
+    snapshot: { ...before.algorithmCandidate, ...changes },
+    actor: "本地操作者",
+    requestId,
+    expectedRevision: before.revision,
+  });
+
+  assert.throws(() => submit("relation-self-loop", { mergeTarget: "flower-2" }), /自环.*“初绽花（第 2 级）”不能合成为自身/);
+  assert.throws(() => submit("relation-level-regression", { mergeTarget: "flower-1" }), /等级倒退.*“初绽花（第 2 级）”.*“花苞（第 1 级）”/);
+  assert.throws(() => submit("relation-chain-break", { mergeTarget: "flower-5" }), /链条断裂.*第 2 级.*第 3 级.*“冠冕花（第 5 级）”/);
+  assert.throws(() => submit("relation-cross-chain", { mergeTarget: "other-3" }), /链条断裂.*“初绽花（第 2 级）”.*“异链花（第 3 级）”/);
+  assert.throws(() => submit("relation-count", { requiredCount: 3 }), /所需数量.*“初绽花（第 2 级）”.*2 个/);
+
+  database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId: "duplicate-relation-record",
+    payload: {
+      itemId: "flower-2",
+      chainId: "flower-chain",
+      level: 2,
+      requiredCount: 2,
+      mergeTarget: "flower-5",
+    },
+    sourceType: "structural-inference",
+    sourceRef: "duplicate-successor.json",
+    countDuplicate: false,
+  });
+  assert.throws(() => submit("relation-multiple-successors", { mergeTarget: "flower-3" }), /一物多后继.*“初绽花（第 2 级）”.*“盛放花（第 3 级）”.*“冠冕花（第 5 级）”/);
+
+  const after = database.getCatalogObject(before.objectType, before.objectId);
+  assert.equal(after.revision, before.revision);
+  assert.equal(after.activeVersion.id, before.activeVersion.id);
+  assert.deepEqual(after.activeVersion.payload, before.activeVersion.payload);
+  assert.equal(database.listCatalogReviewResolutions({
+    objectType: before.objectType,
+    objectId: before.objectId,
   }).length, 0);
 }));
 

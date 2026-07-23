@@ -34,6 +34,7 @@ function relationPayload(payload) {
     itemId: String(payload.itemId ?? payload.id ?? ""),
     chainId: payload.chainId == null ? null : String(payload.chainId),
     level: Number(payload.level),
+    requiredCount: Number(payload.requiredCount ?? 2),
     mergeTarget: payload.mergeTarget == null || payload.mergeTarget === "" ? null : String(payload.mergeTarget),
   };
 }

@@ -39,6 +39,30 @@ function seedReviewCandidate(runtime, { objectId, name, level, type = null }) {
   return object;
 }
 
+function seedActiveIdentity(runtime, { objectId, name, level, chainId }) {
+  runtime.database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId,
+    payload: { itemId: objectId, chainId, level, baseUnits: level == null ? null : 2 ** (level - 1), name, type: "花材" },
+    sourceType: "runtime-capture",
+    sourceRef: `${objectId}.json`,
+    countDuplicate: false,
+  });
+  return runtime.catalogGate.evaluateObject("item-identity", objectId);
+}
+
+function seedRelation(runtime, { objectId, level, mergeTarget, sourceType = "runtime-capture" }) {
+  runtime.database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId,
+    payload: { itemId: objectId, chainId: "browser-flower-chain", level, requiredCount: 2, mergeTarget },
+    sourceType,
+    sourceRef: `${objectId}-relation.json`,
+    countDuplicate: false,
+  });
+  return runtime.catalogGate.evaluateObject("merge-relation", objectId);
+}
+
 async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-review-browser-"));
   const runtime = new AutomationRuntime({
@@ -46,6 +70,24 @@ async function main() {
     dataDir,
     manageConnectionRoute: false,
   });
+  for (const identity of [
+    { objectId: "flower-1", name: "花苞", level: 1 },
+    { objectId: "flower-2", name: "初绽花", level: 2 },
+    { objectId: "flower-3", name: "盛放花", level: 3 },
+    { objectId: "flower-5", name: "冠冕花", level: 5 },
+    { objectId: "flower-6", name: "余香花", level: 6 },
+    { objectId: "flower-7", name: "永恒花", level: 7 },
+    { objectId: "flower-unknown", name: "待定花", level: null },
+  ]) seedActiveIdentity(runtime, { ...identity, chainId: "browser-flower-chain" });
+  seedRelation(runtime, { objectId: "flower-1", level: 1, mergeTarget: "flower-2" });
+  const relationSnapshotBefore = seedRelation(runtime, {
+    objectId: "flower-2",
+    level: 2,
+    mergeTarget: "flower-5",
+    sourceType: "structural-inference",
+  });
+  seedRelation(runtime, { objectId: "flower-3", level: 3, mergeTarget: null });
+  seedRelation(runtime, { objectId: "flower-5", level: 5, mergeTarget: null });
   const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
@@ -233,6 +275,52 @@ async function main() {
       objectType: "merge-relation",
       objectId: editable.objectId,
     }).length, 0);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    const relationEntry = page.getByRole("button", { name: /“初绽花”的合成关系.*合成关系/ });
+    await relationEntry.click();
+    await page.getByRole("heading", { name: "合成关系独立审核" }).waitFor();
+    await page.getByText("切换关系只改变审核焦点；每个对象都需要独立审核。").waitFor();
+    await page.getByRole("button", { name: "来源物 初绽花（第 2 级）", exact: true }).waitFor();
+    assert.equal(await page.getByRole("spinbutton", { name: "所需数量" }).inputValue(), "2");
+    await page.getByRole("region", { name: "完整横向合成链" }).getByText("未命名物品（第 4 级）").waitFor();
+    await page.getByRole("region", { name: "完整横向合成链" }).getByRole("button", { name: "待定花（等级未知）" }).waitFor();
+    await page.getByRole("region", { name: "完整横向合成链" }).getByText("链条断点").first().waitFor();
+    await page.getByLabel("断点：余香花（第 6 级）到永恒花（第 7 级）").waitFor();
+    await page.getByRole("button", { name: /当前焦点.*初绽花.*第 2 级/ }).waitFor();
+
+    await page.getByRole("button", { name: /关系句结果物.*冠冕花.*第 5 级/ }).click();
+    await page.getByRole("heading", { name: /冠冕花/ }).waitFor();
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "flower-2" }).length, 0);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "item-identity", objectId: "flower-5" }).length, 0);
+
+    await relationEntry.click();
+    await page.getByRole("heading", { name: "合成关系独立审核" }).waitFor();
+    await page.getByRole("button", { name: /选择结果物.*初绽花.*第 2 级/ }).click();
+    await page.getByText(/自环.*初绽花.*不能合成为自身/).waitFor();
+    assert.equal(await page.getByRole("button", { name: "修改后确认" }).isDisabled(), true);
+    const relationAfterRejectedEdit = runtime.database.getCatalogObject("merge-relation", "flower-2");
+    assert.equal(relationAfterRejectedEdit.revision, relationSnapshotBefore.revision);
+    assert.deepEqual(relationAfterRejectedEdit.activeVersion, relationSnapshotBefore.activeVersion);
+    assert.deepEqual(relationAfterRejectedEdit.candidateVersion, relationSnapshotBefore.candidateVersion);
+
+    await page.getByRole("button", { name: /选择结果物.*盛放花.*第 3 级/ }).click();
+    await page.getByText(/合成为.*盛放花/).waitFor();
+    await page.getByRole("button", { name: "修改后确认" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存" }).waitFor();
+    const relationRequest = completionRequests.at(-1);
+    assert.equal(relationRequest.objectType, "merge-relation");
+    assert.equal(relationRequest.decision, "modify");
+    assert.deepEqual(relationRequest.snapshot, {
+      itemId: "flower-2",
+      chainId: "browser-flower-chain",
+      level: 2,
+      requiredCount: 2,
+      mergeTarget: "flower-3",
+    });
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "flower-2" }).length, 1);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "item-identity", objectId: "flower-3" }).length, 0);
   } finally {
     await browser.close();
     await server.close();

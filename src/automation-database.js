@@ -678,6 +678,7 @@ class AutomationDatabase {
         && (!Number.isInteger(Number(payload.level)) || Number(payload.level) <= 0)) {
         throw new TypeError("Item Identity 等级必须是正整数或未知");
       }
+      if (identity.objectType === "merge-relation") this._validateMergeRelationSnapshot(identity, payload);
       const requestFingerprint = canonicalJson({
         objectType: identity.objectType,
         objectId: identity.objectId,
@@ -773,6 +774,100 @@ class AutomationDatabase {
         false,
       );
     });
+  }
+
+  _catalogIdentityDescriptor(itemId) {
+    const object = this.getCatalogObject("item-identity", String(itemId));
+    if (!object) return null;
+    const value = object.effectiveValue || object.algorithmCandidate || {};
+    const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
+      .find((candidate) => String(candidate || "").trim());
+    const level = Number(value.level);
+    const levelLabel = Number.isInteger(level) && level > 0 ? `第 ${level} 级` : "等级未知";
+    return {
+      itemId: String(itemId),
+      name: String(name || "未命名物品").trim(),
+      chainId: value.chainId == null ? null : String(value.chainId),
+      level: Number.isInteger(level) && level > 0 ? level : null,
+      label: `${String(name || "未命名物品").trim()}（${levelLabel}）`,
+    };
+  }
+
+  _mergeRelationValidationError(message, fieldPath, nodes) {
+    const error = new TypeError(message);
+    error.code = "CATALOG_DOMAIN_VALIDATION";
+    error.statusCode = 400;
+    error.fieldPath = fieldPath;
+    error.nodes = nodes;
+    return error;
+  }
+
+  _validateMergeRelationSnapshot(identity, payload) {
+    const sourceId = String(payload.itemId ?? "");
+    const targetId = payload.mergeTarget == null || payload.mergeTarget === "" ? null : String(payload.mergeTarget);
+    const source = this._catalogIdentityDescriptor(sourceId);
+    if (sourceId !== identity.objectId || !source) {
+      throw this._mergeRelationValidationError(
+        "来源物与当前独立审核的合成关系不一致，请返回对应来源物重新审核。",
+        "itemId",
+        [sourceId, identity.objectId],
+      );
+    }
+    if (Number(payload.requiredCount ?? 2) !== 2) {
+      throw this._mergeRelationValidationError(
+        `所需数量错误：“${source.label}”每次必须使用 2 个同级物品。`,
+        "requiredCount",
+        [sourceId],
+      );
+    }
+    if (targetId === sourceId) {
+      throw this._mergeRelationValidationError(
+        `自环错误：“${source.label}”不能合成为自身，请在当前节点重新选择结果物。`,
+        "mergeTarget",
+        [sourceId],
+      );
+    }
+    const target = targetId == null ? null : this._catalogIdentityDescriptor(targetId);
+    if (targetId != null && !target) {
+      throw this._mergeRelationValidationError(
+        `链条断裂：“${source.label}”指向尚未出现的结果物，请等待该节点取得身份线索。`,
+        "mergeTarget",
+        [sourceId, targetId],
+      );
+    }
+    if (target && source.level != null && target.level != null && target.level <= source.level) {
+      throw this._mergeRelationValidationError(
+        `等级倒退：“${source.label}”不能指向“${target.label}”。`,
+        "mergeTarget",
+        [sourceId, targetId],
+      );
+    }
+    if (target && (source.chainId !== target.chainId
+      || source.level == null || target.level == null || target.level !== source.level + 1)) {
+      const expected = source.level == null ? "下一等级" : `第 ${source.level + 1} 级`;
+      throw this._mergeRelationValidationError(
+        `链条断裂：“${source.label}”应连接同一合成链的${expected}，当前选择“${target.label}”。`,
+        "mergeTarget",
+        [sourceId, targetId],
+      );
+    }
+    const successors = new Map();
+    if (target) successors.set(target.itemId, target);
+    for (const summary of this.listCatalogObjects({ objectType: "merge-relation" })) {
+      if (summary.objectId === identity.objectId) continue;
+      const object = this.getCatalogObject(summary.objectType, summary.objectId);
+      const relation = object?.effectiveValue || object?.algorithmCandidate || {};
+      if (String(relation.itemId ?? summary.objectId) !== sourceId || relation.mergeTarget == null || relation.mergeTarget === "") continue;
+      const successor = this._catalogIdentityDescriptor(String(relation.mergeTarget));
+      if (successor) successors.set(successor.itemId, successor);
+    }
+    if (successors.size > 1) {
+      throw this._mergeRelationValidationError(
+        `一物多后继：“${source.label}”同时指向${[...successors.values()].map((successor) => `“${successor.label}”`).join("和")}。`,
+        "mergeTarget",
+        [sourceId, ...successors.keys()],
+      );
+    }
   }
 
   _catalogReviewCompletionResult(objectRow, resolutionRow, idempotentReplay) {
@@ -1074,12 +1169,22 @@ class AutomationDatabase {
         : semanticReasons;
       const activeRulings = activeRulingsByObject.get(Number(row.id)) || new Map();
       const activeVersionRow = versionById.get(Number(row.active_version_id));
-      const title = catalogReviewTitle({
+      let title = catalogReviewTitle({
         candidatePayload: algorithmCandidate,
         evidencePayload: latestEvidenceByObject.get(Number(row.id)),
         humanValues: activeRulings,
         activeVersion: activeVersionRow ? { origin: activeVersionRow.origin, payload: parseJson(activeVersionRow.payload_json) || {} } : null,
       });
+      if (row.object_type === "merge-relation") {
+        const source = this._catalogIdentityDescriptor(algorithmCandidate.itemId ?? row.object_id);
+        if (source) {
+          title = {
+            displayTitle: `“${source.name}”的合成关系${source.level == null ? "" : `（第 ${source.level} 级）`}`,
+            titleState: "relation",
+            baseTitle: `“${source.name}”的合成关系`,
+          };
+        }
+      }
       return {
         objectType: row.object_type,
         objectId: row.object_id,
