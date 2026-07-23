@@ -24,7 +24,7 @@ const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, c
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
 const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
-const { LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
+const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -164,11 +164,20 @@ class AutomationRuntime {
     if (!this.lab || !this.selection?.probe) {
       throw Object.assign(new Error("runtime control is not connected"), { code: "RUNTIME_CONTROL_NOT_CONNECTED" });
     }
-    this.runtimeControl = new LegacyRuntimeControlAdapter({
+    const legacy = new LegacyRuntimeControlAdapter({
       lab: this.lab,
       selection: this.selection,
       collectState: (signal) => this.collectState(signal),
       onWarehouseInventoryInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason),
+    });
+    if (typeof this.lab.client?.evaluate !== "function") {
+      this.runtimeControl = legacy;
+      return this.runtimeControl;
+    }
+    this.runtimeControl = new CdpRuntimeControlAdapter({
+      client: this.lab.client,
+      contextId: this.selection.probe.context.id,
+      legacy,
     });
     return this.runtimeControl;
   }
@@ -436,7 +445,8 @@ class AutomationRuntime {
       throw new Error("未发现目标游戏运行上下文，请确认游戏和 CDP 路线已启动");
     }
     this.selection = selection;
-    this.ensureRuntimeControl();
+    const runtimeControl = this.ensureRuntimeControl();
+    selection.runtimeControl = await runtimeControl.ready(signal);
     lab.client.once("close", () => {
       if (this.lab !== lab) return;
       this.selection = null;
@@ -546,6 +556,7 @@ class AutomationRuntime {
       sessions: this.database.listSessions(30),
       resourceSamples: this.database.listResourceSamples(120),
       connectionRoute,
+      runtimeControl: this.runtimeControl?.status?.() || null,
     };
   }
 
