@@ -135,13 +135,38 @@ function reviewCandidateSnapshot(detail: any) {
 function meaningfulDifferences(detail: any, fields: string[]) {
   const candidate = reviewCandidateSnapshot(detail);
   const baseline = reviewBaselineSnapshot(detail);
-  return fields.flatMap((field) => {
-    const oldValue = baseline[field];
-    const newValue = candidate[field];
-    return display(oldValue ?? null) === display(newValue ?? null)
-      ? []
-      : [{ field, oldValue, newValue }];
-  });
+  return snapshotDifferences(baseline, candidate, fields);
+}
+
+function identityDraftFromDetail(detail: any) {
+  const candidate = reviewCandidateSnapshot(detail);
+  return {
+    name: candidate.name == null ? "" : String(candidate.name),
+    level: candidate.level == null ? "" : String(candidate.level),
+    type: candidate.type == null ? "" : String(candidate.type),
+  };
+}
+
+function itemIdentitySnapshot(candidate: any, draft: { name: string; level: string; type: string }, selectedIcon: any) {
+  const levelText = draft.level.trim();
+  const snapshot: any = {
+    ...structuredClone(candidate),
+    name: draft.name.trim() || null,
+    level: levelText ? Number(levelText) : null,
+    type: draft.type.trim() || null,
+  };
+  if (selectedIcon || Object.hasOwn(candidate, "displayIcon")) {
+    snapshot.displayIcon = selectedIcon
+      ? { candidateId: Number(selectedIcon.id), assetHash: selectedIcon.assetHash }
+      : candidate.displayIcon;
+  }
+  return snapshot;
+}
+
+function snapshotDifferences(before: any, after: any, fields: string[]) {
+  return fields.flatMap((field) => display(before?.[field] ?? null) === display(after?.[field] ?? null)
+    ? []
+    : [{ field, oldValue: before?.[field] ?? null, newValue: after?.[field] ?? null }]);
 }
 
 function humanReadableReason(detail: any) {
@@ -177,6 +202,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<any>(null);
   const [objectDraft, setObjectDraft] = useState("{}");
+  const [identityDraft, setIdentityDraft] = useState({ name: "", level: "", type: "" });
   const [actor, setActor] = useState("本地操作者");
   const [note, setNote] = useState("");
   const [message, setMessage] = useState("");
@@ -188,6 +214,8 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
+  const identityDraftKey = useRef<string | null>(null);
+  const identityDraftDirty = useRef(false);
 
   const selectedSummary = useMemo(() => {
     const queuedKeys = new Set([...queue, ...laterQueue].map((item: any) => `${item.objectType}:${item.objectId}`));
@@ -207,6 +235,12 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       if (requestId !== detailRequestId.current) return;
       setDetail(value);
       setObjectDraft(JSON.stringify(value.candidateVersion?.payload || value.algorithmCandidate || value.effectiveValue || {}, null, 2));
+      const valueKey = `${value.objectType}:${value.objectId}`;
+      if (identityDraftKey.current !== valueKey || !identityDraftDirty.current) {
+        setIdentityDraft(identityDraftFromDetail(value));
+        identityDraftDirty.current = false;
+      }
+      identityDraftKey.current = valueKey;
     } catch (error: any) {
       if (requestId !== detailRequestId.current) return;
       setLoadError(error.message || "审核对象加载失败");
@@ -231,16 +265,36 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   ])).sort(), [detail]);
   const visibleFields = useMemo(() => domainFields(detail), [detail]);
   const reviewCandidate = useMemo(() => reviewCandidateSnapshot(detail), [detail]);
-  const visibleDifferences = useMemo(() => meaningfulDifferences(detail, visibleFields), [detail, visibleFields]);
+  const identitySnapshot = useMemo(
+    () => itemIdentitySnapshot(reviewCandidate, identityDraft, detail?.selectedIcon),
+    [detail?.selectedIcon, identityDraft, reviewCandidate],
+  );
+  const identityDifferences = useMemo(
+    () => snapshotDifferences(reviewCandidate, identitySnapshot, ["name", "level", "type", "displayIcon"]),
+    [identitySnapshot, reviewCandidate],
+  );
+  const visibleDifferences = useMemo(
+    () => detail?.objectType === "item-identity"
+      ? identityDifferences
+      : meaningfulDifferences(detail, visibleFields),
+    [detail, identityDifferences, visibleFields],
+  );
+  const identityDecision: "confirm" | "modify" = identityDifferences.length ? "modify" : "confirm";
+  const identityLevelValid = identityDraft.level.trim() === "" || /^[1-9]\d*$/.test(identityDraft.level.trim());
 
   const completeReview = async (decision: "confirm" | "modify") => {
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
+    if (detail.objectType === "item-identity" && !identityLevelValid) {
+      setMessage("等级必须是正整数或留空表示未知");
+      return;
+    }
     setBusy(true);
     try {
-      const snapshot = decision === "confirm"
-        ? structuredClone(reviewCandidate)
-        : parseObjectDraft(objectDraft);
-      const requestKey = `${detail.objectType}:${detail.objectId}:${detail.revision}:${decision}:${JSON.stringify(snapshot)}`;
+      const effectiveDecision = detail.objectType === "item-identity" ? identityDecision : decision;
+      const snapshot = detail.objectType === "item-identity"
+        ? identitySnapshot
+        : effectiveDecision === "confirm" ? structuredClone(reviewCandidate) : parseObjectDraft(objectDraft);
+      const requestKey = `${detail.objectType}:${detail.objectId}:${detail.revision}:${effectiveDecision}:${JSON.stringify(snapshot)}`;
       if (completionRequest.current?.key !== requestKey) {
         completionRequest.current = {
           key: requestKey,
@@ -248,7 +302,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
         };
       }
       const updated = await controlApi.completeCatalogReview({
-        objectType: detail.objectType, objectId: detail.objectId, decision,
+        objectType: detail.objectType, objectId: detail.objectId, decision: effectiveDecision,
         snapshot, actor: actor.trim(), ...(note.trim() ? { note: note.trim() } : {}),
         requestId: completionRequest.current.requestId,
         expectedRevision: detail.revision,
@@ -256,6 +310,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
       setObjectDraft(JSON.stringify(updated.candidateVersion?.payload || updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
+      setIdentityDraft(identityDraftFromDetail(updated));
+      identityDraftKey.current = `${updated.objectType}:${updated.objectId}`;
+      identityDraftDirty.current = false;
       setNote("");
       completionRequest.current = null;
       const planningRecovered = updated.reviewResolution?.planningResult?.recovered === true;
@@ -274,6 +331,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       if (error.payload?.currentObject) {
         setDetail(error.payload.currentObject);
         setObjectDraft(JSON.stringify(error.payload.currentObject.algorithmCandidate || error.payload.currentObject.effectiveValue || {}, null, 2));
+        setIdentityDraft(identityDraftFromDetail(error.payload.currentObject));
+        identityDraftKey.current = `${error.payload.currentObject.objectType}:${error.payload.currentObject.objectId}`;
+        identityDraftDirty.current = false;
       }
       setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新核对完整对象" : error.message);
     } finally { setBusy(false); }
@@ -432,17 +492,25 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
           {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>以后再看：物品图标</strong><span>这属于完整性缺口，不进入主阻塞队列，不影响本次语义审核或当前规划。</span></div></div>}
           <div className="candidate-snapshot">
             <h3>本次将确认的完整候选</h3>
-            <div className="candidate-facts">{visibleFields.length ? visibleFields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(reviewCandidate[field])}</strong></div>) : <p>当前候选没有需要操作者核对的领域字段。</p>}</div>
+            {detail.objectType === "item-identity" ? <div className="item-identity-form">
+              <label><span>名称</span><input aria-label="名称" value={identityDraft.name} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, name: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <label><span>等级</span><input aria-label="等级" inputMode="numeric" value={identityDraft.level} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, level: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <label><span>类型</span><input aria-label="类型" value={identityDraft.type} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, type: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <div className="identity-icon-field"><span>展示图标</span><strong>{detail.selectedIcon ? `候选 ${detail.iconCandidates.findIndex((candidate: any) => candidate.id === detail.selectedIcon.id) + 1}` : "未知"}</strong><small>在上方真实图标候选中选择</small></div>
+              {!identityLevelValid && <p className="identity-validation" role="alert">等级必须是正整数或留空表示未知</p>}
+            </div> : <div className="candidate-facts">{visibleFields.length ? visibleFields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(reviewCandidate[field])}</strong></div>) : <p>当前候选没有需要操作者核对的领域字段。</p>}</div>}
           </div>
           <div className="meaningful-differences">
             <h3>有意义的差异</h3>
-            {visibleDifferences.length ? visibleDifferences.map((difference) => <p key={difference.field}><strong>{fieldLabel(difference.field)}</strong><span>{display(difference.oldValue)} → {display(difference.newValue)}</span></p>) : <p>候选与当前生效的领域信息一致；本次只需确认语义审核原因。</p>}
+            {visibleDifferences.length ? visibleDifferences.map((difference) => <p key={difference.field}><strong>{fieldLabel(difference.field)}</strong><span>{display(difference.oldValue)} → {display(difference.newValue)}</span></p>) : <p>{detail.objectType === "item-identity" ? "身份字段与候选一致；未知值会原样保留。" : "候选与当前生效的领域信息一致；本次只需确认语义审核原因。"}</p>}
           </div>
           {selectedSummary?.actionStatus !== "以后再看" && <div className="ruling-editor object-review-editor">
             <div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div>
             <label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label>
             <label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label>
-            <div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></div>
+            <div className="ruling-actions">{detail.objectType === "item-identity"
+              ? <button disabled={busy || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
+              : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}</div>
             {message && <p className="review-message" role="status">{message}</p>}
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
           </div>}

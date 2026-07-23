@@ -77,7 +77,7 @@ test("确认无误以一个事务保存完整快照、结论和 Catalog Audit Su
     objectRevision: first.revision,
     actor: input.actor,
     action: "confirm",
-    displayTitle: "未命名物品（第 2 级）",
+    displayTitle: "园艺手套",
     meaningfulDifferences: [],
     triggerReasons: before.reviewReasons,
     planningResult: { status: "pending", recovered: false },
@@ -112,6 +112,82 @@ test("同一幂等请求标识不能代表不同的候选快照", () => withData
     assert.equal(error.statusCode, 409);
     return true;
   });
+}));
+
+test("修改后确认拒绝无效的 Item Identity 等级", () => withDatabase((database) => {
+  const identity = provisionalIdentity(database, "invalid-level");
+
+  assert.throws(() => database.completeCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    decision: "modify",
+    snapshot: { ...identity.algorithmCandidate, level: -1 },
+    actor: "本地操作者",
+    requestId: "invalid-level-review",
+    expectedRevision: identity.revision,
+  }), /Item Identity 等级必须是正整数或未知/);
+  assert.equal(database.getCatalogObject(identity.objectType, identity.objectId).revision, identity.revision);
+}));
+
+test("修改后确认保存完整 Item Identity 和稳定审计说明且不确认 Merge Relation", () => withDatabase((database) => {
+  const identity = provisionalIdentity(database, "modified-identity");
+  assert.equal(identity.algorithmCandidate.name, "园艺手套");
+  assert.equal(identity.algorithmCandidate.type, null);
+  database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId: identity.objectId,
+    payload: {
+      itemId: identity.objectId,
+      chainId: "garden-tools",
+      level: 2,
+      mergeTarget: "modified-identity-next",
+    },
+    sourceType: "structural-inference",
+    sourceRef: "relation-candidate.json",
+    countDuplicate: false,
+  });
+  const gate = new CatalogReviewGate(database);
+  const relationBefore = gate.evaluateObject("merge-relation", identity.objectId);
+  const snapshot = {
+    ...identity.algorithmCandidate,
+    name: "加固园艺手套",
+    level: 3,
+    type: null,
+    displayIcon: {
+      candidateId: 17,
+      assetHash: "sha256:item-icon",
+    },
+  };
+
+  const completed = database.completeCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    decision: "modify",
+    snapshot,
+    actor: "本地操作者",
+    requestId: "modified-identity-review",
+    expectedRevision: identity.revision,
+    createdAt: "2026-07-24T09:00:00.000Z",
+  });
+  const relationAfter = database.getCatalogObject("merge-relation", identity.objectId);
+
+  assert.deepEqual(completed.activeVersion.payload, snapshot);
+  assert.deepEqual(completed.reviewResolution.snapshot, snapshot);
+  assert.equal(completed.reviewResolution.optionalNote, "系统生成：修改后确认完整候选快照");
+  assert.equal(completed.catalogAuditSummary.optionalNote, "系统生成：修改后确认完整候选快照");
+  assert.deepEqual(completed.catalogAuditSummary.meaningfulDifferences, [
+    { fieldPath: "displayIcon", oldValue: null, newValue: snapshot.displayIcon },
+    { fieldPath: "level", oldValue: 2, newValue: 3 },
+    { fieldPath: "name", oldValue: "园艺手套", newValue: "加固园艺手套" },
+  ]);
+  assert.equal(relationAfter.revision, relationBefore.revision);
+  assert.equal(relationAfter.status, relationBefore.status);
+  assert.equal(relationAfter.activeVersion?.id || null, relationBefore.activeVersion?.id || null);
+  assert.equal(relationAfter.candidateVersion?.id || null, relationBefore.candidateVersion?.id || null);
+  assert.equal(database.listCatalogReviewResolutions({
+    objectType: "merge-relation",
+    objectId: identity.objectId,
+  }).length, 0);
 }));
 
 test("重规划失败保留不可变审计并在刷新投影中恢复未完成状态", () => withDatabase((database) => {

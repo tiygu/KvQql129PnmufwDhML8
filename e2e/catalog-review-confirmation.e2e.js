@@ -19,11 +19,11 @@ function listen(server) {
   });
 }
 
-function seedReviewCandidate(runtime, { objectId, name, level }) {
+function seedReviewCandidate(runtime, { objectId, name, level, type = null }) {
   let object = runtime.database.observeCatalogObject({
     objectType: "item-identity",
     objectId,
-    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name },
+    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name, type },
     sourceType: "structural-inference",
     sourceRef: `${objectId}.json`,
     countDuplicate: false,
@@ -31,7 +31,7 @@ function seedReviewCandidate(runtime, { objectId, name, level }) {
   object = runtime.database.saveCatalogVersion({
     objectType: "item-identity",
     objectId,
-    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name },
+    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name, type },
     status: "provisional",
     origin: "inference-gate",
     expectedRevision: object.revision,
@@ -45,6 +45,35 @@ async function main() {
     rootDir: path.resolve(__dirname, ".."),
     dataDir,
     manageConnectionRoute: false,
+  });
+  const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
+  runtime.database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId: editable.objectId,
+    payload: { itemId: editable.objectId, chainId: "review-chain", level: 2, mergeTarget: "browser-next" },
+    sourceType: "structural-inference",
+    sourceRef: "browser-edit-relation.json",
+    countDuplicate: false,
+  });
+  const relationBefore = runtime.catalogGate.evaluateObject("merge-relation", editable.objectId);
+  const iconFile = path.join(dataDir, "browser-edit-icon.png");
+  fs.writeFileSync(iconFile, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+R3v7WQAAAABJRU5ErkJggg==", "base64"));
+  const editableIcon = runtime.database.saveIconCandidate({
+    itemId: editable.objectId,
+    cacheKey: "browser-edit-real-icon",
+    sourceType: "screenshot-runtime",
+    crop: { fixture: "browser" },
+    similarity: { composite: 0.92 },
+    rankScore: 0.92,
+    autoSelect: false,
+    asset: {
+      hash: "a".repeat(64),
+      mimeType: "image/png",
+      width: 1,
+      height: 1,
+      byteSize: fs.statSync(iconFile).size,
+      filePath: iconFile,
+    },
   });
   seedReviewCandidate(runtime, { objectId: "browser-next", name: "下一候选", level: 2 });
   let first = seedReviewCandidate(runtime, { objectId: "browser-first", name: "园艺手套", level: 1 });
@@ -99,10 +128,10 @@ async function main() {
     headless: true,
   });
   const page = await browser.newPage();
-  let completionRequest = null;
+  const completionRequests = [];
   page.on("request", (request) => {
     if (request.method() === "POST" && request.url().endsWith("/api/catalog/review/complete")) {
-      completionRequest = request.postDataJSON();
+      completionRequests.push(request.postDataJSON());
     }
   });
   try {
@@ -130,10 +159,11 @@ async function main() {
     await page.getByText("规划已恢复").waitFor();
     await page.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
 
-    assert.ok(completionRequest);
-    assert.deepEqual(completionRequest.snapshot, first.algorithmCandidate);
-    assert.equal(completionRequest.note, undefined);
-    assert.equal(typeof completionRequest.requestId, "string");
+    const confirmationRequest = completionRequests.at(-1);
+    assert.ok(confirmationRequest);
+    assert.deepEqual(confirmationRequest.snapshot, first.algorithmCandidate);
+    assert.equal(confirmationRequest.note, undefined);
+    assert.equal(typeof confirmationRequest.requestId, "string");
     const replay = await page.evaluate(async (body) => {
       const response = await fetch("/api/catalog/review/complete", {
         method: "POST",
@@ -141,7 +171,7 @@ async function main() {
         body: JSON.stringify(body),
       });
       return { status: response.status, body: await response.json() };
-    }, completionRequest);
+    }, confirmationRequest);
     assert.equal(replay.status, 200);
     assert.equal(replay.body.idempotentReplay, true);
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: "browser-first" }).length, 1);
@@ -154,7 +184,55 @@ async function main() {
     assert.equal(await page.getByRole("button", { name: /疑似“园艺手套”/ }).count(), 0);
     const restored = runtime.getCatalogObject("item-identity", "browser-first");
     assert.equal(restored.reviewStatus, "clear");
-    assert.deepEqual(restored.effectiveValue, completionRequest.snapshot);
+    assert.deepEqual(restored.effectiveValue, confirmationRequest.snapshot);
+
+    const editableEntry = page.getByRole("button", { name: /疑似“旧名称”/ });
+    await editableEntry.click();
+    await page.getByRole("heading", { name: "疑似“旧名称”" }).waitFor();
+    await page.getByRole("textbox", { name: "名称", exact: true }).fill("新名称");
+    await page.getByRole("textbox", { name: "类型", exact: true }).fill("园艺工具");
+    await page.getByRole("textbox", { name: "等级", exact: true }).fill("-1");
+    await page.getByText("等级必须是正整数或留空表示未知").waitFor();
+    assert.equal(await page.getByRole("button", { name: "修改后确认" }).isDisabled(), true);
+    await page.getByRole("textbox", { name: "等级", exact: true }).fill("3");
+    await page.getByRole("button", { name: "选择候选" }).click();
+    await page.getByRole("button", { name: /当前选择/ }).waitFor();
+    assert.equal(await page.getByRole("textbox", { name: "名称", exact: true }).inputValue(), "新名称");
+    assert.equal(await page.getByRole("textbox", { name: "等级", exact: true }).inputValue(), "3");
+    assert.equal(await page.getByRole("textbox", { name: "类型", exact: true }).inputValue(), "园艺工具");
+    assert.equal(await page.getByRole("button", { name: "确认无误" }).count(), 0);
+    await page.getByRole("button", { name: "修改后确认" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存" }).waitFor();
+
+    const modificationRequest = completionRequests.at(-1);
+    assert.equal(modificationRequest.decision, "modify");
+    assert.equal(modificationRequest.note, undefined);
+    assert.equal(modificationRequest.snapshot.name, "新名称");
+    assert.equal(modificationRequest.snapshot.level, 3);
+    assert.equal(modificationRequest.snapshot.type, "园艺工具");
+    assert.deepEqual(modificationRequest.snapshot.displayIcon, {
+      candidateId: editableIcon.id,
+      assetHash: editableIcon.assetHash,
+    });
+    const modifiedAudit = runtime.database.listCatalogAuditSummaries({ objectId: editable.objectId }).at(-1);
+    assert.equal(modifiedAudit.optionalNote, "系统生成：修改后确认完整候选快照");
+    assert.deepEqual(modifiedAudit.meaningfulDifferences.map((difference) => difference.fieldPath), [
+      "displayIcon",
+      "level",
+      "name",
+      "type",
+    ]);
+    assert.equal(
+      runtime.database.getCatalogObject("item-identity", editable.objectId).iconSelectionHistory.at(-1).note,
+      "手动选择图标候选",
+    );
+    const relationAfter = runtime.database.getCatalogObject("merge-relation", editable.objectId);
+    assert.equal(relationAfter.revision, relationBefore.revision);
+    assert.equal(relationAfter.status, relationBefore.status);
+    assert.equal(runtime.database.listCatalogReviewResolutions({
+      objectType: "merge-relation",
+      objectId: editable.objectId,
+    }).length, 0);
   } finally {
     await browser.close();
     await server.close();

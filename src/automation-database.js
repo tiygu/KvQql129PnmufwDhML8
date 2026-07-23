@@ -661,6 +661,10 @@ class AutomationDatabase {
     const actor = String(input.actor || "").trim();
     const note = String(input.note || "").trim();
     if (!actor) throw new TypeError("catalog review actor is required");
+    const generatedRulingNote = decision === "confirm"
+      ? "系统生成：确认完整候选快照"
+      : "系统生成：修改后确认完整候选快照";
+    const optionalNote = note || (decision === "modify" ? generatedRulingNote : null);
     const hasExplicitRequestId = String(input.requestId || "").trim().length > 0;
     const requestId = String(input.requestId || `legacy-review:${crypto.randomUUID()}`).trim();
     if (!requestId) throw new TypeError("catalog review requestId is required");
@@ -670,13 +674,17 @@ class AutomationDatabase {
       const algorithmCandidate = this._catalogAlgorithmCandidate(before);
       const submittedSnapshot = input.snapshot ?? input.payload ?? (decision === "confirm" ? algorithmCandidate : null);
       const payload = validateCatalogReviewPayload(identity, submittedSnapshot);
+      if (identity.objectType === "item-identity" && payload.level != null
+        && (!Number.isInteger(Number(payload.level)) || Number(payload.level) <= 0)) {
+        throw new TypeError("Item Identity 等级必须是正整数或未知");
+      }
       const requestFingerprint = canonicalJson({
         objectType: identity.objectType,
         objectId: identity.objectId,
         decision,
         snapshot: payload,
         actor,
-        optionalNote: note || null,
+        optionalNote,
       });
       const existingResolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(requestId);
       if (existingResolution) {
@@ -701,7 +709,7 @@ class AutomationDatabase {
       const nextRevision = Number(before.revision) + 1;
       const now = input.createdAt || new Date().toISOString();
       const json = (value) => JSON.stringify(value === undefined ? null : value);
-      const rulingNote = note || (decision === "confirm" ? "系统生成：确认完整候选快照" : "系统生成：修改后确认完整候选快照");
+      const rulingNote = note || generatedRulingNote;
       const insertRuling = this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)`);
       for (const ruling of activeRulings.values()) {
@@ -735,7 +743,7 @@ class AutomationDatabase {
         decision,
         canonicalJson(payload),
         actor,
-        note || null,
+        optionalNote,
         nextRevision,
         canonicalJson(planningResult),
         now,
@@ -754,7 +762,7 @@ class AutomationDatabase {
         triggerReasons,
         planningResult,
         evidenceReferences,
-        optionalNote: note || null,
+        optionalNote,
         createdAt: now,
       };
       this.db.prepare(`INSERT INTO catalog_audit_summaries(resolution_id,summary_json,created_at,updated_at)

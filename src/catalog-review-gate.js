@@ -17,7 +17,11 @@ function identityPayload(payload) {
   return {
     itemId: String(payload.itemId ?? payload.id ?? ""),
     chainId: payload.chainId == null ? null : String(payload.chainId),
+    name: payload.name == null && payload.displayName == null && payload.descriptionKey == null
+      ? null
+      : String(payload.name ?? payload.displayName ?? payload.descriptionKey),
     level,
+    type: payload.type == null && payload.itemType == null ? null : String(payload.type ?? payload.itemType),
     baseUnits: Number(payload.baseUnits ?? (level > 0 ? 2 ** (level - 1) : 0)),
     iconResourceIdentifier: payload.iconResourceIdentifier ?? payload.iconResource ?? null,
     iconEvidenceStatus: payload.iconEvidenceStatus || "missing",
