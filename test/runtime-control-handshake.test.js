@@ -131,6 +131,10 @@ test("CDP Adapter installs once in the selected context and reuses a healthy bri
     capabilities: healthyHandshake().capabilities,
     fallback: { active: false, reason: null },
     eventBinding: { active: false, appliedRevision: -1 },
+    buttonFallback: {
+      usageCount: 0,
+      resolutions: { "component-handler": 0, "node-event": 0, "coordinate-input": 0 },
+    },
   });
 });
 

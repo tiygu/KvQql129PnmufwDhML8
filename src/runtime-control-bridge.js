@@ -13,7 +13,7 @@ const { SaleActionExecutor } = require("./sale-actions");
 const { randomUUID } = require("node:crypto");
 
 const RUNTIME_CONTROL_PROTOCOL_VERSION = 1;
-const RUNTIME_CONTROL_BRIDGE_VERSION = "1.1.0";
+const RUNTIME_CONTROL_BRIDGE_VERSION = "1.2.0";
 
 /**
  * Runtime Semantic Control Bridge interface implemented by both adapters.
@@ -484,6 +484,246 @@ function buildBridgeInstallExpression(contextGeneration) {
       }
       return cacheAcknowledgement(command.operationId, acknowledgement);
     };
+    const enumerateButtons = () => {
+      const MAX_BUTTONS = 64;
+      const { currentScene } = resolveRuntime();
+      const buttons = [];
+      const computeScreenBounds = (node) => {
+        try {
+          const transform = node.getComponent?.(cc.UITransform) || node._uiTransformComponent;
+          const worldPos = node.worldPosition
+            || (typeof node.getWorldPosition === "function" ? node.getWorldPosition() : null)
+            || node.position || {};
+          return {
+            x: Number(worldPos.x ?? worldPos._x ?? 0),
+            y: Number(worldPos.y ?? worldPos._y ?? 0),
+            width: Number(transform?.width ?? node.width ?? 0),
+            height: Number(transform?.height ?? node.height ?? 0),
+          };
+        } catch (_) { return { x: 0, y: 0, width: 0, height: 0 }; }
+      };
+      const nodeActive = (node) => {
+        try { return node?.activeInHierarchy === true && node?.active !== false; } catch (_) { return false; }
+      };
+      const context = resolveNavigationContext();
+      const walk = (node, depth) => {
+        if (!node || depth > 32 || buttons.length >= MAX_BUTTONS) return;
+        const components = Array.isArray(node._components) ? node._components : [];
+        for (const comp of components) {
+          if (buttons.length >= MAX_BUTTONS) return;
+          if (!comp) continue;
+          const isButton = comp.interactable !== undefined
+            && (Array.isArray(comp.clickEvents) || comp.clickEvents != null);
+          if (!isButton) continue;
+          buttons.push({
+            nodeName: safe(() => node.name, ""),
+            activeInHierarchy: nodeActive(node),
+            interactable: !!safe(() => comp.interactable, false),
+            handlerCount: Array.isArray(comp.clickEvents) ? comp.clickEvents.length : 0,
+            handlers: (Array.isArray(comp.clickEvents) ? comp.clickEvents : []).slice(0, 8).map((h) => ({
+              targetName: safe(() => h?.target?.name, null),
+              component: safe(() => h?.component, null),
+              handler: safe(() => h?.handler, null),
+              customEventData: safe(() => h?.customEventData, null),
+            })),
+            screenBounds: computeScreenBounds(node),
+            inCurrentGameplayArea: context.boardVisible || context.mapVisible,
+          });
+        }
+        const children = Array.isArray(node.children) ? node.children
+          : (Array.isArray(node._children) ? node._children : []);
+        for (const child of children) walk(child, depth + 1);
+      };
+      walk(currentScene, 0);
+      return {
+        scope: "current-scene-observation",
+        count: buttons.length,
+        truncated: buttons.length >= MAX_BUTTONS,
+        buttons,
+      };
+    };
+    const resolveButtonTarget = (buttons, hint) => {
+      if (!hint || typeof hint !== "object") return { resolved: false, reason: "no-hint" };
+      const matches = buttons.filter((btn) => {
+        if (!btn.activeInHierarchy || !btn.interactable) return false;
+        if (!btn.inCurrentGameplayArea) return false;
+        if (hint.nodeName != null && btn.nodeName !== hint.nodeName) return false;
+        if (hint.handlerComponent != null
+          && !btn.handlers.some((h) => h.component === hint.handlerComponent)) return false;
+        if (hint.handlerName != null
+          && !btn.handlers.some((h) => h.handler === hint.handlerName)) return false;
+        if (hint.targetName != null
+          && !btn.handlers.some((h) => h.targetName === hint.targetName)) return false;
+        return true;
+      });
+      if (matches.length === 0) return { resolved: false, reason: "no-matching-button" };
+      if (matches.length > 1) return { resolved: false, reason: "ambiguous-buttons", candidates: matches.map((m) => m.nodeName) };
+      return { resolved: true, button: matches[0] };
+    };
+    const locateButtonComponent = (nodeName) => {
+      if (!nodeName) return null;
+      const { currentScene } = resolveRuntime();
+      const find = (node, depth) => {
+        if (!node || depth > 32) return null;
+        if (node.name === nodeName && Array.isArray(node._components)) {
+          for (const comp of node._components) {
+            if (comp && comp.interactable !== undefined
+              && (Array.isArray(comp.clickEvents) || comp.clickEvents != null)) {
+              return { node, component: comp };
+            }
+          }
+        }
+        const children = Array.isArray(node.children) ? node.children
+          : (Array.isArray(node._children) ? node._children : []);
+        for (const child of children) {
+          const found = find(child, depth + 1);
+          if (found) return found;
+        }
+        return null;
+      };
+      return find(currentScene, 0);
+    };
+    const executeButtonFallback = async (command) => {
+      if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
+        return reject(command, "stale-revision", "runtime-revision-stale");
+      }
+      if (command.method == null || command.target == null) {
+        return reject(command, "rejected-precondition", "fallback-missing-method-or-target");
+      }
+      const allButtons = enumerateButtons();
+      const hint = command.buttonHint || {};
+      if (allButtons.count === 0) {
+        return reject(command, "unsupported-capability", "fallback-no-buttons-in-scene");
+      }
+      const resolution = resolveButtonTarget(allButtons.buttons, hint);
+      if (!resolution.resolved) {
+        if (resolution.reason === "ambiguous-buttons") {
+          return reject(command, "unsupported-capability", "fallback-ambiguous");
+        }
+        return reject(command, "rejected-precondition", "fallback-no-match");
+      }
+      const candidate = resolution.button;
+      if (!candidate.activeInHierarchy) {
+        return reject(command, "rejected-precondition", "fallback-button-inactive");
+      }
+      if (!candidate.interactable) {
+        return reject(command, "rejected-precondition", "fallback-button-not-interactable");
+      }
+      if (candidate.handlerCount === 0) {
+        return reject(command, "unsupported-capability", "fallback-no-handlers");
+      }
+      const located = locateButtonComponent(candidate.nodeName);
+      if (!located) {
+        return reject(command, "unsupported-capability", "fallback-locate-failed");
+      }
+      const { node, component } = located;
+      const currentNodeActive = node?.activeInHierarchy === true && node?.active !== false;
+      const currentInteractable = !!component?.interactable;
+      if (!currentNodeActive) {
+        return reject(command, "rejected-precondition", "fallback-button-located-inactive");
+      }
+      if (!currentInteractable) {
+        return reject(command, "rejected-precondition", "fallback-button-located-not-interactable");
+      }
+      // Validate that the navigation target is reachable from the current gameplay area
+      const ctx = resolveNavigationContext();
+      if (command.method === "navigate") {
+        const alreadyAtTarget = (command.target === "board" && ctx.boardVisible)
+          || (command.target === "map" && ctx.mapVisible && !ctx.boardVisible);
+        if (alreadyAtTarget) {
+          return cacheAcknowledgement(command.operationId, {
+            ...acknowledgementBase(command, false),
+            ok: true,
+            outcome: "accepted-unchanged",
+            reason: "button-fallback-already-at-target",
+            delta: { scene: ctx.scene, boardVisible: ctx.boardVisible, mapVisible: ctx.mapVisible }
+          });
+        }
+        if (!ctx.mapVisible && !ctx.boardVisible) {
+          return reject(command, "rejected-precondition", "fallback-no-gameplay-area");
+        }
+      }
+      const handlerList = Array.isArray(component.clickEvents) ? component.clickEvents : [];
+      const matchingHandler = handlerList.find((h) => {
+        if (hint.handlerComponent != null && h?.component !== hint.handlerComponent) return false;
+        if (hint.handlerName != null && h?.handler !== hint.handlerName) return false;
+        if (hint.targetName != null && h?.target?.name !== hint.targetName) return false;
+        return hint.handlerComponent != null || hint.handlerName != null || hint.targetName != null || true;
+      }) || handlerList[0];
+      let tier = null;
+      let fallbackError = null;
+      // Tier 1: invoke the handler through the component's emit or direct dispatch
+      if (matchingHandler && matchingHandler.target && matchingHandler.component && matchingHandler.handler) {
+        try {
+          const targetComp = matchingHandler.target.getComponent
+            ? matchingHandler.target.getComponent(matchingHandler.component)
+            : null;
+          if (targetComp && typeof targetComp[matchingHandler.handler] === "function") {
+            targetComp[matchingHandler.handler](matchingHandler.customEventData);
+            tier = "component-handler";
+          }
+        } catch (error) {
+          fallbackError = String(error?.message || error || "component-handler-failed");
+        }
+      }
+      // Tier 2: try node event emission
+      if (tier == null) {
+        try {
+          if (typeof component?.emit === "function") {
+            component.emit("click");
+            tier = "node-event";
+          } else if (typeof node?.emit === "function") {
+            node.emit("click", component);
+            tier = "node-event";
+          }
+        } catch (error) {
+          fallbackError = fallbackError || String(error?.message || error || "node-event-failed");
+        }
+      }
+      // Tier 3: coordinate input via touch simulation
+      if (tier == null) {
+        try {
+          const bounds = candidate.screenBounds;
+          if (bounds.width > 0 && bounds.height > 0) {
+            const center = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 };
+            const currentScene = safe(() => cc?.director?.getScene?.(), null);
+            if (currentScene && typeof currentScene.emit === "function") {
+              currentScene.emit("touchstart", center);
+              currentScene.emit("touchend", center);
+              tier = "coordinate-input";
+            }
+          }
+        } catch (error) {
+          fallbackError = fallbackError || String(error?.message || error || "coordinate-input-failed");
+        }
+      }
+      if (tier == null) {
+        return reject(command, "bridge-failure", fallbackError || "fallback-all-tiers-failed");
+      }
+      revision += 1;
+      invalidateMergeContext();
+      publishEvent("cache-invalidated", command.operationId, { scope: "button-fallback", tier });
+      const after = resolveNavigationContext();
+      const arrived = command.method === "navigate"
+        ? (command.target === "board" ? after.boardVisible : (after.mapVisible && !after.boardVisible))
+        : true;
+      const acknowledgement = {
+        ...acknowledgementBase(command, arrived),
+        ok: true,
+        outcome: arrived ? "accepted-changed" : "uncertain-result",
+        reason: arrived ? "button-fallback-complete" : "button-fallback-dispatched-awaiting-verification",
+        delta: {
+          scene: after.scene,
+          boardVisible: after.boardVisible,
+          mapVisible: after.mapVisible,
+          buttonFallback: { tier, nodeName: candidate.nodeName },
+        }
+      };
+      if (arrived) {
+        publishEvent("state-changed", command.operationId, acknowledgement.delta);
+      }
+      return cacheAcknowledgement(command.operationId, acknowledgement);
+    };
     const resolveMergeContext = () => {
       const { runtime } = resolveRuntime();
       const candidates = boardControllerCandidates(runtime);
@@ -804,6 +1044,9 @@ function buildBridgeInstallExpression(contextGeneration) {
       if (command.method === "navigate" && capabilities.navigation) {
         return executeNavigationCommand(command);
       }
+      if (command.method === "navigate" && command.fallback === "button") {
+        return executeButtonFallback(command);
+      }
       if (command.method !== "merge" || !capabilities.merge) {
         return reject(command, "unsupported-capability", command.method + "-unsupported");
       }
@@ -936,6 +1179,8 @@ function buildBridgeInstallExpression(contextGeneration) {
       readBoard,
       readOrderSlot,
       readGameplayArea,
+      enumerateButtons,
+      executeButtonFallback,
       executeCommand,
       drainEventQueue,
       invalidateMergeContext
@@ -1082,6 +1327,8 @@ class CdpRuntimeControlAdapter {
     this.appliedEventRevision = -1;
     this.bindingListener = null;
     this.eventsSinceLastRead = [];
+    this.buttonFallbackUsage = 0;
+    this.buttonFallbackResolutions = { "component-handler": 0, "node-event": 0, "coordinate-input": 0 };
   }
 
   async ready(signal = null) {
@@ -1829,6 +2076,201 @@ class CdpRuntimeControlAdapter {
         targetedVerification: cloneRecord(areaRead),
       };
     }
+    // When navigation capability is unavailable, try button fallback before legacy
+    const canUseButtonFallbackNavigation = !this.fallbackReason
+      && this.readiness?.capabilities?.navigation !== true
+      && command?.type === "navigate";
+    if (canUseButtonFallbackNavigation) {
+      const target = command.target;
+      if (target !== "board" && target !== "map") {
+        throw Object.assign(new Error("button-fallback navigation requires target board or map"), {
+          code: "RUNTIME_CONTROL_COMMAND_INVALID",
+          reason: "navigation-target-invalid",
+        });
+      }
+      this.buttonFallbackUsage += 1;
+      // Step 1: enumerate buttons to find candidates for navigation
+      let buttonEnum = null;
+      try {
+        buttonEnum = await this.client.evaluate(
+          "globalThis.miniGameCtl.enumerateButtons()",
+          this.contextId,
+          { signal },
+        );
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        // Fall through to legacy if enumeration fails
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      if (!buttonEnum || !Array.isArray(buttonEnum.buttons) || buttonEnum.count === 0) {
+        // No buttons found — fall through to legacy
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      // Step 2: build a hint for the button we want
+      // For map→board navigation, look for button whose handler calls onBoardClick or targets EntranceViewController
+      // For board→map navigation, look for button whose handler calls onMapButtonClick
+      // Try by handler name first, then by component identity if handler name doesn't match
+      const resolveHint = (target === "board"
+        ? [
+          { handlerName: "onBoardClick" },
+          { targetName: "EntranceViewController" },
+          { handlerComponent: "EntranceViewController" },
+        ]
+        : [
+          { handlerName: "onMapButtonClick" },
+          { handlerComponent: "UserBoardViewController" },
+        ]);
+      // Step 3: try each hint until one resolves uniquely
+      let matchingButton = null;
+      let chosenHint = null;
+      for (const hint of resolveHint) {
+        const matches = buttonEnum.buttons.filter((btn) => {
+          if (!btn.activeInHierarchy || !btn.interactable) return false;
+          if (!btn.inCurrentGameplayArea) return false;
+          if (hint.handlerName != null
+            && !btn.handlers.some((h) => h.handler === hint.handlerName)) return false;
+          if (hint.targetName != null
+            && !btn.handlers.some((h) => h.targetName === hint.targetName)) return false;
+          if (hint.handlerComponent != null
+            && !btn.handlers.some((h) => h.component === hint.handlerComponent)) return false;
+          return true;
+        });
+        if (matches.length === 1) {
+          matchingButton = matches[0];
+          chosenHint = hint;
+          break;
+        }
+        // Ambiguous — skip this hint, try next
+      }
+      if (!matchingButton) {
+        // No unambiguous button match — fall through to legacy
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      // Step 4: execute button fallback via the injected bridge
+      const operationId = String(command.operationId || `btn-fallback-${randomUUID()}`);
+      const expectedRevision = command.expectedRevision == null
+        ? this.readiness.revision
+        : Number(command.expectedRevision);
+      const fallbackCommand = {
+        operationId,
+        expectedRevision,
+        method: "navigate",
+        target,
+        fallback: "button",
+        buttonHint: chosenHint,
+      };
+      this.cachedBaseline = null;
+      const expression = `globalThis.miniGameCtl.executeCommand(${JSON.stringify(fallbackCommand)})`;
+      let acknowledgement = null;
+      for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
+        try {
+          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            this.requiresBroadReconciliation = true;
+            return {
+              ok: false,
+              executed: true,
+              reason: "button-fallback-navigation-aborted",
+              stopReason: "button-fallback-navigation-aborted",
+              actions: [],
+              uncertainAction: { type: "navigate", target },
+              pauseRequested: false,
+            };
+          }
+        }
+      }
+      if (acknowledgement == null) {
+        // Bridge call failed — fall through to legacy
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      const ackValid = acknowledgement
+        && typeof acknowledgement === "object"
+        && Number.isInteger(acknowledgement.revision)
+        && typeof acknowledgement.outcome === "string"
+        && typeof acknowledgement.reason === "string";
+      if (!ackValid) {
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      this.readiness.revision = acknowledgement.revision;
+      // Track fallback resolution tier
+      const fallbackTier = acknowledgement.delta?.buttonFallback?.tier;
+      if (fallbackTier && this.buttonFallbackResolutions[fallbackTier] != null) {
+        this.buttonFallbackResolutions[fallbackTier] += 1;
+      }
+      if (acknowledgement.outcome === "stale-revision") {
+        this.requiresBroadReconciliation = false;
+        const replanState = await this.readState(signal);
+        return {
+          ok: false,
+          executed: false,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          replanRequested: true,
+          replanState,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (["rejected-precondition", "unsupported-capability", "bridge-failure"].includes(acknowledgement.outcome)) {
+        // Button fallback rejected — fall through to legacy
+        this.cachedBaseline = null;
+        this.requiresBroadReconciliation = true;
+        return this.legacy.execute(command, request);
+      }
+      // Dispatched — verify with gameplay-area targeted reads, same as semantic navigation
+      let arrived = acknowledgement.outcome === "accepted-changed"
+        && acknowledgement.reason === "button-fallback-complete";
+      let areaRead = null;
+      const maxVerificationAttempts = 6;
+      for (let attempt = 0; !arrived && attempt < maxVerificationAttempts; attempt += 1) {
+        assertNotAborted(signal);
+        try {
+          areaRead = await this.client.evaluate(
+            "globalThis.miniGameCtl.readGameplayArea()",
+            this.contextId,
+            { signal },
+          );
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          continue;
+        }
+        if (areaRead && Number.isInteger(areaRead.revision)) {
+          this.readiness.revision = areaRead.revision;
+        }
+        arrived = target === "board" ? areaRead?.boardVisible === true
+          : (areaRead?.mapVisible === true && areaRead?.boardVisible !== true);
+        if (arrived) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      if (arrived) {
+        this.requiresBroadReconciliation = false;
+        return {
+          ok: true,
+          executed: true,
+          reason: "navigation-verified-via-button-fallback",
+          stopReason: "navigation-complete",
+          actions: [{ type: "navigate", target, verified: true, fallback: "button", tier: fallbackTier }],
+          acknowledgement: cloneRecord(acknowledgement),
+          targetedVerification: cloneRecord(areaRead),
+          diagnostics: { buttonFallback: { tier: fallbackTier, nodeName: acknowledgement.delta?.buttonFallback?.nodeName } },
+        };
+      }
+      // Fall through to legacy as last resort
+      this.cachedBaseline = null;
+      this.requiresBroadReconciliation = true;
+      return this.legacy.execute(command, request);
+    }
     const canUseSemanticMerge = !this.fallbackReason
       && this.readiness?.capabilities?.merge === true
       && command?.type === "run-board-action"
@@ -2044,6 +2486,10 @@ class CdpRuntimeControlAdapter {
       capabilities: cloneRecord(handshake.capabilities || {}),
       fallback: { active: !!this.fallbackReason, reason: this.fallbackReason },
       eventBinding: { active: !!this.bindingListener, appliedRevision: this.appliedEventRevision },
+      buttonFallback: {
+        usageCount: this.buttonFallbackUsage,
+        resolutions: cloneRecord(this.buttonFallbackResolutions),
+      },
     };
   }
 

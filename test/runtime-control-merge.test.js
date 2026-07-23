@@ -1,4 +1,4 @@
-"use strict";
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -196,7 +196,7 @@ test("CDP Adapter executes an invariant-complete merge through the semantic brid
   });
 
   assert.equal(readiness.capabilities.merge, true);
-  assert.equal(readiness.bridgeVersion, "1.1.0");
+  assert.equal(readiness.bridgeVersion, "1.2.0");
   assert.equal(fixture.legacyExecutions(), 0);
   assert.equal(fixture.evaluations.length, 2);
   assert.match(fixture.evaluations[1].expression, /^globalThis\.miniGameCtl\.executeCommand\(/);
@@ -399,7 +399,7 @@ test("the injected command contract reports unsupported methods with a stable ou
   assert.deepEqual(JSON.parse(JSON.stringify(acknowledgement)), {
     ok: false,
     outcome: "unsupported-capability",
-    reason: "merge-unsupported",
+    reason: "production-unsupported",
     operationId: "unsupported-command",
     method: "production",
     expectedRevision: 0,
