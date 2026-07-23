@@ -8,14 +8,9 @@ const crypto = require("node:crypto");
 const { ZipArchive } = require("archiver");
 const { AdapterLab } = require("./lab");
 const { getConfig } = require("./config");
-const { summarizeSnapshot } = require("../scripts/summarize-target-snapshot.cjs");
-const { BOARD_SCAN_EXPRESSION } = require("./board-automation");
 const { buildGameState } = require("./game-state");
 const { buildOptimizationPlan } = require("./order-optimizer");
-const { BoardAutomationRunner } = require("./board-runner");
-const { OrderSubmitter } = require("./order-actions");
 const { MapMissionCompleter } = require("./map-actions");
-const { SceneNavigator } = require("./scene-navigation");
 const { OrderCoinLoop } = require("./order-coin-loop");
 const { FullAutomationLoop } = require("./full-automation-loop");
 const { AutomationDatabase } = require("./automation-database");
@@ -24,8 +19,6 @@ const { buildCatalog } = require("../scripts/build-item-catalog.cjs");
 const { migrateLegacyCatalog } = require("./catalog-migration");
 const { CatalogReviewGate, buildPlanningCatalogFromRepository } = require("./catalog-review-gate");
 const { PauseGate } = require("./pause-gate");
-const { WarehouseActionExecutor } = require("./warehouse-actions");
-const { ProductionModeExecutor } = require("./production-mode-actions");
 const { SaleActionExecutor } = require("./sale-actions");
 const { normalizeSalePolicy } = require("./sale-policy");
 const { IdleAutomationSession } = require("./idle-automation-session");
@@ -33,6 +26,7 @@ const { IconEvidenceService, resolveCocosSpriteFrame, resolveScreenshotTarget, c
 const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./catalog-evidence");
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
 const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
+const { LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
 
 function mergeCatalogs(base, update) {
   const mergeBy = (left, right, keyOf) => [...new Map([...(left || []), ...(right || [])].map((item) => [String(keyOf(item)), item])).values()];
@@ -60,7 +54,7 @@ function waitForPromiseOrAbort(promise, signal = null) {
 }
 
 class AutomationRuntime {
-  constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true } = {}) {
+  constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true, runtimeControl = null } = {}) {
     this.rootDir = rootDir;
     this.url = url;
     this.onEvent = onEvent;
@@ -68,6 +62,8 @@ class AutomationRuntime {
     this.connectionAutoStartEnabled = this.manageConnectionRoute;
     this.lab = null;
     this.selection = null;
+    this.runtimeControl = runtimeControl;
+    this.runtimeControlInjected = runtimeControl != null;
     this.connectPromise = null;
     this.connectController = null;
     this.lastState = buildGameState();
@@ -164,6 +160,20 @@ class AutomationRuntime {
   }
 
   emit(type, payload = {}) { this.onEvent?.({ type, at: new Date().toISOString(), ...payload }); }
+
+  ensureRuntimeControl() {
+    if (this.runtimeControl) return this.runtimeControl;
+    if (!this.lab || !this.selection?.probe) {
+      throw Object.assign(new Error("runtime control is not connected"), { code: "RUNTIME_CONTROL_NOT_CONNECTED" });
+    }
+    this.runtimeControl = new LegacyRuntimeControlAdapter({
+      lab: this.lab,
+      selection: this.selection,
+      collectState: (signal) => this.collectState(signal),
+      onWarehouseInventoryInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason),
+    });
+    return this.runtimeControl;
+  }
 
   getCatalogView({ includeRepositoryObjects = true } = {}) {
     const executionMode = this.getSettings().mode;
@@ -382,11 +392,12 @@ class AutomationRuntime {
     await this.lab?.close().catch(() => {});
     this.lab = null;
     this.selection = null;
+    if (!this.runtimeControlInjected) this.runtimeControl = null;
     return this.connectionService.stop();
   }
 
   connect(signal = null) {
-    if (this.lab && this.selection?.probe) return this.selection;
+    if ((this.lab || this.runtimeControlInjected) && this.selection?.probe) return this.selection;
     if (signal?.aborted) return Promise.reject(Object.assign(new Error("operation aborted"), { name: "AbortError" }));
     if (this.connectPromise) return waitForPromiseOrAbort(this.connectPromise, signal);
     const controller = new AbortController();
@@ -399,10 +410,22 @@ class AutomationRuntime {
   }
 
   async connectOnce(signal = null) {
+    if (this.runtimeControlInjected) {
+      const readiness = await this.runtimeControl.ready(signal);
+      const selection = {
+        probe: { context: { id: readiness?.contextId ?? "runtime-control" } },
+        adapter: { id: readiness?.adapterId || "runtime-control" },
+        runtimeControl: readiness,
+      };
+      this.selection = selection;
+      this.emit("connection", { connected: true, contextId: selection.probe.context.id, adapterId: selection.adapter.id });
+      return selection;
+    }
     const previous = this.lab;
     if (previous) {
       this.lab = null;
       this.selection = null;
+      this.runtimeControl = null;
       await previous.close().catch(() => {});
     }
     const lab = new AdapterLab(getConfig({ url: this.url || undefined }));
@@ -415,10 +438,12 @@ class AutomationRuntime {
       throw new Error("未发现目标游戏运行上下文，请确认游戏和 CDP 路线已启动");
     }
     this.selection = selection;
+    this.ensureRuntimeControl();
     lab.client.once("close", () => {
       if (this.lab !== lab) return;
       this.selection = null;
       this.lab = null;
+      this.runtimeControl = null;
       this.emit("connection", { connected: false, reason: "cdp-websocket-closed" });
     });
     this.emit("connection", { connected: true, contextId: selection.probe.context.id });
@@ -426,20 +451,21 @@ class AutomationRuntime {
   }
 
   async collectState(signal = null) {
-    const selection = await this.connect(signal);
-    let snapshot;
-    try { snapshot = await this.lab.snapshot(selection, { signal }); }
+    await this.connect(signal);
+    const runtimeControl = this.ensureRuntimeControl();
+    let state;
+    try { state = await runtimeControl.readState(signal); }
     catch (error) {
       if (error?.name === "AbortError") throw error;
-      const failedLab = this.lab;
-      this.selection = null;
-      this.lab = null;
-      await failedLab?.close().catch(() => {});
+      if (!this.runtimeControlInjected) {
+        const failedLab = this.lab;
+        this.selection = null;
+        this.lab = null;
+        this.runtimeControl = null;
+        await failedLab?.close().catch(() => {});
+      }
       throw error;
     }
-    let boardState = null;
-    try { boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, selection.probe.context.id, { signal }); } catch (error) { if (error?.name === "AbortError") throw error; }
-    const state = buildGameState({ state: summarizeSnapshot(snapshot), boardState });
     if (this.warehouseInventoryKnowledgeInvalidated) {
       if (state.scene === "warehouse" && state.warehouse?.visible && state.warehouse?.inventoryKnowledge?.status === "loaded") {
         this.warehouseInventoryKnowledgeInvalidated = false;
@@ -587,22 +613,28 @@ class AutomationRuntime {
   }
 
   createRuntime(options, sessionId = null, nextSequence = null) {
-    const contextId = this.selection.probe.context.id;
+    const runtimeControl = this.ensureRuntimeControl();
     const collectState = (signal = null) => this.collectState(signal);
-    const runner = new BoardAutomationRunner({ client: this.lab.client, contextId, delayMs: options.delayMs, evaluateTimeoutMs: options.timeoutMs });
-    const submitter = new OrderSubmitter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const navigator = new SceneNavigator({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const mapCompleter = new MapMissionCompleter({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const warehouse = new WarehouseActionExecutor({ client: this.lab.client, contextId, collectState, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs, onInventoryKnowledgeInvalidated: (reason) => this.invalidateWarehouseInventoryKnowledge(reason) });
-    const productionModes = new ProductionModeExecutor({ client: this.lab.client, contextId, settleMs: options.settleMs, evaluateTimeoutMs: options.timeoutMs });
-    const orderLoop = new OrderCoinLoop({ collectState, planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot, salePolicy: options.salePolicy, executionMode: options.mode }), runBoardAction: ({ producer, merge, plannedAction, signal }) => runner.run({ producer, merge, plannedAction, maxActions: 1, execute: true, signal }), submitOrder: (slot, { signal }) => submitter.submit(slot, { execute: true, signal }), preflightStore: (index, { signal }) => warehouse.preflight(index, { signal }), storeBoardItem: (index, { signal, preflight }) => warehouse.move(index, { execute: true, signal, preflight }), loadWarehouseInventory: ({ signal }) => warehouse.loadInventory({ execute: true, signal }), retrieveWarehouseItem: (action, request) => warehouse.retrieve(action, { ...request, execute: true }), switchProductionMode: (index, modeId, request) => productionModes.switch(index, modeId, { ...request, execute: true }), allowProductionModeSwitch: options.mode !== "observation" });
+    const execute = (command, signal) => runtimeControl.execute(command, { signal, options });
+    const orderLoop = new OrderCoinLoop({
+      collectState,
+      planOrders: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: options.mode === "observation", executionMode: options.mode }), state, strategy: options.strategy, prioritySlot: options.prioritySlot, salePolicy: options.salePolicy, executionMode: options.mode }),
+      runBoardAction: ({ producer, merge, plannedAction, signal }) => execute({ type: "run-board-action", producer, merge, plannedAction }, signal),
+      submitOrder: (slot, { signal, before }) => execute({ type: "submit-order", slot, before }, signal),
+      preflightStore: (index, { signal }) => execute({ type: "preflight-warehouse-store", index }, signal),
+      storeBoardItem: (index, { signal, preflight }) => execute({ type: "store-to-warehouse", index, preflight }, signal),
+      loadWarehouseInventory: ({ signal }) => execute({ type: "load-warehouse-inventory" }, signal),
+      retrieveWarehouseItem: (action, request) => execute({ type: "retrieve-from-warehouse", action, request: { inventory: request.inventory, before: request.before } }, request.signal),
+      switchProductionMode: (index, modeId, request) => execute({ type: "switch-production-mode", index, modeId, request: { expectedCurrentModeId: request.expectedCurrentModeId } }, request.signal),
+      allowProductionModeSwitch: options.mode !== "observation",
+    });
     let sequence = 0;
     return new FullAutomationLoop({
       collectState,
       autoMapUpgrade: !!options.autoMapUpgrade,
-      navigate: (target, { signal }) => navigator.go(target, { execute: true, signal }),
+      navigate: (target, { signal }) => execute({ type: "navigate", target }, signal),
       runOrderCycle: (runOptions) => orderLoop.run(runOptions),
-      completeMapMission: ({ signal }) => mapCompleter.complete({ execute: true, signal }),
+      completeMapMission: ({ signal }) => execute({ type: "complete-map-mission" }, signal),
       onEvent: (event) => {
         const actionSequence = nextSequence ? nextSequence() : ++sequence;
         if (sessionId) this.database.logAction({ sessionId, sequence: actionSequence, type: event.type, reason: event.reason, ok: event.ok, before: event.before, after: event.after, details: event });
