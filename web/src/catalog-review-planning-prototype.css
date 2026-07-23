@@ -1,0 +1,246 @@
+.crp-planning {
+  display: grid;
+  grid-template-columns: 1fr 1.4fr;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.crp-queue-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-top: 15px;
+  padding: 4px;
+  border-radius: 10px;
+  background: #edf2ed;
+}
+
+.crp-queue .crp-queue-tabs button {
+  display: block;
+  width: auto;
+  padding: 7px 5px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #71847b;
+  text-align: center;
+}
+
+.crp-queue .crp-queue-tabs button.active {
+  background: #fff;
+  color: #285f48;
+  box-shadow: 0 2px 7px #173c3115;
+}
+
+.crp-planning article {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: #f8faf8;
+}
+
+.crp-planning article.blocked {
+  border-color: #e5b6a8;
+  background: #fff3ef;
+}
+
+.crp-planning article.clear {
+  border-color: #b8d9c2;
+  background: #f0f8f1;
+}
+
+.crp-planning span,
+.crp-planning strong,
+.crp-planning small {
+  display: block;
+}
+
+.crp-planning span {
+  color: #71877d;
+  font-size: 11px;
+}
+
+.crp-planning strong {
+  margin: 6px 0 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crp-planning small {
+  color: #60776d;
+  line-height: 1.55;
+}
+
+.crp-planning small b {
+  color: #31885a;
+}
+
+.crp-blocker-link {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin: 7px 5px 0 0;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 7px;
+  background: #f4d7ce;
+  color: #9a4f3c;
+  font-size: 11px;
+}
+
+.crp-chain-card {
+  grid-column: 1 / -1;
+}
+
+.crp-chain-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+
+.crp-chain-controls {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 36px;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.crp-chain-controls > button {
+  width: 36px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #cbd9cf;
+  border-radius: 10px;
+  background: #fff;
+  color: #396b56;
+}
+
+.crp-chain-track {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  padding: 12px 8px 18px;
+  scroll-snap-type: x proximity;
+  scrollbar-color: #61a979 #e2ebe4;
+  scrollbar-width: thin;
+}
+
+.crp-chain-track > div {
+  width: 104px;
+  flex: 0 0 104px;
+  position: relative;
+  padding: 10px 8px;
+  border: 1px solid #dce7df;
+  border-radius: 12px;
+  background: #fff;
+  text-align: center;
+  scroll-snap-align: center;
+  cursor: pointer;
+}
+
+.crp-chain-track > div.current {
+  border-color: #45b870;
+  box-shadow: 0 0 0 3px #8ee2a977, 0 0 22px #45b87088;
+}
+
+.crp-chain-track > div.unknown {
+  border-style: dashed;
+  border-color: #d59554;
+  background: #fff8ed;
+}
+
+.crp-chain-track > div.unknown i {
+  background: #f6dfbd;
+  color: #9a642b;
+}
+
+.crp-chain-track i {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto 7px;
+  border-radius: 11px;
+  background: #eaf4e9;
+  color: #317452;
+  font-size: 18px;
+  font-style: normal;
+}
+
+.crp-chain-track strong {
+  margin: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.crp-chain-track small {
+  margin-top: 3px;
+  font-size: 10px;
+}
+
+.crp-chain-track b {
+  position: absolute;
+  top: 34px;
+  right: -17px;
+  color: #6c8b7c;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.crp-chain-focus {
+  display: grid;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  gap: 11px;
+  align-items: center;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #b9d7c2;
+  border-radius: 12px;
+  background: #f1f8f2;
+}
+
+.crp-chain-focus.unknown {
+  border-color: #e0b477;
+  background: #fff8ec;
+}
+
+.crp-chain-focus-icon {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: #fff;
+  color: #8d6a3d;
+  font-size: 22px;
+}
+
+.crp-chain-focus span,
+.crp-chain-focus strong,
+.crp-chain-focus small {
+  display: block;
+}
+
+.crp-chain-focus strong {
+  margin: 3px 0;
+}
+
+.crp-chain-focus button {
+  border: 1px solid #d6b37b;
+  border-radius: 9px;
+  background: #fff;
+  color: #855f2b;
+  padding: 8px 10px;
+}
+
+@media (max-width: 1050px) {
+  .crp-planning {
+    grid-template-columns: 1fr;
+  }
+}
