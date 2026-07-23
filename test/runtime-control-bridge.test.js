@@ -1,10 +1,11 @@
-"use strict";
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const vm = require("node:vm");
 const { AutomationRuntime } = require("../src/automation-runtime");
 const { BoardAutomationRunner } = require("../src/board-runner");
 const { OrderSubmitter } = require("../src/order-actions");
@@ -13,7 +14,7 @@ const { SceneNavigator } = require("../src/scene-navigation");
 const { WarehouseActionExecutor } = require("../src/warehouse-actions");
 const { ProductionModeExecutor } = require("../src/production-mode-actions");
 const { SaleActionExecutor } = require("../src/sale-actions");
-const { FakeRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("../src/runtime-control-bridge");
+const { FakeRuntimeControlAdapter, LegacyRuntimeControlAdapter, CdpRuntimeControlAdapter } = require("../src/runtime-control-bridge");
 
 function catalogFixture() {
   return {
@@ -71,6 +72,56 @@ function boardState({ ready = false, energy = 5 } = {}) {
     producers: [{ index: 0, itemId: "producer-1", produceCount: 5, energyCost: 1 }],
     warehouse: { inventoryKnowledge: { status: "unknown" } },
     mapMission: { canComplete: false },
+  };
+}
+
+function normalizedBaseline() {
+  return {
+    schemaVersion: 1,
+    collectedAt: "2026-07-23T00:00:00.000Z",
+    scene: "board",
+    resources: { coins: 12, diamonds: 3, energy: 8 },
+    energy: {
+      amount: 8,
+      limit: 20,
+      recoverIntervalSeconds: 60,
+      recoverTimestamp: 1234,
+      recovering: true,
+    },
+    board: {
+      available: true,
+      visible: true,
+      width: 2,
+      height: 2,
+      occupied: 1,
+      empty: 3,
+      signature: "item-1|||",
+      grids: [{ index: 0, itemId: "item-1", empty: false, normal: true, moveable: true }],
+      mergeCandidates: [],
+      requiredItemCounts: { "item-1": 1 },
+    },
+    orders: [{
+      slot: "order-1",
+      taskId: 101,
+      rewardCoins: 9,
+      items: [{ itemId: "item-1", complete: false, status: 0 }],
+      requiredItemIds: ["item-1"],
+      missingItemIds: ["item-1"],
+      ready: false,
+    }],
+    producers: [],
+    warehouse: { inventoryKnowledge: { status: "unknown" } },
+    mapProgress: {
+      currentTask: null,
+      currentSeason: null,
+      seasonDisplay: null,
+      allFinished: false,
+      episodeFinished: false,
+    },
+    mapMission: null,
+    overlays: [],
+    selectedItem: null,
+    source: { adapter: "semantic-runtime", engine: "cocos" },
   };
 }
 
@@ -387,4 +438,590 @@ test("assisted-sale sessions execute through an injected Fake Adapter", async ()
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
+});
+
+// --- Semantic bridge order submission tests ---
+
+function orderSubmissionRuntimeFixture() {
+  const task = {
+    taskId: 101,
+    itemInfos: [
+      { itemId: "item-1", isComplete: true, status: 1 },
+      { itemId: "item-2", isComplete: true, status: 1 },
+    ],
+    rewards: [{ type: 1, count: 10 }],
+    _inSubmit: false,
+  };
+  const buttonView = { submitTask() { this._submitted = true; }, _submitted: false };
+  const taskItemMap = new Map([["order-1", buttonView]]);
+  const taskView = {
+    _taskItemDataMap: new Map([["order-1", { task }]]),
+    childViews: [{ type: 6, taskItemMap }],
+  };
+  const grid = {
+    index: 0,
+    itemId: "item-1",
+    item: { itemConfig: {} },
+    isEmpty: false,
+    isNormal: true,
+    isMoveable: true,
+    isLocking: false,
+    isFrozen: false,
+    center: { x: 100, y: 100 },
+  };
+  const gameBoard = {
+    size: { width: 1, height: 1 },
+    __private_95_grids: [grid],
+  };
+  const boardController = {
+    _controllerClazzName: "UserBoardViewController",
+    isViewVisible: true,
+    view: {
+      _boardView: {
+        _gameBoardView: {
+          _boardStore: { _state: { _gameBoard: gameBoard } },
+          canBoardGridBeDragging: () => true,
+          isBoardGridItemAnimating: () => false,
+          _operatorCenter: { itemCanMergeWith: () => false },
+          onTouch: () => {},
+          onDragStart: () => {},
+          onDragMove: () => {},
+          onDragEnd: () => {},
+        },
+        _taskView: taskView,
+      },
+    },
+  };
+  const resourceMap = new Map([[1, 50], [2, 5], [3, 10]]);
+  const runtime = {
+    mControllers: [boardController],
+    mManagers: [
+      { _resourceMap: resourceMap },
+      { _energyDataMap: new Map([[3, { _energyLimit: 20, _recoverInterval: 60, recoverTimestamp: 1234, inRecover: false }]]) },
+      { clientTaskDataMap: new Map([["orders", new Map([["order-1", task]])]]) },
+    ],
+  };
+  const scene = {
+    name: "main",
+    getChildByName: (name) => name === "Entry" ? { _components: [runtime] } : null,
+    children: [],
+  };
+  const sandbox = vm.createContext({
+    globalThis: null,
+    cc: { ENGINE_VERSION: "3.8.0", director: { getScene: () => scene } },
+  });
+  sandbox.globalThis = sandbox;
+  return { sandbox, runtime, boardController, taskView, task, buttonView, gameBoard, grid, resourceMap, scene };
+}
+
+function installOrderSubmissionBridge(fixture, contextGeneration = "7") {
+  const { sandbox } = fixture;
+  const { buildBridgeInstallExpression } = require("../src/runtime-control-bridge");
+  const expression = buildBridgeInstallExpression(contextGeneration);
+  return vm.runInContext(expression, sandbox);
+}
+
+test("injected bridge detects orderSubmission capability when task view and submit handler are present", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  const result = installOrderSubmissionBridge(fixture);
+
+  assert.equal(result.handshake.capabilities.orderSubmission, true);
+  assert.equal(result.handshake.capabilities.baseline, true);
+});
+
+test("injected bridge submit-order dispatches a ready order and returns accepted-changed", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-1",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.equal(ack.ok, true);
+  assert.equal(ack.outcome, "accepted-changed");
+  assert.equal(ack.reason, "order-submit-dispatched");
+  assert.equal(ack.changed, true);
+  assert.equal(ack.delta.order.slot, "order-1");
+  assert.equal(ack.delta.order.previousTaskId, 101);
+  assert.equal(ack.delta.order.dispatched, true);
+  assert.equal(ack.delta.preCoins, 50);
+  assert.equal(fixture.buttonView._submitted, true);
+});
+
+test("injected bridge submit-order rejects an incomplete order", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  fixture.task.itemInfos[0].isComplete = false;
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-2",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "order-not-ready");
+});
+
+test("injected bridge submit-order rejects an already-submitting order", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  fixture.task._inSubmit = true;
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-3",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "order-already-submitting");
+});
+
+test("injected bridge submit-order rejects a slot that does not exist", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-4",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "nonexistent",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "order-slot-not-found");
+});
+
+test("injected bridge submit-order rejects when expected task identity changed", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-5",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+    expectedTaskId: "999",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "order-task-changed");
+});
+
+test("injected bridge submit-order handles expectedTaskId match", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-5b",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+    expectedTaskId: "101",
+  });
+
+  assert.equal(ack.ok, true);
+  assert.equal(ack.outcome, "accepted-changed");
+});
+
+test("injected bridge submit-order is idempotent for duplicate operation IDs", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const first = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-dup",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  // Reset submitted flag to verify the second call does NOT re-invoke submitTask
+  fixture.buttonView._submitted = false;
+
+  const second = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-dup",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.deepEqual(second, first);
+  assert.equal(fixture.buttonView._submitted, false);
+});
+
+test("injected bridge submit-order rejects stale revision", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-6",
+    expectedRevision: 5,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "stale-revision");
+  assert.equal(ack.reason, "runtime-revision-stale");
+});
+
+test("injected bridge submit-order returns unsupported-capability when submit handler is absent at execution time", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  // Install with handler present so capability is detected
+  installOrderSubmissionBridge(fixture);
+
+  // Now remove the submit handler after install
+  fixture.taskView.childViews = [];
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "op-7",
+    expectedRevision: 0,
+    method: "submit-order",
+    slot: "order-1",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "unsupported-capability");
+  assert.equal(ack.reason, "order-submit-handler-not-found");
+});
+
+test("injected bridge readOrderSlot returns current order and coin state", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const slot = await fixture.sandbox.globalThis.miniGameCtl.readOrderSlot("order-1");
+
+  assert.equal(slot.ok, true);
+  assert.equal(slot.slot, "order-1");
+  assert.equal(slot.occupied, true);
+  assert.equal(slot.taskId, 101);
+  assert.equal(slot.ready, true);
+  assert.equal(slot.inSubmit, false);
+  assert.equal(slot.coins, 50);
+  assert.equal(slot.items.length, 2);
+  assert.equal(slot.items[0].itemId, "item-1");
+  assert.equal(slot.items[0].complete, true);
+});
+
+test("injected bridge readOrderSlot returns not-occupied for a missing slot", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture);
+
+  const slot = await fixture.sandbox.globalThis.miniGameCtl.readOrderSlot("nonexistent");
+
+  assert.equal(slot.ok, true);
+  assert.equal(slot.occupied, false);
+  assert.equal(slot.taskId, null);
+  assert.equal(slot.ready, false);
+});
+
+// --- CdpRuntimeControlAdapter order submission tests ---
+
+test("CDP Adapter submits a ready order through the semantic bridge and returns invariant-complete success", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  // Simulate: submitTask also updates state (like the real game server response)
+  const origSubmit = fixture.buttonView.submitTask;
+  fixture.buttonView.submitTask = function () {
+    origSubmit.call(this);
+    // Simulate order replacement and coin reward
+    fixture.taskView._taskItemDataMap.delete("order-1");
+    const newTask = {
+      taskId: 202,
+      itemInfos: [{ itemId: "item-3", isComplete: false, status: 0 }],
+      rewards: [{ type: 1, count: 15 }],
+    };
+    fixture.taskView._taskItemDataMap.set("order-1", { task: newTask });
+    fixture.resourceMap.set(1, 60);
+  };
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression, _contextId) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => {
+        legacyCalled = true;
+        return normalizedBaseline();
+      },
+      execute: async () => {
+        legacyCalled = true;
+        return { ok: true, reason: "legacy-action" };
+      },
+    },
+  });
+
+  await adapter.ready();
+  // reset — legacy.readState is called during install for baseline reconciliation
+  legacyCalled = false;
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.executed, true);
+  assert.equal(result.reason, "order-submitted-and-coins-received");
+  assert.equal(result.actions[0].type, "submit-order");
+  assert.equal(result.actions[0].orderReplaced, true);
+  assert.equal(result.actions[0].coinsChanged, true);
+  assert.equal(result.actions[0].previousTaskId, 101);
+  assert.equal(result.actions[0].coinsBefore, 50);
+  assert.equal(result.actions[0].coinsAfter, 60);
+  assert.equal(legacyCalled, false);
+});
+
+test("CDP Adapter reports order-replaced-but-coins-not-observed when coins unchanged", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  // Simulate: submitTask replaces order but does NOT reward coins
+  const origSubmit = fixture.buttonView.submitTask;
+  fixture.buttonView.submitTask = function () {
+    origSubmit.call(this);
+    fixture.taskView._taskItemDataMap.delete("order-1");
+    const newTask = {
+      taskId: 202,
+      itemInfos: [{ itemId: "item-3", isComplete: false, status: 0 }],
+    };
+    fixture.taskView._taskItemDataMap.set("order-1", { task: newTask });
+    // Coins unchanged at 50
+  };
+
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "order-replaced-but-coins-not-observed");
+  assert.equal(result.actions[0].orderReplaced, true);
+  assert.equal(result.actions[0].coinsChanged, false);
+  assert.equal(result.actions[0].coinsAfter, 50);
+});
+
+test("CDP Adapter pauses with uncertainty when order slot is not yet replaced after dispatch", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  // After submit: order slot still occupied with same task (not yet replaced)
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, true);
+  assert.equal(result.pauseRequested, true);
+  assert.equal(result.reason, "order-submission-awaiting-replacement");
+  assert.equal(result.uncertainAction.type, "submit-order");
+  assert.equal(result.uncertainAction.slot, "order-1");
+});
+
+test("CDP Adapter rejects an incomplete order through the semantic bridge", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  fixture.task.itemInfos[0].isComplete = false;
+  installOrderSubmissionBridge(fixture, "7");
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => { legacyCalled = true; return { ok: true }; },
+    },
+  });
+
+  await adapter.ready();
+  legacyCalled = false; // reset — legacy.readState is called during install
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "order-not-ready");
+  assert.equal(legacyCalled, false);
+});
+
+test("CDP Adapter rejects an already-submitting order through the semantic bridge", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  fixture.task._inSubmit = true;
+  installOrderSubmissionBridge(fixture, "7");
+
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "order-already-submitting");
+});
+
+test("CDP Adapter requests replan on stale revision for order submission", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  let legacyReads = 0;
+  const baseline = normalizedBaseline();
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => {
+        legacyReads += 1;
+        return baseline;
+      },
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", expectedRevision: 99, before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, false);
+  assert.equal(result.replanRequested, true);
+  assert.equal(result.reason, "runtime-revision-stale");
+});
+
+test("CDP Adapter falls back to legacy when orderSubmission capability is absent", async () => {
+  // Use a bridge without order submission capability
+  const fixture = orderSubmissionRuntimeFixture();
+  fixture.taskView.childViews = []; // removes submit handler
+  installOrderSubmissionBridge(fixture, "7");
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => {
+        legacyCalled = true;
+        return { ok: true, executed: true, reason: "order-submitted-legacy" };
+      },
+    },
+  });
+
+  await adapter.ready();
+  // Force capabilities to be read from handshake (orderSubmission: false)
+  await adapter.execute(
+    { type: "submit-order", slot: "order-1" },
+  );
+
+  assert.equal(legacyCalled, true);
+});
+
+test("CDP Adapter duplicate operation IDs are blocked by the injected bridge", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  // Simulate submitTask updates state (order replaced, coins changed)
+  const origSubmit = fixture.buttonView.submitTask;
+  fixture.buttonView.submitTask = function () {
+    origSubmit.call(this);
+    fixture.taskView._taskItemDataMap.delete("order-1");
+    const newTask = {
+      taskId: 202,
+      itemInfos: [{ itemId: "item-3", isComplete: false, status: 0 }],
+    };
+    fixture.taskView._taskItemDataMap.set("order-1", { task: newTask });
+    fixture.resourceMap.set(1, 60);
+  };
+
+  const evaluations = [];
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => {
+        evaluations.push(expression);
+        return vm.runInContext(expression, fixture.sandbox);
+      },
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+
+  // First call — should go through
+  const first = await adapter.execute(
+    { type: "submit-order", slot: "order-1", operationId: "dup-op-order", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+  assert.equal(first.ok, true);
+
+  // Second call with same operationId — bridge returns cached ack
+  // The targeted read will still succeed (order was already replaced on first call)
+  const second = await adapter.execute(
+    { type: "submit-order", slot: "order-1", operationId: "dup-op-order", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+  );
+  assert.equal(second.ok, true);
+  // Verify both results are the same (idempotent)
+  assert.equal(second.reason, first.reason);
 });

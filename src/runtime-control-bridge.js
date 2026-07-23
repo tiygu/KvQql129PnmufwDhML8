@@ -116,6 +116,24 @@ function buildBridgeInstallExpression(contextGeneration) {
       const gameBoard = boardView?._boardStore?._state?._gameBoard;
       const boardRead = Array.isArray(gameBoard?.__private_95_grids);
       const merge = boardRead && mergeMethodsAvailable(boardView);
+      const production = boardRead && typeof boardView?.onTouch === "function";
+      const orderSubmission = (() => {
+        try {
+          const controller = boardController;
+          const taskView = controller?.view?._boardView?._taskView;
+          if (!taskView) return false;
+          const buttonLayer = (taskView.childViews || []).find(
+            (layer) => layer?.type === 6 && isMap(layer?.taskItemMap)
+          );
+          if (!buttonLayer) return false;
+          const buttonMap = buttonLayer.taskItemMap;
+          // Iterate Map safely across context boundaries via entries()
+          for (const [, btn] of buttonMap.entries()) {
+            if (typeof btn?.submitTask === "function") return true;
+          }
+          return false;
+        } catch (_) { return false; }
+      })();
       return {
         baseline: resourceRead && energyRead && orderRead && boardRead,
         boardRead,
@@ -123,8 +141,8 @@ function buildBridgeInstallExpression(contextGeneration) {
         energyRead,
         orderRead,
         merge,
-        production: false,
-        orderSubmission: false,
+        production,
+        orderSubmission,
         navigation: false
       };
     };
@@ -415,6 +433,32 @@ function buildBridgeInstallExpression(contextGeneration) {
         grids: context.grids.map((grid, index) => gridDelta(grid, index))
       };
     };
+    const readOrderSlot = (slot) => {
+      const { runtime } = resolveRuntime();
+      const controller = (runtime.mControllers || []).find(
+        (item) => item?._controllerClazzName === "UserBoardViewController"
+      );
+      const taskView = controller?.view?._boardView?._taskView;
+      if (!controller || !taskView) return { ok: false, reason: "order-runtime-unavailable", slot };
+      const taskItemData = taskView._taskItemDataMap?.get?.(slot);
+      const task = taskItemData?.task;
+      const items = Array.isArray(task?.itemInfos) ? task.itemInfos : [];
+      const resourceManager = runtime.mManagers?.find?.((manager) => isMap(manager?._resourceMap));
+      const coins = Number(resourceManager?._resourceMap?.get?.(1) ?? resourceManager?._resourceMap?.get?.("1") ?? 0) || 0;
+      return {
+        ok: true,
+        slot,
+        occupied: !!task,
+        taskId: safe(() => task.taskId, null),
+        ready: items.length > 0 && items.every((item) => !!item.isComplete),
+        inSubmit: !!safe(() => task._inSubmit, false),
+        coins,
+        items: items.map((item) => ({
+          itemId: String(safe(() => item.itemId, "")),
+          complete: !!safe(() => item.isComplete, false),
+        })),
+      };
+    };
     const cacheAcknowledgement = (operationId, acknowledgement) => {
       completedOperations.set(operationId, clone(acknowledgement));
       while (completedOperations.size > 128) completedOperations.delete(completedOperations.keys().next().value);
@@ -435,9 +479,224 @@ function buildBridgeInstallExpression(contextGeneration) {
     });
     const isGridReady = (boardView, grid) => !!safe(() => boardView.canBoardGridBeDragging(grid), false)
       && !safe(() => boardView.isBoardGridItemAnimating(grid), true);
+    const isProducerGrid = (grid) => typeof safe(() => grid?.item?.produceCount) === "number"
+      && Number(safe(() => grid?.item?.itemConfig?.EnergyCost, 0)) > 0;
+    const executeProductionCommand = async (command) => {
+      if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
+        return reject(command, "stale-revision", "runtime-revision-stale");
+      }
+      const producerIndex = Number(command.producerGrid);
+      if (!Number.isInteger(producerIndex) || producerIndex < 0) {
+        return reject(command, "rejected-precondition", "production-grid-invalid");
+      }
+      const { runtime } = resolveRuntime();
+      const candidates = boardControllerCandidates(runtime);
+      const controller = candidates.length === 1 ? candidates[0] : null;
+      const boardView = controller?.view?._boardView?._gameBoardView;
+      const gameBoard = boardView?._boardStore?._state?._gameBoard;
+      const grids = gameBoard?.__private_95_grids;
+      if (!controller || !boardView || !Array.isArray(grids)) {
+        return reject(command, "unsupported-capability", "production-runtime-unavailable");
+      }
+      if (!controller.isViewVisible) {
+        return reject(command, "rejected-precondition", "board-not-visible");
+      }
+      const producerGrid = findGrid(grids, producerIndex);
+      if (!producerGrid || !isProducerGrid(producerGrid)) {
+        return reject(command, "rejected-precondition", "producer-not-found");
+      }
+      if (Number(safe(() => producerGrid.item.produceCount, 0)) <= 0) {
+        return reject(command, "rejected-precondition", "producer-exhausted");
+      }
+      const managers = runtime.mManagers;
+      const resourceManager = managers.find((manager) => isMap(manager?._resourceMap));
+      const energyAmount = Number(resourceManager?._resourceMap?.get?.(3) ?? resourceManager?._resourceMap?.get?.("3") ?? 0) || 0;
+      const energyCost = Number(safe(() => producerGrid.item?.itemConfig?.EnergyCost, 0));
+      if (energyAmount < energyCost) {
+        return reject(command, "rejected-precondition", "energy-insufficient");
+      }
+      const multipleModeManager = managers.find((manager) => isMap(manager?._multipleModeMap));
+      const productionModeCurrentFor = (grid) => {
+        const raw = multipleModeManager?._multipleModeMap?.get?.(String(grid?.itemId))
+          ?? multipleModeManager?._multipleModeMap?.get?.(Number(grid?.itemId))
+          ?? multipleModeManager?._multipleModeMap?.get?.(grid?.index);
+        return String(raw?.modeId ?? raw?.multiple ?? raw?.value ?? raw ?? "single");
+      };
+      if (command.expectedProductionModeId != null) {
+        const currentModeId = productionModeCurrentFor(producerGrid);
+        if (String(currentModeId) !== String(command.expectedProductionModeId)) {
+          return reject(command, "rejected-precondition", "production-mode-mismatch");
+        }
+      }
+      const currentModeId = productionModeCurrentFor(producerGrid);
+      const expectedOutputs = currentModeId === "quad" ? 4 : currentModeId === "double" ? 2 : 1;
+      const emptyCount = grids.filter((grid) => safe(() => grid.isEmpty, true)).length;
+      if (emptyCount < expectedOutputs) {
+        return reject(command, "rejected-precondition", "board-full");
+      }
+      const isProducerReady = (boardView, grid) => !safe(() => boardView?.isBoardGridItemAnimating?.(grid), true)
+        && !safe(() => grid?.isLocking, false);
+      if (!isProducerReady(boardView, producerGrid)) {
+        return reject(command, "rejected-precondition", "producer-not-ready");
+      }
+      const beforeGrids = grids.map((grid, index) => gridDelta(grid, index));
+      const beforeSignature = beforeGrids.map((grid) => grid.itemId).join("|");
+      let actionError = null;
+      let touches = 0;
+      try {
+        boardView.onTouch(producerGrid.center);
+        touches = 1;
+        await Promise.resolve();
+        const afterFirstSignature = grids.map((grid) => String(safe(() => grid?.itemId, ""))).join("|");
+        if (afterFirstSignature === beforeSignature) {
+          boardView.onTouch(producerGrid.center);
+          touches = 2;
+        }
+      } catch (error) {
+        actionError = String(error?.message || error || "production-action-error");
+      }
+      const afterGrids = grids.map((grid, index) => gridDelta(grid, index));
+      const afterSignature = afterGrids.map((grid) => grid.itemId).join("|");
+      const changed = beforeSignature !== afterSignature;
+      const producedItemIds = [];
+      const changedGrids = [];
+      for (let i = 0; i < afterGrids.length; i += 1) {
+        if (i === producerIndex) continue;
+        if (beforeGrids[i].empty && !afterGrids[i].empty && afterGrids[i].itemId) {
+          producedItemIds.push(afterGrids[i].itemId);
+        }
+        if (beforeGrids[i].itemId !== afterGrids[i].itemId || beforeGrids[i].empty !== afterGrids[i].empty) {
+          changedGrids.push(afterGrids[i]);
+        }
+      }
+      const producerAfter = gridDelta(findGrid(grids, producerIndex), producerIndex);
+      if (producerAfter.itemId !== beforeGrids[producerIndex]?.itemId
+        || producerAfter.empty !== beforeGrids[producerIndex]?.empty) {
+        changedGrids.push(producerAfter);
+      }
+      if (changed && !actionError) {
+        revision += 1;
+        const acknowledgement = {
+          ...acknowledgementBase(command, true),
+          ok: true,
+          outcome: "accepted-changed",
+          reason: "production-complete",
+          delta: {
+            energyChange: -energyCost,
+            producedItemIds,
+            touches,
+            board: { signature: afterSignature, grids: changedGrids }
+          }
+        };
+        publishEvent("state-changed", command.operationId, acknowledgement.delta);
+        return cacheAcknowledgement(command.operationId, acknowledgement);
+      }
+      if (!changed && !actionError) {
+        return cacheAcknowledgement(command.operationId, {
+          ...acknowledgementBase(command, false),
+          ok: false,
+          outcome: "accepted-unchanged",
+          reason: "production-unchanged",
+          delta: { energyChange: 0, producedItemIds: [], touches, board: { grids: changedGrids } }
+        });
+      }
+      if (changed) {
+        revision += 1;
+        publishEvent("state-changed", command.operationId, {
+          energyChange: -energyCost, producedItemIds, touches, board: { grids: changedGrids }
+        });
+      }
+      return cacheAcknowledgement(command.operationId, {
+        ...acknowledgementBase(command, changed),
+        ok: false,
+        outcome: "uncertain-result",
+        reason: "production-result-uncertain",
+        error: actionError,
+        delta: { energyChange: changed ? -energyCost : 0, producedItemIds, touches, board: { grids: changedGrids } }
+      });
+    };
+    const executeSubmitOrderCommand = async (command) => {
+      if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
+        return reject(command, "stale-revision", "runtime-revision-stale");
+      }
+      const slot = String(command.slot);
+      if (!slot) return reject(command, "rejected-precondition", "order-slot-invalid");
+      const { runtime } = resolveRuntime();
+      const controller = (runtime.mControllers || []).find(
+        (item) => item?._controllerClazzName === "UserBoardViewController"
+      );
+      const taskView = controller?.view?._boardView?._taskView;
+      if (!controller || !taskView) {
+        return reject(command, "unsupported-capability", "order-runtime-unavailable");
+      }
+      if (!controller.isViewVisible) {
+        return reject(command, "rejected-precondition", "board-not-visible");
+      }
+      const taskItemData = taskView._taskItemDataMap?.get?.(slot);
+      const task = taskItemData?.task;
+      const items = Array.isArray(task?.itemInfos) ? task.itemInfos : [];
+      if (!task) return reject(command, "rejected-precondition", "order-slot-not-found");
+      if (command.expectedTaskId != null && String(task.taskId) !== String(command.expectedTaskId)) {
+        return reject(command, "rejected-precondition", "order-task-changed");
+      }
+      if (!items.length || !items.every((item) => !!item.isComplete)) {
+        return reject(command, "rejected-precondition", "order-not-ready");
+      }
+      if (task._inSubmit) {
+        return reject(command, "rejected-precondition", "order-already-submitting");
+      }
+      const buttonLayer = (taskView.childViews || []).find(
+        (layer) => layer?.type === 6 && isMap(layer?.taskItemMap)
+      );
+      if (!buttonLayer) {
+        return reject(command, "unsupported-capability", "order-submit-handler-not-found");
+      }
+      const buttonView = buttonLayer.taskItemMap?.get?.(slot);
+      if (!buttonView || typeof buttonView.submitTask !== "function") {
+        return reject(command, "unsupported-capability", "order-submit-handler-not-found");
+      }
+      const preTaskId = safe(() => task.taskId, null);
+      const managers = runtime.mManagers;
+      const resourceManager = managers.find((manager) => isMap(manager?._resourceMap));
+      const preCoins = Number(resourceManager?._resourceMap?.get?.(1) ?? resourceManager?._resourceMap?.get?.("1") ?? 0) || 0;
+      let invocationError = null;
+      try {
+        buttonView.submitTask();
+      } catch (error) {
+        invocationError = String(error?.message || error || "order-submit-invocation-failed");
+      }
+      if (invocationError) {
+        return reject(command, "bridge-failure", invocationError);
+      }
+      revision += 1;
+      const acknowledgement = {
+        ...acknowledgementBase(command, true),
+        ok: true,
+        outcome: "accepted-changed",
+        reason: "order-submit-dispatched",
+        delta: {
+          order: {
+            slot,
+            previousTaskId: preTaskId,
+            dispatched: true,
+          },
+          preCoins,
+        }
+      };
+      publishEvent("state-changed", command.operationId, {
+        order: { slot, previousTaskId: preTaskId, dispatched: true }
+      });
+      return cacheAcknowledgement(command.operationId, acknowledgement);
+    };
     const executeCommandOnce = async (command) => {
+      if (command.method === "production" && capabilities.production) {
+        return executeProductionCommand(command);
+      }
+      if (command.method === "submit-order" && capabilities.orderSubmission) {
+        return executeSubmitOrderCommand(command);
+      }
       if (command.method !== "merge" || !capabilities.merge) {
-        return reject(command, "unsupported-capability", "merge-unsupported");
+        return reject(command, "unsupported-capability", command.method + "-unsupported");
       }
       if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
         return reject(command, "stale-revision", "runtime-revision-stale");
@@ -566,6 +825,7 @@ function buildBridgeInstallExpression(contextGeneration) {
       }),
       readBaseline,
       readBoard,
+      readOrderSlot,
       executeCommand,
       drainEventQueue,
       invalidateMergeContext
@@ -886,6 +1146,411 @@ class CdpRuntimeControlAdapter {
     const merge = command?.plannedAction?.type === "merge"
       ? command.plannedAction
       : command?.merge;
+    const isProduction = command?.plannedAction?.type === "produce"
+      && command?.producer != null;
+    const canUseSemanticProduction = !this.fallbackReason
+      && this.readiness?.capabilities?.production === true
+      && command?.type === "run-board-action"
+      && isProduction
+      && merge == null;
+    if (canUseSemanticProduction) {
+      const producerIndex = Number(command.plannedAction.producer ?? command.producer);
+      if (!Number.isInteger(producerIndex) || producerIndex < 0) {
+        throw Object.assign(new Error("semantic production requires a non-negative integer producer index"), {
+          code: "RUNTIME_CONTROL_COMMAND_INVALID",
+          reason: "production-grid-invalid",
+        });
+      }
+      const operationId = String(command.operationId || `production-${randomUUID()}`);
+      const expectedRevision = command.expectedRevision == null
+        ? this.readiness.revision
+        : Number(command.expectedRevision);
+      const semanticCommand = {
+        operationId,
+        expectedRevision,
+        method: "production",
+        producerGrid: producerIndex,
+        expectedProductionModeId: command.plannedAction.productionModeId == null
+          ? null
+          : String(command.plannedAction.productionModeId),
+      };
+      this.cachedBaseline = null;
+      const expression = `globalThis.miniGameCtl.executeCommand(${JSON.stringify(semanticCommand)})`;
+      let acknowledgement = null;
+      let deliveryError = null;
+      for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
+        try {
+          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            this.requiresBroadReconciliation = true;
+            acknowledgement = {
+              ok: false,
+              outcome: "aborted",
+              reason: "semantic-production-aborted-after-dispatch",
+              operationId,
+              method: "production",
+              expectedRevision,
+              revision: this.readiness.revision,
+              changed: null,
+            };
+            break;
+          }
+          deliveryError = error;
+        }
+      }
+      if (acknowledgement == null) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-production-acknowledgement-lost",
+          operationId,
+          method: "production",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+          error: deliveryError?.message || String(deliveryError || "unknown bridge failure"),
+        };
+      }
+      const ackValid = acknowledgement
+        && typeof acknowledgement === "object"
+        && acknowledgement.operationId === operationId
+        && Number.isInteger(acknowledgement.revision)
+        && typeof acknowledgement.outcome === "string"
+        && typeof acknowledgement.reason === "string";
+      if (!ackValid) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-production-acknowledgement-invalid",
+          operationId,
+          method: "production",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+        };
+      }
+      this.readiness.revision = acknowledgement.revision;
+      if (acknowledgement.outcome === "aborted") {
+        return {
+          ok: false,
+          executed: true,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          uncertainAction: { type: "produce", producer: producerIndex },
+          pauseRequested: false,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (acknowledgement.outcome === "stale-revision") {
+        this.requiresBroadReconciliation = false;
+        const replanState = await this.readState(signal);
+        return {
+          ok: false,
+          executed: false,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          replanRequested: true,
+          replanState,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      const producedItemIds = Array.isArray(acknowledgement.delta?.producedItemIds)
+        ? [...acknowledgement.delta.producedItemIds].map(String).filter(Boolean)
+        : [];
+      const energyChange = Number(acknowledgement.delta?.energyChange || 0);
+      const touches = Number(acknowledgement.delta?.touches || 1);
+      const productionInvariantComplete = acknowledgement.outcome === "accepted-changed"
+        && acknowledgement.changed === true
+        && producedItemIds.length > 0;
+      const action = {
+        step: 1,
+        type: "produce",
+        producer: producerIndex,
+        producerItemId: null, // resolved from baseline when available
+        productionModeId: semanticCommand.expectedProductionModeId,
+        actualOutputItemIds: producedItemIds,
+        touches,
+        energyChange,
+        verified: productionInvariantComplete,
+      };
+      if (productionInvariantComplete) {
+        this.requiresBroadReconciliation = false;
+        return {
+          ok: true,
+          executed: true,
+          reason: acknowledgement.reason,
+          stopReason: "max_actions_reached",
+          actions: [action],
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      let targetedVerification = null;
+      const uncertaintyReason = acknowledgement.outcome === "accepted-changed"
+        ? "semantic-production-acknowledgement-incomplete"
+        : ["uncertain-result", "bridge-failure"].includes(acknowledgement.outcome)
+          ? acknowledgement.reason
+          : null;
+      if (uncertaintyReason) {
+        try {
+          targetedVerification = await this.client.evaluate(
+            "globalThis.miniGameCtl.readBoard()",
+            this.contextId,
+            { signal },
+          );
+          if (Number.isInteger(targetedVerification?.revision)) {
+            this.readiness.revision = targetedVerification.revision;
+          }
+          const verifiedGrids = Array.isArray(targetedVerification?.grids) ? targetedVerification.grids : [];
+          const verifiedOutputIds = verifiedGrids
+            .filter((grid) => Number(grid.index) !== producerIndex && !grid.empty && grid.itemId)
+            .map((grid) => String(grid.itemId));
+          if (verifiedOutputIds.length > 0) {
+            this.requiresBroadReconciliation = false;
+            return {
+              ok: true,
+              executed: true,
+              reason: "production-complete-after-targeted-verification",
+              stopReason: "max_actions_reached",
+              actions: [{ ...action, actualOutputItemIds: verifiedOutputIds, verified: true }],
+              acknowledgement: cloneRecord(acknowledgement),
+              targetedVerification: cloneRecord(targetedVerification),
+            };
+          }
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          targetedVerification = {
+            ok: false,
+            reason: "targeted-board-verification-failed",
+            error: error?.message || String(error),
+            grids: [],
+          };
+        }
+        return {
+          ok: false,
+          executed: true,
+          reason: uncertaintyReason,
+          stopReason: uncertaintyReason,
+          actions: [],
+          uncertainAction: action,
+          pauseRequested: true,
+          acknowledgement: cloneRecord(acknowledgement),
+          targetedVerification: cloneRecord(targetedVerification),
+        };
+      }
+      return {
+        ok: false,
+        executed: !["rejected-precondition", "unsupported-capability"].includes(acknowledgement.outcome),
+        reason: acknowledgement.reason,
+        stopReason: acknowledgement.reason,
+        actions: [],
+        uncertainAction: null,
+        pauseRequested: false,
+        acknowledgement: cloneRecord(acknowledgement),
+        targetedVerification: cloneRecord(targetedVerification),
+      };
+    }
+    const canUseSemanticOrderSubmission = !this.fallbackReason
+      && this.readiness?.capabilities?.orderSubmission === true
+      && command?.type === "submit-order";
+    if (canUseSemanticOrderSubmission) {
+      const slot = String(command.slot);
+      if (!slot) {
+        throw Object.assign(new Error("semantic order submission requires a non-empty slot"), {
+          code: "RUNTIME_CONTROL_COMMAND_INVALID",
+          reason: "order-slot-invalid",
+        });
+      }
+      const operationId = String(command.operationId || `submit-order-${randomUUID()}`);
+      const expectedRevision = command.expectedRevision == null
+        ? this.readiness.revision
+        : Number(command.expectedRevision);
+      const expectedTaskId = command.before?.orders
+        ?.find((o) => String(o.slot) === slot)?.taskId ?? null;
+      const semanticCommand = {
+        operationId,
+        expectedRevision,
+        method: "submit-order",
+        slot,
+        expectedTaskId: expectedTaskId != null ? String(expectedTaskId) : null,
+      };
+      this.cachedBaseline = null;
+      const expression = `globalThis.miniGameCtl.executeCommand(${JSON.stringify(semanticCommand)})`;
+      let acknowledgement = null;
+      let deliveryError = null;
+      for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
+        try {
+          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            this.requiresBroadReconciliation = true;
+            acknowledgement = {
+              ok: false,
+              outcome: "aborted",
+              reason: "semantic-order-submission-aborted-after-dispatch",
+              operationId,
+              method: "submit-order",
+              expectedRevision,
+              revision: this.readiness.revision,
+              changed: null,
+            };
+            break;
+          }
+          deliveryError = error;
+        }
+      }
+      if (acknowledgement == null) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-order-submission-acknowledgement-lost",
+          operationId,
+          method: "submit-order",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+          error: deliveryError?.message || String(deliveryError || "unknown bridge failure"),
+        };
+      }
+      const ackValid = acknowledgement
+        && typeof acknowledgement === "object"
+        && acknowledgement.operationId === operationId
+        && Number.isInteger(acknowledgement.revision)
+        && typeof acknowledgement.outcome === "string"
+        && typeof acknowledgement.reason === "string";
+      if (!ackValid) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-order-submission-acknowledgement-invalid",
+          operationId,
+          method: "submit-order",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+        };
+      }
+      this.readiness.revision = acknowledgement.revision;
+      if (acknowledgement.outcome === "aborted") {
+        return {
+          ok: false,
+          executed: true,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          uncertainAction: { type: "submit-order", slot },
+          pauseRequested: false,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (acknowledgement.outcome === "stale-revision") {
+        this.requiresBroadReconciliation = false;
+        const replanState = await this.readState(signal);
+        return {
+          ok: false,
+          executed: false,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          replanRequested: true,
+          replanState,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (!["rejected-precondition", "unsupported-capability"].includes(acknowledgement.outcome)) {
+        // Submission was dispatched. Use targeted verification — no fixed settle delay.
+        const preCoins = Number(acknowledgement.delta?.preCoins ?? 0);
+        const preTaskId = acknowledgement.delta?.order?.previousTaskId ?? null;
+        let targetedSlot = null;
+        let slotReadError = null;
+        try {
+          const slotExpr = `globalThis.miniGameCtl.readOrderSlot(${JSON.stringify(slot)})`;
+          targetedSlot = await this.client.evaluate(slotExpr, this.contextId, { signal });
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          slotReadError = error?.message || String(error);
+        }
+        const orderReplaced = !targetedSlot?.ok
+          || !targetedSlot?.occupied
+          || (targetedSlot.taskId != null && String(targetedSlot.taskId) !== String(preTaskId));
+        const coinsChanged = targetedSlot?.ok
+          && Number.isFinite(targetedSlot.coins)
+          && Number(targetedSlot.coins) > preCoins;
+        const invariantComplete = acknowledgement.outcome === "accepted-changed"
+          && acknowledgement.changed === true
+          && orderReplaced;
+        const action = {
+          step: 1,
+          type: "submit-order",
+          slot,
+          previousTaskId: preTaskId,
+          currentTaskId: targetedSlot?.taskId ?? null,
+          orderReplaced,
+          coinsChanged,
+          coinsBefore: preCoins,
+          coinsAfter: targetedSlot?.coins ?? null,
+          verified: invariantComplete && coinsChanged,
+        };
+        if (invariantComplete && coinsChanged) {
+          this.requiresBroadReconciliation = false;
+          return {
+            ok: true,
+            executed: true,
+            reason: "order-submitted-and-coins-received",
+            stopReason: "order-completed",
+            actions: [action],
+            acknowledgement: cloneRecord(acknowledgement),
+            targetedVerification: cloneRecord(targetedSlot),
+            before: command.before ?? null,
+          };
+        }
+        if (invariantComplete && !coinsChanged) {
+          this.requiresBroadReconciliation = false;
+          return {
+            ok: true,
+            executed: true,
+            reason: "order-replaced-but-coins-not-observed",
+            stopReason: "order-completed",
+            actions: [{ ...action, verified: true }],
+            acknowledgement: cloneRecord(acknowledgement),
+            targetedVerification: cloneRecord(targetedSlot),
+            before: command.before ?? null,
+          };
+        }
+        // Not yet replaced — uncertain. Preserve pause and recovery.
+        const uncertaintyReason = slotReadError
+          ? "order-submission-targeted-read-failed"
+          : acknowledgement.outcome === "accepted-changed"
+            ? "order-submission-awaiting-replacement"
+            : acknowledgement.reason;
+        return {
+          ok: false,
+          executed: true,
+          reason: uncertaintyReason,
+          stopReason: uncertaintyReason,
+          actions: [],
+          uncertainAction: action,
+          pauseRequested: true,
+          acknowledgement: cloneRecord(acknowledgement),
+          targetedVerification: cloneRecord(targetedSlot),
+          before: command.before ?? null,
+        };
+      }
+      // Rejected or unsupported
+      return {
+        ok: false,
+        executed: false,
+        reason: acknowledgement.reason,
+        stopReason: acknowledgement.reason,
+        actions: [],
+        uncertainAction: null,
+        pauseRequested: false,
+        acknowledgement: cloneRecord(acknowledgement),
+        before: command.before ?? null,
+      };
+    }
     const canUseSemanticMerge = !this.fallbackReason
       && this.readiness?.capabilities?.merge === true
       && command?.type === "run-board-action"
