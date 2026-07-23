@@ -10,9 +10,10 @@ const { SceneNavigator } = require("./scene-navigation");
 const { WarehouseActionExecutor } = require("./warehouse-actions");
 const { ProductionModeExecutor } = require("./production-mode-actions");
 const { SaleActionExecutor } = require("./sale-actions");
+const { randomUUID } = require("node:crypto");
 
 const RUNTIME_CONTROL_PROTOCOL_VERSION = 1;
-const RUNTIME_CONTROL_BRIDGE_VERSION = "1.0.0";
+const RUNTIME_CONTROL_BRIDGE_VERSION = "1.1.0";
 
 /**
  * Runtime Semantic Control Bridge interface implemented by both adapters.
@@ -73,7 +74,9 @@ function buildBridgeInstallExpression(contextGeneration) {
     if (existing?.__runtimeSemanticControlBridge === true
       && existing.contextGeneration === contextGeneration
       && typeof existing.handshake === "function"
-      && typeof existing.readBaseline === "function") {
+      && typeof existing.readBaseline === "function"
+      && typeof existing.readBoard === "function"
+      && typeof existing.executeCommand === "function") {
       return { handshake: existing.handshake(), baseline: existing.readBaseline() };
     }
     const runtimeGlobal = globalThis;
@@ -83,6 +86,14 @@ function buildBridgeInstallExpression(contextGeneration) {
       && typeof value.get === "function"
       && typeof value.values === "function"
       && typeof value.entries === "function";
+    const mergeMethodsAvailable = (boardView) => typeof boardView?._operatorCenter?.itemCanMergeWith === "function"
+      && typeof boardView?.canBoardGridBeDragging === "function"
+      && typeof boardView?.isBoardGridItemAnimating === "function"
+      && typeof boardView?.onDragStart === "function"
+      && typeof boardView?.onDragMove === "function"
+      && typeof boardView?.onDragEnd === "function";
+    const boardControllerCandidates = (runtime) => runtime.mControllers
+      .filter((item) => item?._controllerClazzName === "UserBoardViewController");
     const engineVersion = String(cc?.ENGINE_VERSION || cc?.VERSION || "unknown");
     const resolveRuntime = () => {
       const currentScene = safe(() => cc?.director?.getScene?.(), null);
@@ -99,17 +110,19 @@ function buildBridgeInstallExpression(contextGeneration) {
       const resourceRead = managers.some((manager) => isMap(manager?._resourceMap));
       const energyRead = managers.some((manager) => isMap(manager?._energyDataMap));
       const orderRead = managers.some((manager) => isMap(manager?.clientTaskDataMap));
-      const boardController = controllers.find((item) => item?._controllerClazzName === "UserBoardViewController");
+      const boardCandidates = boardControllerCandidates(runtime);
+      const boardController = boardCandidates.length === 1 ? boardCandidates[0] : null;
       const boardView = boardController?.view?._boardView?._gameBoardView;
       const gameBoard = boardView?._boardStore?._state?._gameBoard;
       const boardRead = Array.isArray(gameBoard?.__private_95_grids);
+      const merge = boardRead && mergeMethodsAvailable(boardView);
       return {
         baseline: resourceRead && energyRead && orderRead && boardRead,
         boardRead,
         resourceRead,
         energyRead,
         orderRead,
-        merge: false,
+        merge,
         production: false,
         orderSubmission: false,
         navigation: false
@@ -314,6 +327,199 @@ function buildBridgeInstallExpression(contextGeneration) {
         source: { adapter: "semantic-runtime", engine: "cocos" }
       };
     };
+    let revision = 0;
+    const completedOperations = new Map();
+    const inFlightOperations = new Map();
+    let cachedMergeContext = null;
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const resolveMergeContext = () => {
+      const { runtime } = resolveRuntime();
+      const candidates = boardControllerCandidates(runtime);
+      const cachedBoardView = cachedMergeContext?.controller?.view?._boardView?._gameBoardView;
+      const cachedGameBoard = cachedBoardView?._boardStore?._state?._gameBoard;
+      if (candidates.length === 1
+        && candidates[0] === cachedMergeContext?.controller
+        && cachedBoardView === cachedMergeContext?.boardView
+        && cachedGameBoard === cachedMergeContext?.gameBoard
+        && cachedGameBoard?.__private_95_grids === cachedMergeContext?.grids
+        && Array.isArray(cachedMergeContext?.grids)
+        && mergeMethodsAvailable(cachedBoardView)) {
+        return cachedMergeContext;
+      }
+      const controller = candidates.length === 1 ? candidates[0] : null;
+      const boardView = controller?.view?._boardView?._gameBoardView;
+      const gameBoard = boardView?._boardStore?._state?._gameBoard;
+      const grids = gameBoard?.__private_95_grids;
+      if (!controller || !boardView || !Array.isArray(grids) || !mergeMethodsAvailable(boardView)) {
+        cachedMergeContext = null;
+        return null;
+      }
+      cachedMergeContext = { controller, boardView, gameBoard, grids };
+      return cachedMergeContext;
+    };
+    const gridIndex = (grid, fallback) => Number.isInteger(Number(grid?.index))
+      ? Number(grid.index)
+      : fallback;
+    const findGrid = (grids, index) => grids.find((grid, position) => gridIndex(grid, position) === index);
+    const gridDelta = (grid, index) => ({
+      index: gridIndex(grid, index),
+      itemId: String(safe(() => grid?.itemId, "")),
+      empty: !!safe(() => grid?.isEmpty, true)
+    });
+    const boardSummary = (context) => {
+      const grids = context.grids;
+      return {
+        signature: grids.map((grid) => String(safe(() => grid?.itemId, ""))).join("|"),
+        occupied: grids.filter((grid) => !safe(() => grid?.isEmpty, true)).length,
+        empty: grids.filter((grid) => safe(() => grid?.isEmpty, true)).length
+      };
+    };
+    const readBoard = () => {
+      const context = resolveMergeContext();
+      if (!context) return { ok: false, reason: "merge-runtime-unavailable", grids: [] };
+      return {
+        ok: true,
+        revision,
+        visible: !!context.controller.isViewVisible,
+        width: safe(() => context.gameBoard.size.width, null),
+        height: safe(() => context.gameBoard.size.height, null),
+        ...boardSummary(context),
+        grids: context.grids.map((grid, index) => gridDelta(grid, index))
+      };
+    };
+    const cacheAcknowledgement = (operationId, acknowledgement) => {
+      completedOperations.set(operationId, clone(acknowledgement));
+      while (completedOperations.size > 128) completedOperations.delete(completedOperations.keys().next().value);
+      return clone(acknowledgement);
+    };
+    const acknowledgementBase = (command, changed) => ({
+      operationId: command.operationId,
+      method: command.method,
+      expectedRevision: command.expectedRevision,
+      revision,
+      changed
+    });
+    const reject = (command, outcome, reason) => cacheAcknowledgement(command.operationId, {
+      ...acknowledgementBase(command, false),
+      ok: false,
+      outcome,
+      reason
+    });
+    const isGridReady = (boardView, grid) => !!safe(() => boardView.canBoardGridBeDragging(grid), false)
+      && !safe(() => boardView.isBoardGridItemAnimating(grid), true);
+    const executeCommandOnce = async (command) => {
+      if (command.method !== "merge" || !capabilities.merge) {
+        return reject(command, "unsupported-capability", "merge-unsupported");
+      }
+      if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
+        return reject(command, "stale-revision", "runtime-revision-stale");
+      }
+      const sourceIndex = Number(command.sourceGrid);
+      const targetIndex = Number(command.targetGrid);
+      if (!Number.isInteger(sourceIndex) || !Number.isInteger(targetIndex) || sourceIndex === targetIndex) {
+        return reject(command, "rejected-precondition", "merge-grid-invalid");
+      }
+      const context = resolveMergeContext();
+      if (!context) return reject(command, "unsupported-capability", "merge-runtime-unavailable");
+      if (!context.controller.isViewVisible) return reject(command, "rejected-precondition", "board-not-visible");
+      const source = findGrid(context.grids, sourceIndex);
+      const target = findGrid(context.grids, targetIndex);
+      if (!source || !target) return reject(command, "rejected-precondition", "merge-grid-not-found");
+      const sourceItemId = String(safe(() => source.itemId, ""));
+      const targetItemId = String(safe(() => target.itemId, ""));
+      if (!sourceItemId || sourceItemId !== targetItemId
+        || (command.expectedItemId != null && sourceItemId !== String(command.expectedItemId))) {
+        return reject(command, "rejected-precondition", "merge-items-changed");
+      }
+      const sourceReady = isGridReady(context.boardView, source);
+      const targetReady = isGridReady(context.boardView, target);
+      if (!sourceReady || !targetReady) return reject(command, "rejected-precondition", "merge-not-ready");
+      const expectedTarget = safe(() => source.item?.itemConfig?.MergeTarget, null);
+      if (expectedTarget == null
+        || (command.expectedResultItemId != null && String(expectedTarget) !== String(command.expectedResultItemId))) {
+        return reject(command, "rejected-precondition", "merge-relation-changed");
+      }
+      if (!safe(() => context.boardView._operatorCenter.itemCanMergeWith(source.item, target.item), false)) {
+        return reject(command, "rejected-precondition", "merge-pair-rejected");
+      }
+      const before = boardSummary(context);
+      let actionError = null;
+      try {
+        context.boardView.onDragStart(source.center);
+        context.boardView.onDragMove(source.center, target.center);
+        await Promise.resolve(context.boardView.onDragEnd(source.center, target.center));
+      } catch (error) {
+        actionError = String(error?.message || error || "merge-action-error");
+      }
+      const after = boardSummary(context);
+      const sourceAfter = gridDelta(findGrid(context.grids, sourceIndex), sourceIndex);
+      const targetAfter = gridDelta(findGrid(context.grids, targetIndex), targetIndex);
+      const changed = before.signature !== after.signature;
+      const verified = changed && sourceAfter.empty && String(targetAfter.itemId) === String(expectedTarget);
+      if (verified && !actionError) {
+        revision += 1;
+        return cacheAcknowledgement(command.operationId, {
+          ...acknowledgementBase(command, true),
+          ok: true,
+          outcome: "accepted-changed",
+          reason: "merge-complete",
+          delta: {
+            board: {
+              ...after,
+              grids: [sourceAfter, targetAfter]
+            }
+          }
+        });
+      }
+      if (!changed && !actionError) {
+        return cacheAcknowledgement(command.operationId, {
+          ...acknowledgementBase(command, false),
+          ok: false,
+          outcome: "accepted-unchanged",
+          reason: "merge-unchanged",
+          delta: { board: { ...after, grids: [sourceAfter, targetAfter] } }
+        });
+      }
+      if (changed) revision += 1;
+      return cacheAcknowledgement(command.operationId, {
+        ...acknowledgementBase(command, changed),
+        ok: false,
+        outcome: "uncertain-result",
+        reason: "merge-result-uncertain",
+        error: actionError,
+        delta: { board: { ...after, grids: [sourceAfter, targetAfter] } }
+      });
+    };
+    const executeCommand = (command) => {
+      if (!command || typeof command !== "object" || typeof command.operationId !== "string" || !command.operationId) {
+        return Promise.resolve({
+          ok: false,
+          outcome: "rejected-precondition",
+          reason: "command-invalid",
+          operationId: command?.operationId ?? null,
+          method: command?.method ?? null,
+          expectedRevision: command?.expectedRevision ?? null,
+          revision,
+          changed: false
+        });
+      }
+      const completed = completedOperations.get(command.operationId);
+      if (completed) return Promise.resolve(clone(completed));
+      const inFlight = inFlightOperations.get(command.operationId);
+      if (inFlight) return inFlight.then(clone);
+      const pending = Promise.resolve().then(() => executeCommandOnce(command));
+      inFlightOperations.set(command.operationId, pending);
+      return pending.then(
+        (acknowledgement) => {
+          inFlightOperations.delete(command.operationId);
+          return clone(acknowledgement);
+        },
+        (error) => {
+          inFlightOperations.delete(command.operationId);
+          throw error;
+        },
+      );
+    };
     const bridge = Object.freeze({
       __runtimeSemanticControlBridge: true,
       contextGeneration,
@@ -322,10 +528,12 @@ function buildBridgeInstallExpression(contextGeneration) {
         bridgeVersion: ${bridgeVersion},
         gameFingerprint,
         contextGeneration,
-        revision: 0,
+        revision,
         capabilities: { ...capabilities }
       }),
-      readBaseline
+      readBaseline,
+      readBoard,
+      executeCommand
     });
     runtimeGlobal.miniGameCtl = bridge;
     return { handshake: bridge.handshake(), baseline: bridge.readBaseline() };
@@ -422,6 +630,37 @@ function mergeReconciledBaseline(reconciled, semantic) {
   };
 }
 
+function mergeDeltaInvariantComplete(acknowledgement, command) {
+  const board = acknowledgement?.delta?.board;
+  const grids = board?.grids;
+  if (acknowledgement?.ok !== true
+    || acknowledgement.outcome !== "accepted-changed"
+    || acknowledgement.changed !== true
+    || acknowledgement.method !== "merge"
+    || acknowledgement.expectedRevision !== command.expectedRevision
+    || acknowledgement.revision !== command.expectedRevision + 1
+    || typeof board?.signature !== "string"
+    || !Number.isInteger(board?.occupied)
+    || !Number.isInteger(board?.empty)
+    || !Array.isArray(grids)) return false;
+  const source = grids.find((grid) => Number(grid?.index) === command.sourceGrid);
+  const target = grids.find((grid) => Number(grid?.index) === command.targetGrid);
+  if (!source || source.empty !== true || String(source.itemId || "") !== "") return false;
+  if (!target || target.empty !== false || !String(target.itemId || "")) return false;
+  return command.expectedResultItemId == null
+    || String(target.itemId) === String(command.expectedResultItemId);
+}
+
+function targetedMergeInvariantComplete(board, command) {
+  if (!board?.ok || !Array.isArray(board.grids)) return false;
+  const source = board.grids.find((grid) => Number(grid?.index) === command.sourceGrid);
+  const target = board.grids.find((grid) => Number(grid?.index) === command.targetGrid);
+  if (!source || source.empty !== true || String(source.itemId || "") !== "") return false;
+  if (!target || target.empty !== false || !String(target.itemId || "")) return false;
+  return command.expectedResultItemId == null
+    || String(target.itemId) === String(command.expectedResultItemId);
+}
+
 class CdpRuntimeControlAdapter {
   constructor({ client, contextId, legacy }) {
     this.client = client;
@@ -504,10 +743,213 @@ class CdpRuntimeControlAdapter {
     }
   }
 
-  execute(command, request = {}) {
+  async execute(command, request = {}) {
+    const signal = request.signal || null;
+    assertNotAborted(signal);
+    await this.ready(signal);
+    const merge = command?.plannedAction?.type === "merge"
+      ? command.plannedAction
+      : command?.merge;
+    const canUseSemanticMerge = !this.fallbackReason
+      && this.readiness?.capabilities?.merge === true
+      && command?.type === "run-board-action"
+      && merge != null;
+    if (!canUseSemanticMerge) {
+      this.cachedBaseline = null;
+      this.requiresBroadReconciliation = true;
+      return this.legacy.execute(command, request);
+    }
+    const sourceGrid = Number(merge.from);
+    const targetGrid = Number(merge.to);
+    if (!Number.isInteger(sourceGrid) || !Number.isInteger(targetGrid) || sourceGrid === targetGrid) {
+      throw Object.assign(new Error("semantic merge requires distinct integer grid indexes"), {
+        code: "RUNTIME_CONTROL_COMMAND_INVALID",
+        reason: "merge-grid-invalid",
+      });
+    }
+    const operationId = String(command.operationId || `merge-${randomUUID()}`);
+    const expectedRevision = command.expectedRevision == null
+      ? this.readiness.revision
+      : Number(command.expectedRevision);
+    const semanticCommand = {
+      operationId,
+      expectedRevision,
+      method: "merge",
+      sourceGrid,
+      targetGrid,
+      expectedItemId: merge.itemId == null ? null : String(merge.itemId),
+      expectedResultItemId: merge.resultItemId == null
+        ? merge.expectedTarget == null ? null : String(merge.expectedTarget)
+        : String(merge.resultItemId),
+    };
     this.cachedBaseline = null;
-    this.requiresBroadReconciliation = true;
-    return this.legacy.execute(command, request);
+    const expression = `globalThis.miniGameCtl.executeCommand(${JSON.stringify(semanticCommand)})`;
+    let acknowledgement = null;
+    let deliveryError = null;
+    for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
+      try {
+        acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          this.requiresBroadReconciliation = true;
+          acknowledgement = {
+            ok: false,
+            outcome: "aborted",
+            reason: "semantic-merge-aborted-after-dispatch",
+            operationId,
+            method: "merge",
+            expectedRevision,
+            revision: this.readiness.revision,
+            changed: null,
+          };
+          break;
+        }
+        deliveryError = error;
+      }
+    }
+    if (acknowledgement == null) {
+      acknowledgement = {
+        ok: false,
+        outcome: "bridge-failure",
+        reason: "semantic-merge-acknowledgement-lost",
+        operationId,
+        method: "merge",
+        expectedRevision,
+        revision: this.readiness.revision,
+        changed: null,
+        error: deliveryError?.message || String(deliveryError || "unknown bridge failure"),
+      };
+    }
+    const acknowledgementEnvelopeValid = acknowledgement
+      && typeof acknowledgement === "object"
+      && acknowledgement.operationId === operationId
+      && Number.isInteger(acknowledgement.revision)
+      && typeof acknowledgement.outcome === "string"
+      && typeof acknowledgement.reason === "string";
+    if (!acknowledgementEnvelopeValid) {
+      acknowledgement = {
+        ok: false,
+        outcome: "bridge-failure",
+        reason: "semantic-merge-acknowledgement-invalid",
+        operationId,
+        method: "merge",
+        expectedRevision,
+        revision: this.readiness.revision,
+        changed: null,
+      };
+    }
+    this.readiness.revision = acknowledgement.revision;
+    if (acknowledgement.outcome === "aborted") {
+      return {
+        ok: false,
+        executed: true,
+        reason: acknowledgement.reason,
+        stopReason: acknowledgement.reason,
+        actions: [],
+        uncertainAction: { type: "merge", from: sourceGrid, to: targetGrid },
+        pauseRequested: false,
+        acknowledgement: cloneRecord(acknowledgement),
+      };
+    }
+    if (acknowledgement.outcome === "stale-revision") {
+      this.requiresBroadReconciliation = false;
+      const replanState = await this.readState(signal);
+      return {
+        ok: false,
+        executed: false,
+        reason: acknowledgement.reason,
+        stopReason: acknowledgement.reason,
+        actions: [],
+        replanRequested: true,
+        replanState,
+        acknowledgement: cloneRecord(acknowledgement),
+      };
+    }
+    const deltaInvariantComplete = mergeDeltaInvariantComplete(acknowledgement, semanticCommand);
+    const action = {
+      step: 1,
+      type: "merge",
+      from: sourceGrid,
+      to: targetGrid,
+      itemId: semanticCommand.expectedItemId,
+      expectedTarget: semanticCommand.expectedResultItemId,
+      actualTarget: acknowledgement.delta?.board?.grids
+        ?.find((grid) => Number(grid.index) === targetGrid)?.itemId ?? null,
+      verified: deltaInvariantComplete,
+    };
+    if (deltaInvariantComplete) {
+      this.requiresBroadReconciliation = false;
+      return {
+        ok: true,
+        executed: true,
+        reason: acknowledgement.reason,
+        stopReason: "max_actions_reached",
+        actions: [action],
+        acknowledgement: cloneRecord(acknowledgement),
+      };
+    }
+    let targetedVerification = null;
+    const uncertaintyReason = acknowledgement.outcome === "accepted-changed"
+      ? "semantic-merge-acknowledgement-incomplete"
+      : ["uncertain-result", "bridge-failure"].includes(acknowledgement.outcome)
+        ? acknowledgement.reason
+        : null;
+    if (uncertaintyReason) {
+      try {
+        targetedVerification = await this.client.evaluate(
+          "globalThis.miniGameCtl.readBoard()",
+          this.contextId,
+          { signal },
+        );
+        const target = targetedVerification?.grids
+          ?.find((grid) => Number(grid.index) === targetGrid);
+        if (Number.isInteger(targetedVerification?.revision)) {
+          this.readiness.revision = targetedVerification.revision;
+        }
+        if (targetedMergeInvariantComplete(targetedVerification, semanticCommand)) {
+          this.requiresBroadReconciliation = false;
+          return {
+            ok: true,
+            executed: true,
+            reason: "merge-complete-after-targeted-verification",
+            stopReason: "max_actions_reached",
+            actions: [{ ...action, actualTarget: target.itemId, verified: true }],
+            acknowledgement: cloneRecord(acknowledgement),
+            targetedVerification: cloneRecord(targetedVerification),
+          };
+        }
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        targetedVerification = {
+          ok: false,
+          reason: "targeted-board-verification-failed",
+          error: error?.message || String(error),
+          grids: [],
+        };
+      }
+      return {
+        ok: false,
+        executed: true,
+        reason: uncertaintyReason,
+        stopReason: uncertaintyReason,
+        actions: [],
+        uncertainAction: action,
+        pauseRequested: true,
+        acknowledgement: cloneRecord(acknowledgement),
+        targetedVerification: cloneRecord(targetedVerification),
+      };
+    }
+    return {
+      ok: false,
+      executed: !["rejected-precondition", "unsupported-capability"].includes(acknowledgement.outcome),
+      reason: acknowledgement.reason,
+      stopReason: acknowledgement.reason,
+      actions: [],
+      uncertainAction: null,
+      pauseRequested: false,
+      acknowledgement: cloneRecord(acknowledgement),
+      targetedVerification: cloneRecord(targetedVerification),
+    };
   }
 
   status() {
