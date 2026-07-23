@@ -1,4 +1,4 @@
-"use strict";
+
 
 const { summarizeSnapshot } = require("../scripts/summarize-target-snapshot.cjs");
 const { BOARD_SCAN_EXPRESSION } = require("./board-automation");
@@ -328,10 +328,38 @@ function buildBridgeInstallExpression(contextGeneration) {
       };
     };
     let revision = 0;
+    let eventRevision = 0;
+    const eventQueue = [];
+    const MAX_EVENT_QUEUE = 256;
     const completedOperations = new Map();
     const inFlightOperations = new Map();
     let cachedMergeContext = null;
     const clone = (value) => JSON.parse(JSON.stringify(value));
+    const publishBinding = typeof globalThis.__miniGameCtlEventBinding === "function"
+      ? (payload) => { try { globalThis.__miniGameCtlEventBinding(JSON.stringify(payload)); } catch (_) {} }
+      : null;
+    const publishEvent = (eventType, operationId, delta) => {
+      eventRevision += 1;
+      const event = Object.freeze({
+        generation: contextGeneration,
+        revision: eventRevision,
+        eventType,
+        operationId: operationId ?? null,
+        delta: clone(delta),
+        timestamp: new Date().toISOString()
+      });
+      eventQueue.push(event);
+      while (eventQueue.length > MAX_EVENT_QUEUE) eventQueue.shift();
+      if (publishBinding) publishBinding(event);
+    };
+    const drainEventQueue = (sinceRevision) => {
+      const since = Number.isInteger(sinceRevision) ? sinceRevision : -1;
+      return clone(eventQueue.filter((event) => event.revision > since));
+    };
+    const invalidateMergeContext = () => {
+      cachedMergeContext = null;
+      publishEvent("cache-invalidated", null, { scope: "merge-context" });
+    };
     const resolveMergeContext = () => {
       const { runtime } = resolveRuntime();
       const candidates = boardControllerCandidates(runtime);
@@ -458,7 +486,7 @@ function buildBridgeInstallExpression(contextGeneration) {
       const verified = changed && sourceAfter.empty && String(targetAfter.itemId) === String(expectedTarget);
       if (verified && !actionError) {
         revision += 1;
-        return cacheAcknowledgement(command.operationId, {
+        const acknowledgement = {
           ...acknowledgementBase(command, true),
           ok: true,
           outcome: "accepted-changed",
@@ -469,7 +497,9 @@ function buildBridgeInstallExpression(contextGeneration) {
               grids: [sourceAfter, targetAfter]
             }
           }
-        });
+        };
+        publishEvent("state-changed", command.operationId, acknowledgement.delta);
+        return cacheAcknowledgement(command.operationId, acknowledgement);
       }
       if (!changed && !actionError) {
         return cacheAcknowledgement(command.operationId, {
@@ -480,7 +510,10 @@ function buildBridgeInstallExpression(contextGeneration) {
           delta: { board: { ...after, grids: [sourceAfter, targetAfter] } }
         });
       }
-      if (changed) revision += 1;
+      if (changed) {
+        revision += 1;
+        publishEvent("state-changed", command.operationId, { board: { ...after, grids: [sourceAfter, targetAfter] } });
+      }
       return cacheAcknowledgement(command.operationId, {
         ...acknowledgementBase(command, changed),
         ok: false,
@@ -533,7 +566,9 @@ function buildBridgeInstallExpression(contextGeneration) {
       }),
       readBaseline,
       readBoard,
-      executeCommand
+      executeCommand,
+      drainEventQueue,
+      invalidateMergeContext
     });
     runtimeGlobal.miniGameCtl = bridge;
     return { handshake: bridge.handshake(), baseline: bridge.readBaseline() };
@@ -674,6 +709,9 @@ class CdpRuntimeControlAdapter {
     this.readinessPromise = null;
     this.reconciledState = null;
     this.requiresBroadReconciliation = false;
+    this.appliedEventRevision = -1;
+    this.bindingListener = null;
+    this.eventsSinceLastRead = [];
   }
 
   async ready(signal = null) {
@@ -704,6 +742,7 @@ class CdpRuntimeControlAdapter {
         contextId: this.contextId,
         ...handshake,
       };
+      this._enableEvents();
       return cloneRecord(this.readiness);
     } catch (error) {
       if (error?.name === "AbortError") throw error;
@@ -711,6 +750,103 @@ class CdpRuntimeControlAdapter {
       this.fallbackReadiness = await this.legacy.ready(signal);
       return cloneRecord(this.fallbackReadiness);
     }
+  }
+
+  _enableEvents() {
+    if (this.bindingListener) return;
+    if (typeof this.client.on !== "function") return;
+    if (typeof this.client.send !== "function") return;
+    this.bindingListener = (message) => {
+      if (message.method !== "Runtime.bindingCalled") return;
+      const payload = message.params?.payload;
+      if (typeof payload !== "string") return;
+      let event;
+      try { event = JSON.parse(payload); } catch (_) { return; }
+      this._applyEvent(event);
+    };
+    this.client.on("event", this.bindingListener);
+    this.client.send("Runtime.addBinding", { name: "miniGameCtl.event" })
+      .catch(() => {});
+  }
+
+  _disableEvents() {
+    if (!this.bindingListener) return;
+    this.client.off("event", this.bindingListener);
+    this.bindingListener = null;
+  }
+
+  _applyEvent(event) {
+    if (!event || typeof event !== "object"
+      || !Number.isInteger(event.revision)
+      || typeof event.generation !== "string"
+      || typeof event.eventType !== "string") return;
+    if (event.generation !== this.contextGeneration) {
+      this.requiresBroadReconciliation = true;
+      return;
+    }
+    if (event.revision <= this.appliedEventRevision) return;
+    if (event.revision > this.appliedEventRevision + 1 && this.appliedEventRevision >= 0) {
+      this.requiresBroadReconciliation = true;
+      return;
+    }
+    this.appliedEventRevision = event.revision;
+    this.eventsSinceLastRead.push(cloneRecord(event));
+    while (this.eventsSinceLastRead.length > 64) this.eventsSinceLastRead.shift();
+    if (event.eventType === "cache-invalidated") {
+      this.requiresBroadReconciliation = true;
+    }
+    if (event.eventType === "state-changed"
+      && Number.isInteger(event.delta?.board?.revision)) {
+      if (this.readiness) this.readiness.revision = event.delta.board.revision;
+    }
+  }
+
+  async recoverEventGap(signal = null) {
+    assertNotAborted(signal);
+    // Level 1: drain event queue from last applied revision
+    try {
+      const events = await this.client.evaluate(
+        `globalThis.miniGameCtl.drainEventQueue(${this.appliedEventRevision})`,
+        this.contextId,
+        { signal },
+      );
+      if (Array.isArray(events)) {
+        for (const event of events) {
+          if (event.revision > this.appliedEventRevision) {
+            this._applyEvent(event);
+          }
+        }
+      }
+      if (!this.requiresBroadReconciliation) return;
+    } catch (_) { /* escalate to next recovery level */ }
+    // Level 2: targeted board read
+    try {
+      const board = await this.client.evaluate(
+        "globalThis.miniGameCtl.readBoard()",
+        this.contextId,
+        { signal },
+      );
+      if (board?.ok && Number.isInteger(board.revision)) {
+        if (this.readiness) this.readiness.revision = board.revision;
+        this.requiresBroadReconciliation = false;
+        return;
+      }
+    } catch (_) { /* escalate to baseline */ }
+    // Level 3: baseline read
+    try {
+      const baseline = await this.client.evaluate(
+        "globalThis.miniGameCtl.readBaseline()",
+        this.contextId,
+        { signal },
+      );
+      validateBaseline(baseline);
+      if (this.readiness) this.readiness.revision = this.readiness.revision ?? 0;
+      this.requiresBroadReconciliation = false;
+      return;
+    } catch (_) { /* escalate to broad snapshot */ }
+    // Level 4: broad snapshot via legacy adapter
+    this.reconciledState = validateBaseline(await this.legacy.readState(signal));
+    this.requiresBroadReconciliation = false;
   }
 
   async readState(signal = null) {
@@ -964,7 +1100,12 @@ class CdpRuntimeControlAdapter {
       revision: handshake.revision ?? null,
       capabilities: cloneRecord(handshake.capabilities || {}),
       fallback: { active: !!this.fallbackReason, reason: this.fallbackReason },
+      eventBinding: { active: !!this.bindingListener, appliedRevision: this.appliedEventRevision },
     };
+  }
+
+  shutdown() {
+    this._disableEvents();
   }
 }
 

@@ -1,4 +1,4 @@
-"use strict";
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -130,6 +130,7 @@ test("CDP Adapter installs once in the selected context and reuses a healthy bri
     revision: 0,
     capabilities: healthyHandshake().capabilities,
     fallback: { active: false, reason: null },
+    eventBinding: { active: false, appliedRevision: -1 },
   });
 });
 
