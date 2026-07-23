@@ -198,8 +198,22 @@ class OrderCoinLoop {
         const reason = String(boundary).startsWith("waiting-") ? boundary : `waiting-${boundary}`;
         return { ok: true, executed: execute, reason, targetSlot: this.targetSlot, actions, state, plan };
       }
-      if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction: plannedAction || { type: state.board.mergeCandidates.length ? "merge" : "produce", producer }, actions, state, plan };
-      const boardResult = await this.runBoardAction({ producer, merge: plannedAction?.type === "merge" ? plannedAction : null, plannedAction, signal });
+      const liveMergeCandidate = plannedAction == null
+        ? state.board?.mergeCandidates?.[0] || null
+        : null;
+      const fallbackAction = liveMergeCandidate
+        ? {
+            type: "merge",
+            ...liveMergeCandidate,
+            resultItemId: liveMergeCandidate.resultItemId
+              ?? liveMergeCandidate.mergeTarget
+              ?? liveMergeCandidate.expectedTarget
+              ?? null,
+          }
+        : { type: "produce", producer };
+      const nextAction = plannedAction || fallbackAction;
+      if (!execute) return { ok: true, executed: false, reason: "planned", targetSlot: this.targetSlot, nextAction, actions, state, plan };
+      const boardResult = await this.runBoardAction({ producer, merge: nextAction.type === "merge" ? nextAction : null, plannedAction: nextAction, signal });
       const verified = boardResult.ok && (boardResult.actions?.length > 0 || boardResult.stopReason === "order_ready");
       const diff = boardResult.actions?.[0] || boardResult.uncertainAction || null;
       const actualOutputs = (diff?.actualOutputItemIds || []).map(String).sort();

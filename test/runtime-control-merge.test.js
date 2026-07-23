@@ -626,6 +626,44 @@ test("the order loop replans a stale semantic merge without recording a mutation
   assert.deepEqual(events.map((event) => event.type), ["merge"]);
 });
 
+test("the order loop executes a concrete live merge candidate when the selected plan has no next action", async () => {
+  const fixture = createAdapter();
+  await fixture.adapter.ready();
+  const target = {
+    slot: "order-1",
+    feasible: true,
+    actionable: true,
+    ready: false,
+    producerSteps: [],
+  };
+  const loop = new OrderCoinLoop({
+    collectState: (signal) => fixture.adapter.readState(signal),
+    planOrders: async () => ({ recommended: target, plans: [target], boundaryReason: null }),
+    runBoardAction: ({ producer, merge, plannedAction, signal }) => fixture.adapter.execute(
+      { type: "run-board-action", producer, merge, plannedAction },
+      { signal, options: { delayMs: 1 } },
+    ),
+    submitOrder: async () => { throw new Error("a live merge candidate must execute before order submission"); },
+  });
+
+  const result = await loop.run({ execute: true, maxActions: 1 });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "max-actions-reached");
+  assert.equal(fixture.live.mergeExecutions(), 1);
+  assert.deepEqual(result.actions.map((action) => action.type), ["merge"]);
+  assert.deepEqual(result.actions[0].diff, {
+    step: 1,
+    type: "merge",
+    from: 0,
+    to: 1,
+    itemId: "item-1",
+    expectedTarget: "item-2",
+    actualTarget: "item-2",
+    verified: true,
+  });
+});
+
 test("semantic merge results continue through action history and Merge Relation evidence", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "semantic-merge-domain-flow-"));
   fs.writeFileSync(path.join(dataDir, "item-catalog.json"), JSON.stringify({
