@@ -975,6 +975,558 @@ test("CDP Adapter falls back to legacy when orderSubmission capability is absent
   assert.equal(legacyCalled, true);
 });
 
+// --- Semantic bridge navigation tests ---
+
+function navigationRuntimeFixture(scene = "map") {
+  const boardVisible = scene === "board";
+  const mapController = {
+    _controllerClazzName: "FieldMapMainViewController",
+    isViewVisible: !boardVisible,
+  };
+  const boardController = {
+    _controllerClazzName: "UserBoardViewController",
+    isViewVisible: boardVisible,
+    view: {
+      _boardView: {
+        onMapButtonClick() { this._mapClicked = true; },
+        _gameBoardView: {
+          _boardStore: { _state: { _gameBoard: { size: { width: 2, height: 2 }, __private_95_grids: [] } } },
+          canBoardGridBeDragging: () => false,
+          isBoardGridItemAnimating: () => false,
+          _operatorCenter: { itemCanMergeWith: () => false },
+          onTouch: () => {},
+          onDragStart: () => {},
+          onDragMove: () => {},
+          onDragEnd: () => {},
+        },
+      },
+    },
+  };
+  const entranceController = {
+    _controllerClazzName: "EntranceViewController",
+    isViewVisible: !boardVisible,
+    view: {
+      onBoardClick() { this._boardClicked = true; },
+    },
+  };
+  const missionController = {
+    _controllerClazzName: "AreaMissionInfoViewController",
+    isViewVisible: false,
+    hideByCloseBtn() { this.isViewVisible = false; this._closed = true; },
+  };
+  const runtime = {
+    mControllers: [mapController, boardController, entranceController, missionController],
+    mManagers: [
+      { _resourceMap: new Map([[1, 50], [2, 5], [3, 10]]) },
+      { _energyDataMap: new Map([[3, { _energyLimit: 20, _recoverInterval: 60, recoverTimestamp: null, inRecover: false }]]) },
+      { clientTaskDataMap: new Map() },
+    ],
+  };
+  const gameScene = {
+    name: "main",
+    getChildByName: (name) => name === "Entry" ? { _components: [runtime] } : null,
+    children: [],
+  };
+  const sandbox = vm.createContext({
+    globalThis: null,
+    cc: { ENGINE_VERSION: "3.8.0", director: { getScene: () => gameScene } },
+  });
+  sandbox.globalThis = sandbox;
+  return { sandbox, runtime, mapController, boardController, entranceController, missionController, gameScene };
+}
+
+function installNavigationBridge(fixture, contextGeneration = "7") {
+  const { sandbox } = fixture;
+  const { buildBridgeInstallExpression } = require("../src/runtime-control-bridge");
+  const expression = buildBridgeInstallExpression(contextGeneration);
+  return vm.runInContext(expression, sandbox);
+}
+
+test("injected bridge detects navigation capability when both directions are available", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  const result = installNavigationBridge(fixture);
+
+  assert.equal(result.handshake.capabilities.navigation, true);
+  assert.equal(result.handshake.capabilities.baseline, true);
+});
+
+test("injected bridge detects navigation capability unavailable when map button is missing", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  // Remove the map button handler
+  fixture.boardController.view._boardView.onMapButtonClick = undefined;
+  const result = installNavigationBridge(fixture);
+
+  assert.equal(result.handshake.capabilities.navigation, false);
+});
+
+test("injected bridge detects navigation capability unavailable when entrance is missing", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  // Remove the entrance onBoardClick handler
+  fixture.entranceController.view.onBoardClick = undefined;
+  const result = installNavigationBridge(fixture);
+
+  assert.equal(result.handshake.capabilities.navigation, false);
+});
+
+test("injected bridge navigate to board returns accepted-changed when entrance is visible", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  // Verify starting state
+  const before = fixture.sandbox.globalThis.miniGameCtl.readGameplayArea();
+  assert.equal(before.scene, "map");
+  assert.equal(before.boardVisible, false);
+  assert.equal(before.entranceVisible, true);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-1",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.equal(ack.ok, true);
+  assert.equal(ack.method, "navigate");
+  // The bridge dispatches synchronously; arrival depends on scene transition timing
+  assert.equal(fixture.entranceController.view._boardClicked, true);
+});
+
+test("injected bridge navigate to map returns accepted-changed when board is visible", async () => {
+  const fixture = navigationRuntimeFixture("board");
+  installNavigationBridge(fixture);
+
+  const before = fixture.sandbox.globalThis.miniGameCtl.readGameplayArea();
+  assert.equal(before.scene, "board");
+  assert.equal(before.boardVisible, true);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-2",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "map",
+  });
+
+  assert.equal(ack.ok, true);
+  assert.equal(fixture.boardController.view._boardView._mapClicked, true);
+});
+
+test("injected bridge navigate returns accepted-unchanged when already at target", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-already",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "map",
+  });
+
+  assert.equal(ack.ok, true);
+  assert.equal(ack.outcome, "accepted-unchanged");
+  assert.equal(ack.reason, "navigation-already-there");
+  assert.equal(ack.changed, false);
+});
+
+test("injected bridge navigate to board closes map mission overlay before navigation", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  fixture.missionController.isViewVisible = true; // overlay is open
+  installNavigationBridge(fixture);
+
+  const before = fixture.sandbox.globalThis.miniGameCtl.readGameplayArea();
+  assert.equal(before.missionVisible, true);
+
+  await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-overlay",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.equal(fixture.missionController._closed, true);
+  assert.equal(fixture.missionController.isViewVisible, false);
+  assert.equal(fixture.entranceController.view._boardClicked, true);
+});
+
+test("injected bridge navigate to board rejects when entrance is not visible", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  fixture.entranceController.isViewVisible = false;
+  installNavigationBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-no-ent",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "navigation-entrance-not-visible");
+});
+
+test("injected bridge navigate to board rejects when entrance handler missing at execution time", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  // Install with handler present so navigation capability is detected
+  installNavigationBridge(fixture);
+  // Then remove the handler after install — same pattern as order submission test
+  fixture.entranceController.view.onBoardClick = undefined;
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-no-handler",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "unsupported-capability");
+  assert.equal(ack.reason, "navigation-board-entrance-missing");
+});
+
+test("injected bridge navigate to map rejects when board is not visible", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  // Board not visible when on map; try to navigate to map from map is already-there,
+  // but the entrance to map from board path requires board visible.
+  // Create a scenario where we're somehow between scenes
+  fixture.boardController.isViewVisible = false;
+  fixture.mapController.isViewVisible = false; // neither visible
+  installNavigationBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-no-board",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "map",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "navigation-board-not-visible");
+});
+
+test("injected bridge navigate rejects stale revision", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-stale",
+    expectedRevision: 99,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "stale-revision");
+  assert.equal(ack.reason, "runtime-revision-stale");
+});
+
+test("injected bridge navigate is idempotent for duplicate operation IDs", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  const first = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-dup",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  // Reset clicked flag
+  fixture.entranceController.view._boardClicked = false;
+
+  const second = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-dup",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  assert.deepEqual(second, first);
+  assert.equal(fixture.entranceController.view._boardClicked, false);
+});
+
+test("injected bridge readGameplayArea returns current scene state with revision", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  const area = fixture.sandbox.globalThis.miniGameCtl.readGameplayArea();
+
+  assert.equal(area.scene, "map");
+  assert.equal(area.boardVisible, false);
+  assert.equal(area.mapVisible, true);
+  assert.equal(area.entranceVisible, true);
+  assert.equal(area.missionVisible, false);
+  assert.equal(area.revision, 0);
+});
+
+test("injected bridge navigation invalidates merge caches", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  // Drain any existing events
+  fixture.sandbox.globalThis.miniGameCtl.drainEventQueue(0);
+
+  await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-cache",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "board",
+  });
+
+  // Check that a cache-invalidated event was published
+  const events = fixture.sandbox.globalThis.miniGameCtl.drainEventQueue(0);
+  const cacheEvents = events.filter((e) => e.eventType === "cache-invalidated");
+  assert.ok(cacheEvents.length >= 1, "expected at least one cache-invalidated event after navigation");
+});
+
+// --- CdpRuntimeControlAdapter navigation tests ---
+
+test("CDP Adapter navigates to board through the semantic bridge and returns verified success", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture, "7");
+
+  // Simulate: onBoardClick also transitions scene state to board-visible
+  const origBoardClick = fixture.entranceController.view.onBoardClick;
+  fixture.entranceController.view.onBoardClick = function () {
+    origBoardClick.call(this);
+    fixture.boardController.isViewVisible = true;
+    fixture.mapController.isViewVisible = false;
+    fixture.entranceController.isViewVisible = false;
+  };
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => {
+        legacyCalled = true;
+        return normalizedBaseline();
+      },
+      execute: async () => {
+        legacyCalled = true;
+        return { ok: true, reason: "legacy-navigation" };
+      },
+    },
+  });
+
+  await adapter.ready();
+  legacyCalled = false; // reset after install
+  const result = await adapter.execute({ type: "navigate", target: "board" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.executed, true);
+  assert.equal(result.reason, "navigation-verified");
+  assert.equal(result.actions[0].type, "navigate");
+  assert.equal(result.actions[0].target, "board");
+  assert.equal(result.actions[0].verified, true);
+  assert.equal(legacyCalled, false);
+});
+
+test("CDP Adapter navigates to map through the semantic bridge and returns verified success", async () => {
+  const fixture = navigationRuntimeFixture("board");
+  installNavigationBridge(fixture, "7");
+
+  // Simulate: onMapButtonClick transitions to map scene
+  const origMapClick = fixture.boardController.view._boardView.onMapButtonClick;
+  fixture.boardController.view._boardView.onMapButtonClick = function () {
+    origMapClick.call(this);
+    fixture.boardController.isViewVisible = false;
+    fixture.mapController.isViewVisible = true;
+    fixture.entranceController.isViewVisible = true;
+  };
+
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute({ type: "navigate", target: "map" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.executed, true);
+  assert.equal(result.reason, "navigation-verified");
+  assert.equal(result.actions[0].target, "map");
+});
+
+test("CDP Adapter returns already-there when navigation target is the active area", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture, "7");
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => { legacyCalled = true; return { ok: true }; },
+    },
+  });
+
+  await adapter.ready();
+  legacyCalled = false;
+  const result = await adapter.execute({ type: "navigate", target: "map" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.executed, false);
+  assert.equal(result.reason, "navigation-already-there");
+  assert.equal(result.navigation.alreadyThere, true);
+  assert.equal(legacyCalled, false);
+});
+
+test("CDP Adapter requests replan on stale revision for navigation", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture, "7");
+
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "navigate", target: "board", expectedRevision: 99 },
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, false);
+  assert.equal(result.replanRequested, true);
+  assert.equal(result.reason, "runtime-revision-stale");
+});
+
+test("CDP Adapter verifies navigation with targeted gameplay-area reads across multiple attempts", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture, "7");
+
+  // Simulate a slow scene transition: board becomes visible after a few reads
+  let reads = 0;
+  const origBoardClick = fixture.entranceController.view.onBoardClick;
+  fixture.entranceController.view.onBoardClick = function () {
+    origBoardClick.call(this);
+    // Scene transition takes a few reads to complete
+  };
+
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => {
+        if (expression.includes("readGameplayArea")) {
+          reads += 1;
+          // Transition completes after 3 reads
+          if (reads >= 3) {
+            fixture.boardController.isViewVisible = true;
+            fixture.mapController.isViewVisible = false;
+            fixture.entranceController.isViewVisible = false;
+          }
+        }
+        return vm.runInContext(expression, fixture.sandbox);
+      },
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute({ type: "navigate", target: "board" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "navigation-verified");
+  assert.ok(reads >= 3, `expected at least 3 gameplay reads but got ${reads}`);
+});
+
+test("CDP Adapter reports navigation-not-observed when target not reached after verification attempts", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture, "7");
+
+  // onBoardClick does NOT change scene — navigation never completes
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute({ type: "navigate", target: "board" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.executed, true);
+  assert.equal(result.reason, "navigation-not-observed");
+});
+
+test("CDP Adapter falls back to legacy when navigation capability is absent", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  // Remove map button so navigation capability is false
+  fixture.boardController.view._boardView.onMapButtonClick = undefined;
+  installNavigationBridge(fixture, "7");
+
+  let legacyCalled = false;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => vm.runInContext(expression, fixture.sandbox),
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => {
+        legacyCalled = true;
+        return { ok: true, executed: true, reason: "legacy-navigation" };
+      },
+    },
+  });
+
+  await adapter.ready();
+  await adapter.execute({ type: "navigate", target: "board" });
+
+  assert.equal(legacyCalled, true);
+});
+
+test("injected bridge navigate rejects invalid target", async () => {
+  const fixture = navigationRuntimeFixture("map");
+  installNavigationBridge(fixture);
+
+  const ack = await fixture.sandbox.globalThis.miniGameCtl.executeCommand({
+    operationId: "nav-bad",
+    expectedRevision: 0,
+    method: "navigate",
+    target: "warehouse",
+  });
+
+  assert.equal(ack.ok, false);
+  assert.equal(ack.outcome, "rejected-precondition");
+  assert.equal(ack.reason, "navigation-target-invalid");
+});
+
 test("CDP Adapter duplicate operation IDs are blocked by the injected bridge", async () => {
   const fixture = orderSubmissionRuntimeFixture();
   installOrderSubmissionBridge(fixture, "7");

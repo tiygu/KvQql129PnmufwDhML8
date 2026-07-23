@@ -143,7 +143,15 @@ function buildBridgeInstallExpression(contextGeneration) {
         merge,
         production,
         orderSubmission,
-        navigation: false
+        navigation: (() => {
+          try {
+            const mapCtrl = controllers.find((c) => c?._controllerClazzName === "FieldMapMainViewController");
+            const entranceCtrl = controllers.find((c) => c?._controllerClazzName === "EntranceViewController");
+            const boardToMap = typeof boardController?.view?._boardView?.onMapButtonClick === "function";
+            const mapToBoard = typeof entranceCtrl?.view?.onBoardClick === "function";
+            return !!(boardToMap && mapToBoard);
+          } catch (_) { return false; }
+        })()
       };
     };
     const fingerprintRuntime = (runtime) => {
@@ -377,6 +385,104 @@ function buildBridgeInstallExpression(contextGeneration) {
     const invalidateMergeContext = () => {
       cachedMergeContext = null;
       publishEvent("cache-invalidated", null, { scope: "merge-context" });
+    };
+    const resolveNavigationContext = () => {
+      const { runtime } = resolveRuntime();
+      const controllers = runtime.mControllers;
+      const mapController = controllers.find((c) => c?._controllerClazzName === "FieldMapMainViewController");
+      const boardController = controllers.find((c) => c?._controllerClazzName === "UserBoardViewController");
+      const entranceController = controllers.find((c) => c?._controllerClazzName === "EntranceViewController");
+      const missionController = controllers.find((c) => c?._controllerClazzName === "AreaMissionInfoViewController");
+      return {
+        mapController, boardController, entranceController, missionController,
+        mapVisible: !!mapController?.isViewVisible,
+        boardVisible: !!boardController?.isViewVisible,
+        entranceVisible: !!entranceController?.isViewVisible,
+        missionVisible: !!missionController?.isViewVisible,
+        scene: !!boardController?.isViewVisible ? "board" : (!!mapController?.isViewVisible ? "map" : "unknown")
+      };
+    };
+    const readGameplayArea = () => {
+      const ctx = resolveNavigationContext();
+      return {
+        scene: ctx.scene,
+        mapVisible: ctx.mapVisible,
+        boardVisible: ctx.boardVisible,
+        entranceVisible: ctx.entranceVisible,
+        missionVisible: ctx.missionVisible,
+        revision
+      };
+    };
+    const executeNavigationCommand = async (command) => {
+      const target = command.target;
+      if (target !== "board" && target !== "map") {
+        return reject(command, "rejected-precondition", "navigation-target-invalid");
+      }
+      if (!Number.isInteger(command.expectedRevision) || command.expectedRevision !== revision) {
+        return reject(command, "stale-revision", "runtime-revision-stale");
+      }
+      const ctx = resolveNavigationContext();
+      const alreadyThere = target === "board" ? ctx.boardVisible : (ctx.mapVisible && !ctx.boardVisible);
+      if (alreadyThere) {
+        return cacheAcknowledgement(command.operationId, {
+          ...acknowledgementBase(command, false),
+          ok: true,
+          outcome: "accepted-unchanged",
+          reason: "navigation-already-there",
+          delta: { scene: ctx.scene, boardVisible: ctx.boardVisible, mapVisible: ctx.mapVisible }
+        });
+      }
+      if (target === "board") {
+        if (!ctx.entranceVisible) {
+          return reject(command, "rejected-precondition", "navigation-entrance-not-visible");
+        }
+        if (typeof ctx.entranceController?.view?.onBoardClick !== "function") {
+          return reject(command, "unsupported-capability", "navigation-board-entrance-missing");
+        }
+        if (ctx.missionVisible && typeof ctx.missionController?.hideByCloseBtn === "function") {
+          try { ctx.missionController.hideByCloseBtn(); } catch (_) {}
+        }
+        try {
+          ctx.entranceController.view.onBoardClick();
+        } catch (error) {
+          return reject(command, "bridge-failure", "navigation-board-action-failed");
+        }
+      } else {
+        if (!ctx.boardVisible) {
+          return reject(command, "rejected-precondition", "navigation-board-not-visible");
+        }
+        if (typeof ctx.boardController?.view?._boardView?.onMapButtonClick !== "function") {
+          return reject(command, "unsupported-capability", "navigation-map-button-missing");
+        }
+        try {
+          ctx.boardController.view._boardView.onMapButtonClick();
+        } catch (error) {
+          return reject(command, "bridge-failure", "navigation-map-action-failed");
+        }
+      }
+      revision += 1;
+      invalidateMergeContext();
+      publishEvent("cache-invalidated", command.operationId, { scope: "navigation-context" });
+      const after = resolveNavigationContext();
+      const arrived = target === "board" ? after.boardVisible : (after.mapVisible && !after.boardVisible);
+      const acknowledgement = {
+        ...acknowledgementBase(command, arrived),
+        ok: true,
+        outcome: arrived ? "accepted-changed" : "uncertain-result",
+        reason: arrived ? "navigation-complete" : "navigation-dispatched-awaiting-verification",
+        delta: {
+          scene: after.scene,
+          beforeScene: ctx.scene,
+          boardVisible: after.boardVisible,
+          mapVisible: after.mapVisible,
+          entranceVisible: after.entranceVisible,
+          missionVisible: after.missionVisible
+        }
+      };
+      if (arrived) {
+        publishEvent("state-changed", command.operationId, acknowledgement.delta);
+      }
+      return cacheAcknowledgement(command.operationId, acknowledgement);
     };
     const resolveMergeContext = () => {
       const { runtime } = resolveRuntime();
@@ -695,6 +801,9 @@ function buildBridgeInstallExpression(contextGeneration) {
       if (command.method === "submit-order" && capabilities.orderSubmission) {
         return executeSubmitOrderCommand(command);
       }
+      if (command.method === "navigate" && capabilities.navigation) {
+        return executeNavigationCommand(command);
+      }
       if (command.method !== "merge" || !capabilities.merge) {
         return reject(command, "unsupported-capability", command.method + "-unsupported");
       }
@@ -826,6 +935,7 @@ function buildBridgeInstallExpression(contextGeneration) {
       readBaseline,
       readBoard,
       readOrderSlot,
+      readGameplayArea,
       executeCommand,
       drainEventQueue,
       invalidateMergeContext
@@ -1549,6 +1659,174 @@ class CdpRuntimeControlAdapter {
         pauseRequested: false,
         acknowledgement: cloneRecord(acknowledgement),
         before: command.before ?? null,
+      };
+    }
+    const canUseSemanticNavigation = !this.fallbackReason
+      && this.readiness?.capabilities?.navigation === true
+      && command?.type === "navigate";
+    if (canUseSemanticNavigation) {
+      const target = command.target;
+      if (target !== "board" && target !== "map") {
+        throw Object.assign(new Error("semantic navigation requires target board or map"), {
+          code: "RUNTIME_CONTROL_COMMAND_INVALID",
+          reason: "navigation-target-invalid",
+        });
+      }
+      const operationId = String(command.operationId || `navigate-${randomUUID()}`);
+      const expectedRevision = command.expectedRevision == null
+        ? this.readiness.revision
+        : Number(command.expectedRevision);
+      const semanticCommand = {
+        operationId,
+        expectedRevision,
+        method: "navigate",
+        target,
+      };
+      this.cachedBaseline = null;
+      const expression = `globalThis.miniGameCtl.executeCommand(${JSON.stringify(semanticCommand)})`;
+      let acknowledgement = null;
+      let deliveryError = null;
+      for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
+        try {
+          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+        } catch (error) {
+          if (error?.name === "AbortError") {
+            this.requiresBroadReconciliation = true;
+            acknowledgement = {
+              ok: false,
+              outcome: "aborted",
+              reason: "semantic-navigation-aborted-after-dispatch",
+              operationId,
+              method: "navigate",
+              expectedRevision,
+              revision: this.readiness.revision,
+              changed: null,
+            };
+            break;
+          }
+          deliveryError = error;
+        }
+      }
+      if (acknowledgement == null) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-navigation-acknowledgement-lost",
+          operationId,
+          method: "navigate",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+          error: deliveryError?.message || String(deliveryError || "unknown bridge failure"),
+        };
+      }
+      const ackValid = acknowledgement
+        && typeof acknowledgement === "object"
+        && acknowledgement.operationId === operationId
+        && Number.isInteger(acknowledgement.revision)
+        && typeof acknowledgement.outcome === "string"
+        && typeof acknowledgement.reason === "string";
+      if (!ackValid) {
+        acknowledgement = {
+          ok: false,
+          outcome: "bridge-failure",
+          reason: "semantic-navigation-acknowledgement-invalid",
+          operationId,
+          method: "navigate",
+          expectedRevision,
+          revision: this.readiness.revision,
+          changed: null,
+        };
+      }
+      this.readiness.revision = acknowledgement.revision;
+      if (acknowledgement.outcome === "aborted") {
+        return {
+          ok: false,
+          executed: true,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          uncertainAction: { type: "navigate", target },
+          pauseRequested: false,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (acknowledgement.outcome === "stale-revision") {
+        this.requiresBroadReconciliation = false;
+        const replanState = await this.readState(signal);
+        return {
+          ok: false,
+          executed: false,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          replanRequested: true,
+          replanState,
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      if (acknowledgement.outcome === "accepted-unchanged") {
+        this.requiresBroadReconciliation = false;
+        return {
+          ok: true,
+          executed: false,
+          reason: acknowledgement.reason,
+          stopReason: acknowledgement.reason,
+          actions: [],
+          navigation: { target, alreadyThere: true },
+          acknowledgement: cloneRecord(acknowledgement),
+        };
+      }
+      // Dispatched — verify with gameplay-area targeted reads, no fixed settle delay.
+      let arrived = acknowledgement.outcome === "accepted-changed"
+        && acknowledgement.reason === "navigation-complete";
+      let areaRead = null;
+      let lastError = null;
+      const maxVerificationAttempts = 6;
+      for (let attempt = 0; !arrived && attempt < maxVerificationAttempts; attempt += 1) {
+        assertNotAborted(signal);
+        try {
+          areaRead = await this.client.evaluate(
+            "globalThis.miniGameCtl.readGameplayArea()",
+            this.contextId,
+            { signal },
+          );
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          lastError = error?.message || String(error);
+          continue;
+        }
+        if (areaRead && Number.isInteger(areaRead.revision)) {
+          this.readiness.revision = areaRead.revision;
+        }
+        arrived = target === "board" ? areaRead?.boardVisible === true
+          : (areaRead?.mapVisible === true && areaRead?.boardVisible !== true);
+        if (arrived) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      if (arrived) {
+        this.requiresBroadReconciliation = false;
+        return {
+          ok: true,
+          executed: true,
+          reason: "navigation-verified",
+          stopReason: "navigation-complete",
+          actions: [{ type: "navigate", target, verified: true }],
+          acknowledgement: cloneRecord(acknowledgement),
+          targetedVerification: cloneRecord(areaRead),
+        };
+      }
+      const navigationReason = lastError || "navigation-not-observed";
+      return {
+        ok: false,
+        executed: true,
+        reason: navigationReason,
+        stopReason: navigationReason,
+        actions: [],
+        uncertainAction: { type: "navigate", target },
+        pauseRequested: false,
+        acknowledgement: cloneRecord(acknowledgement),
+        targetedVerification: cloneRecord(areaRead),
       };
     }
     const canUseSemanticMerge = !this.fallbackReason
