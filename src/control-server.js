@@ -212,12 +212,23 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       }
       if (route === "POST /api/catalog/review/complete") {
         const body = await readJson(req);
-        const payloadValid = body.decision !== "modify" || (body.payload && typeof body.payload === "object" && !Array.isArray(body.payload));
-        if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !["confirm", "modify"].includes(body.decision) || !payloadValid || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) {
+        const snapshotValid = body.snapshot && typeof body.snapshot === "object" && !Array.isArray(body.snapshot);
+        if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !["confirm", "modify"].includes(body.decision) || !snapshotValid || !body.actor || !body.requestId || !Number.isInteger(Number(body.expectedRevision))) {
           return writeJson(res, 400, { ok: false, error: "invalid-catalog-review-completion-request" });
         }
-        const object = runtime.completeCatalogReview({ ...body, expectedRevision: Number(body.expectedRevision) });
-        broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+        const object = await runtime.completeCatalogReview({ ...body, expectedRevision: Number(body.expectedRevision) });
+        if (!object.idempotentReplay) {
+          const reviewQueue = runtime.getCatalogView({ includeRepositoryObjects: true }).repository?.reviewQueue || [];
+          broadcast({
+            type: "catalog-review-updated",
+            objectType: object.objectType,
+            objectId: object.objectId,
+            revision: object.revision,
+            reviewStatus: object.reviewStatus,
+            planningResult: object.reviewResolution?.planningResult || null,
+            reviewQueue,
+          });
+        }
         return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/ruling") {

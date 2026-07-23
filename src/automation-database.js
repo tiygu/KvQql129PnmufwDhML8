@@ -68,6 +68,25 @@ function validateCatalogReviewPayload(identity, payload) {
   return value;
 }
 
+function catalogDisplayTitle(payload) {
+  const value = payload || {};
+  const name = value.name || value.displayName || value.title || value.description || value.descriptionKey;
+  if (String(name || "").trim()) return String(name).trim();
+  const level = Number(value.level);
+  return Number.isFinite(level) && level > 0 ? `未命名物品（第 ${level} 级）` : "未命名物品";
+}
+
+function meaningfulCatalogDifferences(before, after) {
+  const fields = new Set([...Object.keys(before || {}), ...Object.keys(after || {})]);
+  return [...fields].sort().flatMap((fieldPath) => {
+    const oldValue = before?.[fieldPath];
+    const newValue = after?.[fieldPath];
+    return canonicalJson(oldValue ?? null) === canonicalJson(newValue ?? null)
+      ? []
+      : [{ fieldPath, oldValue: oldValue ?? null, newValue: newValue ?? null }];
+  });
+}
+
 class AutomationDatabase {
   constructor(filePath = "data/automation.db") {
     this.filePath = path.resolve(String(filePath));
@@ -202,6 +221,28 @@ class AutomationDatabase {
         created_at TEXT NOT NULL,
         FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT
       );
+      CREATE TABLE IF NOT EXISTS catalog_review_resolutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_id INTEGER NOT NULL,
+        request_id TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        optional_note TEXT,
+        object_revision INTEGER NOT NULL,
+        planning_result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS catalog_audit_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resolution_id INTEGER NOT NULL UNIQUE,
+        summary_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(resolution_id) REFERENCES catalog_review_resolutions(id) ON DELETE RESTRICT
+      );
       CREATE TABLE IF NOT EXISTS catalog_icon_assets (
         hash TEXT PRIMARY KEY,
         mime_type TEXT NOT NULL,
@@ -295,6 +336,8 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_conflicts_status ON catalog_repository_conflicts(status, object_type);
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_transitions_object ON catalog_repository_transitions(object_id, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_rulings_object_field ON catalog_repository_rulings(object_id, field_path, id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_review_resolutions_object ON catalog_review_resolutions(object_id, id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_audit_summaries_created ON catalog_audit_summaries(created_at, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_object ON catalog_icon_candidates(object_id, selected, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_asset ON catalog_icon_candidates(asset_hash);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_icon_candidates_one_selected ON catalog_icon_candidates(object_id) WHERE selected=1;
@@ -554,25 +597,54 @@ class AutomationDatabase {
     const actor = String(input.actor || "").trim();
     const note = String(input.note || "").trim();
     if (!actor) throw new TypeError("catalog review actor is required");
-    if (!note) throw new TypeError("catalog review note is required");
+    const hasExplicitRequestId = String(input.requestId || "").trim().length > 0;
+    const requestId = String(input.requestId || `legacy-review:${crypto.randomUUID()}`).trim();
+    if (!requestId) throw new TypeError("catalog review requestId is required");
     return this.transaction(() => {
       const before = this._catalogObjectRow(identity.objectType, identity.objectId);
       if (!before) throw new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`);
-      this._assertCatalogRevision(before, input.expectedRevision);
       const algorithmCandidate = this._catalogAlgorithmCandidate(before);
-      const payload = validateCatalogReviewPayload(identity, decision === "confirm" ? algorithmCandidate : input.payload);
+      const submittedSnapshot = input.snapshot ?? input.payload ?? (decision === "confirm" ? algorithmCandidate : null);
+      const payload = validateCatalogReviewPayload(identity, submittedSnapshot);
+      const requestFingerprint = canonicalJson({
+        objectType: identity.objectType,
+        objectId: identity.objectId,
+        decision,
+        snapshot: payload,
+        actor,
+        optionalNote: note || null,
+      });
+      const existingResolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(requestId);
+      if (existingResolution) {
+        if (existingResolution.request_fingerprint !== requestFingerprint) {
+          const conflict = new Error(`catalog idempotency conflict: ${requestId}`);
+          conflict.code = "CATALOG_IDEMPOTENCY_CONFLICT";
+          conflict.statusCode = 409;
+          throw conflict;
+        }
+        return this._catalogReviewCompletionResult(
+          this._catalogObjectRow(identity.objectType, identity.objectId),
+          existingResolution,
+          true,
+        );
+      }
+      this._assertCatalogRevision(before, input.expectedRevision);
       const activeRulings = this._activeCatalogRulings(before.id);
       const effectiveBefore = [...activeRulings.values()].reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
+      const triggerReasons = this._catalogReviewReasons(before, algorithmCandidate, activeRulings);
+      const evidenceReferences = this.db.prepare("SELECT id,source_type,source_ref FROM catalog_repository_evidence WHERE object_id=? ORDER BY id").all(before.id)
+        .map((evidence) => ({ id: Number(evidence.id), sourceType: evidence.source_type, sourceRef: evidence.source_ref || null }));
       const nextRevision = Number(before.revision) + 1;
       const now = input.createdAt || new Date().toISOString();
       const json = (value) => JSON.stringify(value === undefined ? null : value);
+      const rulingNote = note || (decision === "confirm" ? "系统生成：确认完整候选快照" : "系统生成：修改后确认完整候选快照");
       const insertRuling = this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
         VALUES(?,?,?,?,?,?,?,?,?,?)`);
       for (const ruling of activeRulings.values()) {
-        insertRuling.run(before.id, ruling.fieldPath, "revoke", null, actor, `整对象审核替代旧裁决：${note}`, json(fieldValue(effectiveBefore, ruling.fieldPath)), json(fieldValue(algorithmCandidate, ruling.fieldPath)), nextRevision, now);
+        insertRuling.run(before.id, ruling.fieldPath, "revoke", null, actor, `整对象审核替代旧裁决：${rulingNote}`, json(fieldValue(effectiveBefore, ruling.fieldPath)), json(fieldValue(algorithmCandidate, ruling.fieldPath)), nextRevision, now);
       }
       for (const fieldPath of Object.keys(payload).sort()) {
-        insertRuling.run(before.id, fieldPath, decision, json(payload[fieldPath]), actor, note, json(fieldValue(effectiveBefore, fieldPath)), json(payload[fieldPath]), nextRevision, now);
+        insertRuling.run(before.id, fieldPath, decision, json(payload[fieldPath]), actor, rulingNote, json(fieldValue(effectiveBefore, fieldPath)), json(payload[fieldPath]), nextRevision, now);
       }
       const nextVersion = Number(this.db.prepare("SELECT COALESCE(MAX(version),0)+1 AS version FROM catalog_repository_versions WHERE object_id=?").get(before.id).version);
       const inserted = this.db.prepare(`INSERT INTO catalog_repository_versions(object_id,version,status,origin,payload_json,evidence_summary_json,created_at)
@@ -587,7 +659,129 @@ class AutomationDatabase {
         reason: `human-review-${decision}:${actor}`,
         evidenceRevision: nextRevision,
       });
-      return this._catalogObjectResult(after);
+      const planningResult = hasExplicitRequestId
+        ? { status: "pending", recovered: false }
+        : { status: "not-requested", recovered: true };
+      const insertedResolution = this.db.prepare(`INSERT INTO catalog_review_resolutions(
+        object_id,request_id,request_fingerprint,decision,snapshot_json,actor,optional_note,object_revision,planning_result_json,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        before.id,
+        requestId,
+        requestFingerprint,
+        decision,
+        canonicalJson(payload),
+        actor,
+        note || null,
+        nextRevision,
+        canonicalJson(planningResult),
+        now,
+      );
+      const resolutionId = Number(insertedResolution.lastInsertRowid);
+      const auditSummary = {
+        resolutionId,
+        requestId,
+        objectType: identity.objectType,
+        objectId: identity.objectId,
+        objectRevision: nextRevision,
+        actor,
+        action: decision,
+        displayTitle: catalogDisplayTitle(payload),
+        meaningfulDifferences: meaningfulCatalogDifferences(effectiveBefore, payload),
+        triggerReasons,
+        planningResult,
+        evidenceReferences,
+        optionalNote: note || null,
+        createdAt: now,
+      };
+      this.db.prepare(`INSERT INTO catalog_audit_summaries(resolution_id,summary_json,created_at,updated_at)
+        VALUES(?,?,?,?)`).run(resolutionId, canonicalJson(auditSummary), now, now);
+      return this._catalogReviewCompletionResult(
+        after,
+        this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE id=?").get(resolutionId),
+        false,
+      );
+    });
+  }
+
+  _catalogReviewCompletionResult(objectRow, resolutionRow, idempotentReplay) {
+    const result = this._catalogObjectResult(objectRow);
+    const auditRow = this.db.prepare("SELECT * FROM catalog_audit_summaries WHERE resolution_id=?").get(resolutionRow.id);
+    const planningResult = parseJson(resolutionRow.planning_result_json);
+    return Object.assign(result, {
+      reviewResolution: {
+        id: Number(resolutionRow.id),
+        requestId: resolutionRow.request_id,
+        decision: resolutionRow.decision,
+        snapshot: parseJson(resolutionRow.snapshot_json),
+        actor: resolutionRow.actor,
+        optionalNote: resolutionRow.optional_note || null,
+        objectRevision: Number(resolutionRow.object_revision),
+        planningResult,
+        createdAt: resolutionRow.created_at,
+      },
+      catalogAuditSummary: auditRow
+        ? { id: Number(auditRow.id), ...parseJson(auditRow.summary_json), planningResult }
+        : null,
+      idempotentReplay: !!idempotentReplay,
+    });
+  }
+
+  listCatalogReviewResolutions({ objectType = null, objectId = null } = {}) {
+    const clauses = [], values = [];
+    if (objectType != null) { clauses.push("object.object_type=?"); values.push(String(objectType)); }
+    if (objectId != null) { clauses.push("object.object_id=?"); values.push(String(objectId)); }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT resolution.*,object.object_type,object.object_id
+      FROM catalog_review_resolutions resolution
+      JOIN catalog_repository_objects object ON object.id=resolution.object_id
+      ${where} ORDER BY resolution.id`).all(...values).map((row) => ({
+      id: Number(row.id),
+      requestId: row.request_id,
+      objectType: row.object_type,
+      objectId: row.object_id,
+      decision: row.decision,
+      snapshot: parseJson(row.snapshot_json),
+      actor: row.actor,
+      optionalNote: row.optional_note || null,
+      objectRevision: Number(row.object_revision),
+      planningResult: parseJson(row.planning_result_json),
+      createdAt: row.created_at,
+    }));
+  }
+
+  listCatalogAuditSummaries({ objectType = null, objectId = null } = {}) {
+    const clauses = [], values = [];
+    if (objectType != null) { clauses.push("object.object_type=?"); values.push(String(objectType)); }
+    if (objectId != null) { clauses.push("object.object_id=?"); values.push(String(objectId)); }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT audit.id,audit.summary_json,resolution.planning_result_json
+      FROM catalog_audit_summaries audit
+      JOIN catalog_review_resolutions resolution ON resolution.id=audit.resolution_id
+      JOIN catalog_repository_objects object ON object.id=resolution.object_id
+      ${where} ORDER BY audit.id`).all(...values)
+      .map((row) => ({
+        id: Number(row.id),
+        ...parseJson(row.summary_json),
+        planningResult: parseJson(row.planning_result_json),
+      }));
+  }
+
+  finalizeCatalogReviewPlanning(requestId, planningResult) {
+    const normalizedRequestId = String(requestId || "").trim();
+    if (!normalizedRequestId) throw new TypeError("catalog review requestId is required");
+    const normalizedPlanningResult = structuredClone(planningResult || {});
+    return this.transaction(() => {
+      const resolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(normalizedRequestId);
+      if (!resolution) throw new Error(`catalog review resolution not found: ${normalizedRequestId}`);
+      const audit = this.db.prepare("SELECT * FROM catalog_audit_summaries WHERE resolution_id=?").get(resolution.id);
+      const summary = parseJson(audit.summary_json);
+      this.db.prepare("UPDATE catalog_review_resolutions SET planning_result_json=? WHERE id=?")
+        .run(canonicalJson(normalizedPlanningResult), resolution.id);
+      return this._catalogReviewCompletionResult(
+        this._catalogObjectRow(summary.objectType, summary.objectId),
+        this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE id=?").get(resolution.id),
+        false,
+      );
     });
   }
 
@@ -707,7 +901,13 @@ class AutomationDatabase {
 
   getCatalogObject(objectType, objectId) {
     const identity = validateCatalogIdentity(objectType, objectId);
-    return this._catalogObjectResult(this._catalogObjectRow(identity.objectType, identity.objectId));
+    const object = this._catalogObjectRow(identity.objectType, identity.objectId);
+    const resolution = object && this.db.prepare(
+      "SELECT * FROM catalog_review_resolutions WHERE object_id=? ORDER BY id DESC LIMIT 1",
+    ).get(object.id);
+    return resolution
+      ? this._catalogReviewCompletionResult(object, resolution, false)
+      : this._catalogObjectResult(object);
   }
 
   assertCatalogObjectRevision(objectType, objectId, expectedRevision) {
@@ -768,22 +968,50 @@ class AutomationDatabase {
       if (ruling.decision === "revoke") active.delete(ruling.field_path);
       else active.set(ruling.field_path, this._catalogRulingRow(ruling));
     }
+    const latestResolutionByObject = new Map();
+    for (const resolution of this.db.prepare("SELECT object_id,planning_result_json FROM catalog_review_resolutions ORDER BY id DESC").all()) {
+      const objectId = Number(resolution.object_id);
+      if (!latestResolutionByObject.has(objectId)) latestResolutionByObject.set(objectId, parseJson(resolution.planning_result_json));
+    }
     return rows.map((row) => {
-      const reasons = [];
-      if (row.status === "observed") reasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
-      if (row.candidate_version_id != null) reasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
+      const semanticReasons = [];
+      if (row.status === "observed") semanticReasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
+      if (row.candidate_version_id != null) semanticReasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
       for (const conflict of conflictsByObject.get(`${row.object_type}:${row.object_id}`) || []) {
-        reasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
+        semanticReasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
       }
       const version = versionById.get(Number(row.active_version_id)) || versionById.get(Number(row.candidate_version_id)) || latestVersionByObject.get(Number(row.id));
       const algorithmCandidate = parseJson(version?.payload_json) || {};
       for (const ruling of (activeRulingsByObject.get(Number(row.id)) || new Map()).values()) {
         const candidate = fieldValue(algorithmCandidate, ruling.fieldPath);
         if (canonicalJson(candidate ?? null) !== canonicalJson(ruling.value ?? null)) {
-          reasons.push({ type: "human-ruling-conflict", fieldPath: ruling.fieldPath, candidate, humanValue: ruling.value, message: "算法证据与人工裁决冲突" });
+          semanticReasons.push({ type: "human-ruling-conflict", fieldPath: ruling.fieldPath, candidate, humanValue: ruling.value, message: "算法证据与人工裁决冲突" });
         }
       }
-      return { objectType: row.object_type, objectId: row.object_id, revision: Number(row.revision), status: row.status, disposition: row.disposition, reviewStatus: reasons.length ? "needs-review" : "clear", reasons, updatedAt: row.updated_at };
+      const planningResult = latestResolutionByObject.get(Number(row.id)) || null;
+      const planningIncomplete = planningResult && planningResult.recovered !== true;
+      const reasons = planningIncomplete
+        ? [...semanticReasons, {
+            type: "planning-recovery-pending",
+            message: planningResult.status === "failed" ? "审核结论已保存，规划尚未恢复" : "审核结论已保存，正在重新规划",
+          }]
+        : semanticReasons;
+      const title = catalogDisplayTitle(algorithmCandidate);
+      const displayTitle = row.candidate_version_id != null && !title.startsWith("未命名物品")
+        ? `疑似“${title}”`
+        : title;
+      return {
+        objectType: row.object_type,
+        objectId: row.object_id,
+        displayTitle,
+        revision: Number(row.revision),
+        status: row.status,
+        disposition: row.disposition,
+        reviewStatus: semanticReasons.length ? "needs-review" : "clear",
+        actionStatus: semanticReasons.length ? "需要处理" : "已确认",
+        reasons,
+        updatedAt: row.updated_at,
+      };
     }).filter((entry) => entry.reasons.length > 0);
   }
 

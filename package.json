@@ -8,6 +8,7 @@
     "console": "node run.cjs --external-cdp --no-open",
     "web:dev": "concurrently -k \"node run.cjs --external-cdp --no-open\" \"vite --config web/vite.config.ts --host 127.0.0.1\"",
     "web:build": "vite build --config web/vite.config.ts",
+    "test:browser": "node node_modules/vite/bin/vite.js build --config web/vite.config.ts && node e2e/catalog-review-confirmation.e2e.js",
     "wx:cdp": "node wmpf/src/index.js",
     "wx:cdp:debug": "node wmpf/src/index.js --debug-main --debug-frida",
     "wx:verify": "node scripts/inspect-app-runtime.cjs --verify",
@@ -56,6 +57,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "concurrently": "^10.0.3",
+    "playwright": "^1.55.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2",
     "vite": "^8.1.5"

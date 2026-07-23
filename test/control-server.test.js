@@ -9,9 +9,10 @@ const WebSocket = require("ws");
 const { createControlServer } = require("../src/control-server");
 
 function createRuntime() {
+  const reviewQueue = [{ objectType: "item-identity", objectId: "next", revision: 2, reviewStatus: "needs-review" }];
   return {
     dashboard: async () => ({ connected: false, running: false }),
-    getCatalogView: () => ({ revision: "db-revision-3", stats: { items: 3 }, repository: { summary: { states: { observed: 1, provisional: 1, active: 1 } }, objects: [{ objectType: "item-identity", objectId: "i", status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }] } }),
+    getCatalogView: () => ({ revision: "db-revision-3", stats: { items: 3 }, repository: { summary: { states: { observed: 1, provisional: 1, active: 1 } }, objects: [{ objectType: "item-identity", objectId: "i", status: "active", revision: 3, evidenceSummary: { evidenceCount: 2 } }], reviewQueue } }),
     exportCatalog: () => ({ schemaVersion: 1, source: { type: "sqlite-catalog-repository", revision: "db-revision-3" }, objects: [] }),
     importCatalog: (snapshot, options) => ({ imported: snapshot.objects.length, preserved: 0, sourceFile: options.sourceFile, revision: "db-revision-4" }),
     acquireCatalogIcon: (itemId) => ({ status: "queued", taskId: 17, itemId }),
@@ -269,6 +270,7 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
   fs.mkdirSync(path.join(root, "public"));
   fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
   const runtime = createRuntime();
+  const reviewQueue = runtime.getCatalogView().repository.reviewQueue;
   const completions = [];
   let revision = 3;
   runtime.completeCatalogReview = (input) => {
@@ -281,9 +283,7 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
     }
     completions.push(input);
     revision += 1;
-    const effectiveValue = input.decision === "modify"
-      ? input.payload
-      : { itemId: input.objectId, chainId: "c", level: 1, baseUnits: 1 };
+    const effectiveValue = input.snapshot;
     return {
       objectType: input.objectType,
       objectId: input.objectId,
@@ -302,7 +302,8 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
 
     const confirmInput = {
       objectType: "item-identity", objectId: "i", decision: "confirm",
-      actor: "operator-a", note: "完整候选已核对", expectedRevision: 3,
+      snapshot: { itemId: "i", chainId: "c", level: 1, baseUnits: 1 },
+      actor: "operator-a", note: "完整候选已核对", requestId: "confirm-i-3", expectedRevision: 3,
     };
     const confirmEvent = waitForEvent(client, (event) => event.type === "catalog-review-updated" && event.revision === 4, "catalog confirm event");
     const confirmed = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
@@ -317,12 +318,14 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
     });
     assert.deepEqual(await confirmEvent.promise, {
       type: "catalog-review-updated", objectType: "item-identity", objectId: "i", revision: 4, reviewStatus: "clear",
+      planningResult: null,
+      reviewQueue,
     });
 
     const modifiedPayload = { itemId: "i", chainId: "manual", level: 2, baseUnits: 2 };
     const modifyInput = {
-      objectType: "item-identity", objectId: "i", decision: "modify", payload: modifiedPayload,
-      actor: "operator-b", note: "整项修改已核对", expectedRevision: 4,
+      objectType: "item-identity", objectId: "i", decision: "modify", snapshot: modifiedPayload,
+      actor: "operator-b", note: "整项修改已核对", requestId: "modify-i-4", expectedRevision: 4,
     };
     const modifyEvent = waitForEvent(client, (event) => event.type === "catalog-review-updated" && event.revision === 5, "catalog modify event");
     const modified = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
@@ -333,6 +336,8 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
     assert.deepEqual((await modified.json()).effectiveValue, modifiedPayload);
     assert.deepEqual(await modifyEvent.promise, {
       type: "catalog-review-updated", objectType: "item-identity", objectId: "i", revision: 5, reviewStatus: "clear",
+      planningResult: null,
+      reviewQueue,
     });
     assert.deepEqual(completions, [confirmInput, modifyInput]);
 

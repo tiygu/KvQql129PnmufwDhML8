@@ -487,10 +487,50 @@ class AutomationRuntime {
     return this.database.applyCatalogRuling(input);
   }
 
-  completeCatalogReview(input) {
-    const object = this.database.completeCatalogReview(input);
-    this.emit("catalog-state-updated", { object });
-    return object;
+  async completeCatalogReview(input) {
+    const committed = this.database.completeCatalogReview(input);
+    const priorPlanning = committed.reviewResolution?.planningResult;
+    if (committed.idempotentReplay && priorPlanning?.status !== "pending") return committed;
+    let planningResult;
+    try {
+      const replanned = this.catalogReviewReplanner
+        ? await this.catalogReviewReplanner({ object: committed, input })
+        : await this._replanAfterCatalogReview();
+      planningResult = {
+        status: replanned?.status || (replanned?.recovered ? "ready" : "waiting"),
+        recovered: replanned?.recovered ?? replanned?.status === "ready",
+        boundaryReason: replanned?.boundaryReason ?? null,
+        recommendedOrderSlot: replanned?.recommendedOrderSlot ?? replanned?.recommended?.slot ?? null,
+      };
+    } catch (error) {
+      planningResult = {
+        status: "failed",
+        recovered: false,
+        boundaryReason: "catalog-review-replan-failed",
+        recommendedOrderSlot: null,
+        error: error?.message || String(error),
+      };
+    }
+    return this.database.finalizeCatalogReviewPlanning(committed.reviewResolution?.requestId || input.requestId, planningResult);
+  }
+
+  async _replanAfterCatalogReview() {
+    const settings = this.getSettings();
+    const plan = buildOptimizationPlan({
+      catalog: this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode }),
+      state: this.lastState,
+      strategy: settings.strategy,
+      prioritySlot: settings.prioritySlot,
+      salePolicy: settings.salePolicy,
+      executionMode: settings.mode,
+    });
+    this.lastPlan = plan;
+    return {
+      status: plan.status,
+      recovered: plan.status === "ready",
+      boundaryReason: plan.boundaryReason,
+      recommendedOrderSlot: plan.recommended?.slot ?? null,
+    };
   }
 
   revokeCatalogRuling(input) {

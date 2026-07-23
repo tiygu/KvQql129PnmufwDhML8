@@ -3,12 +3,31 @@ import { AlertTriangle, Check, History, Image, Pause, Play, RotateCcw, Save, Upl
 import { controlApi } from "./control-api";
 import { ImageLightbox } from "./ImageLightbox";
 
-const reasonLabels: Record<string, string> = {
-  "new-observation": "新观测",
-  "inference-change": "推断变化",
-  "evidence-conflict": "证据冲突",
-  "icon-gap": "图标缺口",
-  "human-ruling-conflict": "裁决冲突",
+const reviewReasonMetadata: Record<string, { label: string; explanation: string }> = {
+  "new-observation": {
+    label: "新观测",
+    explanation: "系统刚观测到这个对象，但现有线索还没有形成稳定含义。请核对完整候选是否与游戏中看到的一致。",
+  },
+  "inference-change": {
+    label: "推断变化",
+    explanation: "系统整理出一份尚未生效的完整候选，它可能解除当前订单的图鉴阻塞。请核对对象身份与关系是否正确。",
+  },
+  "evidence-conflict": {
+    label: "证据冲突",
+    explanation: "系统发现不同来源对这个对象的含义说法不一致，相关订单的规划可能因此受阻。请核对下方候选快照是否与游戏中看到的一致。",
+  },
+  "icon-gap": {
+    label: "图标缺口",
+    explanation: "对象只缺少展示图标，不影响当前规划。请在方便时补充视觉线索。",
+  },
+  "human-ruling-conflict": {
+    label: "裁决冲突",
+    explanation: "新线索与上一次人工结论不一致，规划仍沿用人工确认值。请核对当前完整候选，确认是否需要更新结论。",
+  },
+  "planning-recovery-pending": {
+    label: "规划尚未恢复",
+    explanation: "审核结论已经保存，但订单规划尚未恢复。请保留当前诊断上下文并查看重新规划结果。",
+  },
 };
 
 const valueLabels: Record<string, string> = {
@@ -65,6 +84,22 @@ function display(value: any) {
   return JSON.stringify(value);
 }
 
+function catalogObjectTitle(detail: any) {
+  const value = detail?.effectiveValue || detail?.algorithmCandidate || {};
+  const confirmedName = detail?.humanValues?.name?.value;
+  const candidateName = confirmedName || value.name || value.displayName || value.title || value.description || value.descriptionKey;
+  if (String(candidateName || "").trim()) return confirmedName ? String(candidateName).trim() : `疑似“${String(candidateName).trim()}”`;
+  const level = Number(value.level);
+  return Number.isFinite(level) && level > 0 ? `未命名物品（第 ${level} 级）` : "未命名物品";
+}
+
+function humanReadableReason(detail: any) {
+  const reasons = detail?.reviewReasons || [];
+  const priority = ["planning-recovery-pending", "evidence-conflict", "human-ruling-conflict", "inference-change", "new-observation"];
+  const reason = priority.find((type) => reasons.some((entry: any) => entry.type === type));
+  return reviewReasonMetadata[reason || "new-observation"].explanation;
+}
+
 function parseObjectDraft(value: string) {
   const parsed = JSON.parse(value);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("完整对象必须是 JSON 对象");
@@ -93,8 +128,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [latestAuditSummary, setLatestAuditSummary] = useState<any>(null);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
+  const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
 
   const selectedSummary = useMemo(() => {
     const queuedKeys = new Set(queue.map((item: any) => `${item.objectType}:${item.objectId}`));
@@ -113,7 +150,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       const value = await controlApi.getCatalogObject(summary.objectType, summary.objectId);
       if (requestId !== detailRequestId.current) return;
       setDetail(value);
-      setObjectDraft(JSON.stringify(value.effectiveValue || value.algorithmCandidate || {}, null, 2));
+      setObjectDraft(JSON.stringify(value.algorithmCandidate || value.effectiveValue || {}, null, 2));
     } catch (error: any) {
       if (requestId !== detailRequestId.current) return;
       setLoadError(error.message || "审核对象加载失败");
@@ -138,22 +175,38 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   ])).sort(), [detail]);
 
   const completeReview = async (decision: "confirm" | "modify") => {
-    if (!detail || !note.trim() || !actor.trim()) { setMessage("请填写操作者和审核备注"); return; }
+    if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     setBusy(true);
     try {
-      const payload = decision === "modify" ? parseObjectDraft(objectDraft) : undefined;
+      const snapshot = decision === "confirm"
+        ? structuredClone(detail.algorithmCandidate || {})
+        : parseObjectDraft(objectDraft);
+      const requestKey = `${detail.objectType}:${detail.objectId}:${detail.revision}:${decision}:${JSON.stringify(snapshot)}`;
+      if (completionRequest.current?.key !== requestKey) {
+        completionRequest.current = {
+          key: requestKey,
+          requestId: globalThis.crypto?.randomUUID?.() || `catalog-review-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        };
+      }
       const updated = await controlApi.completeCatalogReview({
         objectType: detail.objectType, objectId: detail.objectId, decision,
-        ...(payload ? { payload } : {}), actor: actor.trim(), note: note.trim(), expectedRevision: detail.revision,
+        snapshot, actor: actor.trim(), ...(note.trim() ? { note: note.trim() } : {}),
+        requestId: completionRequest.current.requestId,
+        expectedRevision: detail.revision,
       });
       setDetail(updated);
-      setObjectDraft(JSON.stringify(updated.effectiveValue || {}, null, 2));
+      setLatestAuditSummary(updated.catalogAuditSummary || null);
+      setObjectDraft(JSON.stringify(updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
       setNote("");
-      setMessage(updated.reviewStatus === "clear" ? "整对象审核已完成，已从待裁定队列移出" : "整对象已生效；仍有证据冲突需要处置");
+      completionRequest.current = null;
+      const planningRecovered = updated.reviewResolution?.planningResult?.recovered === true;
+      setMessage(planningRecovered
+        ? "审核结论已保存，规划已经恢复"
+        : "审核结论已保存，规划尚未恢复；请继续查看当前诊断");
       await onChanged();
       const currentKey = `${updated.objectType}:${updated.objectId}`;
       const nextEntry = queue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
-      const nextReviewKey = updated.reviewStatus === "needs-review"
+      const nextReviewKey = updated.reviewStatus === "needs-review" || !planningRecovered
         ? currentKey
         : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
       setSelectedKey(nextReviewKey);
@@ -161,7 +214,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
     } catch (error: any) {
       if (error.payload?.currentObject) {
         setDetail(error.payload.currentObject);
-        setObjectDraft(JSON.stringify(error.payload.currentObject.effectiveValue || error.payload.currentObject.algorithmCandidate || {}, null, 2));
+        setObjectDraft(JSON.stringify(error.payload.currentObject.algorithmCandidate || error.payload.currentObject.effectiveValue || {}, null, 2));
       }
       setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新核对完整对象" : error.message);
     } finally { setBusy(false); }
@@ -287,23 +340,25 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
       <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补不占用审核队列，也不阻止规划。</p>
       <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
-        <span><strong>{entry.objectId}</strong><small>{valueLabel(entry.objectType)} · 证据成熟度：{valueLabel(entry.status)} · 规划资格：{valueLabel(entry.disposition)} · 版本 {entry.revision}</small></span>
-        <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reasonLabels[reason.type] || reason.type}</i>)}</span>
+        <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus || "需要处理"}</small></span>
+        <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reviewReasonMetadata[reason.type]?.label || reason.type}</i>)}</span>
       </button>) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
     </div>
     <div className="panel review-detail">
+      {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{latestAuditSummary.actor} 已{latestAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{latestAuditSummary.displayTitle}” · {latestAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
       {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
-        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{detail.objectId}</h2><small>{valueLabel(detail.objectType)} · 证据成熟度：{valueLabel(detail.status)} · 规划资格：{valueLabel(detail.disposition)} · 版本 {detail.revision}</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
+        <div className="panel-head"><div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail)}</h2><small>{valueLabel(detail.objectType)} · 需要处理</small></div><div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div></div>
+        <div className="human-review-reason"><AlertTriangle size={18}/><div><strong>为什么需要处理</strong><p>{humanReadableReason(detail)}</p></div></div>
         {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt={`${detail.objectId} icon`} onClick={() => setLightboxSrc(detail.selectedIcon.url)}/> : <Image/>}<div><strong>{detail.selectedIcon ? "精确运行时图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.assetHash} · ${detail.selectedIcon.width}×${detail.selectedIcon.height}` : "缺失仅影响视觉核对，不影响其他 Active 字段参与规划"}</span></div></div>}
         {detail.objectType === "item-identity" && <div className="icon-candidate-review">
           <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>资源、截图和上传证据都会保留，可随时复核。</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
           <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${candidate.id}`} onClick={() => setLightboxSrc(candidate.url)}/><div><strong>{valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} / {new Date(candidate.createdAt).toLocaleString()}</span><span className="candidate-hash">{candidate.assetHash}</span>{candidate.resourceUrl && <span className="candidate-hash">资源地址：{candidate.resourceUrl}</span>}<span>裁剪：{candidate.crop?.pixelCrop ? `${candidate.crop.pixelCrop.x},${candidate.crop.pixelCrop.y} ${candidate.crop.pixelCrop.width}×${candidate.crop.pixelCrop.height}` : candidate.crop?.rect ? `${candidate.crop.rect.x},${candidate.crop.rect.y} ${candidate.crop.rect.width}×${candidate.crop.rect.height}` : "完整图像"}</span>{candidate.similarity?.frameSelection && <span>稳定帧：{candidate.similarity.frameSelection.acceptedFrameIndexes.length}/{candidate.similarity.frameSelection.frameHashes.length} / {valueLabel(candidate.similarity.frameSelection.reason)}</span>}{candidate.similarity?.comparisons?.[0] && <span>最佳匹配：{(candidate.similarity.comparisons[0].composite * 100).toFixed(1)}% / 感知 {(candidate.similarity.comparisons[0].metrics.perceptualHash * 100).toFixed(0)} / 结构 {(candidate.similarity.comparisons[0].metrics.structure * 100).toFixed(0)} / 色彩 {(candidate.similarity.comparisons[0].metrics.colorHistogram * 100).toFixed(0)} / 轮廓 {(candidate.similarity.comparisons[0].metrics.transparentContour * 100).toFixed(0)}</span>}</div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
           {detail.iconSelectionHistory?.length > 0 && <div className="icon-selection-history"><h4>图标选择历史</h4>{[...detail.iconSelectionHistory].reverse().map((entry: any) => <p key={entry.id}><strong>{valueLabel(entry.action)}</strong><span>{entry.actor} / {new Date(entry.createdAt).toLocaleString()} / {entry.assetHash || "未选择"} / {entry.note}</span></p>)}</div>}
         </div>}
-        {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reasonLabels[reason.type] || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
+        {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reviewReasonMetadata[reason.type]?.label || reason.type}{reason.fieldPath ? ` · ${reason.fieldPath}` : ""}</span>)}</div>}
         {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>数据待补：物品图标</strong><span>这属于完整性缺口，不影响本次语义审核完成，也不影响已生效字段参与规划。</span></div></div>}
-        <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
-        <div className="ruling-editor object-review-editor"><div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认完整候选”会原样接受服务端当前候选；如需修正，请在下方编辑完整 JSON 后保存整项修改。两个操作都会创建人工生效版本。</p></div><label className="wide"><span>完整对象 JSON</span><textarea value={objectDraft} onChange={(event) => setObjectDraft(event.target.value)} spellCheck={false}/></label><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>审核备注</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录核对依据或修改原因"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认完整候选并完成审核</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>保存整项修改并完成审核</button></div>{message && <p className="review-message">{message}</p>}</div>
+        <div className="candidate-snapshot"><h3>本次将确认的完整候选</h3><div className="candidate-facts">{fields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(detail.algorithmCandidate?.[field])}</strong></div>)}</div></div>
+        <div className="ruling-editor object-review-editor"><div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交上方完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div><label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label><label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label><div className="ruling-actions"><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></div>{message && <p className="review-message" role="status">{message}</p>}{detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}<details className="technical-review-details wide"><summary>技术详情</summary><label className="wide"><span>完整对象 JSON</span><textarea value={objectDraft} onChange={(event) => setObjectDraft(event.target.value)} spellCheck={false}/></label><div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div></details></div>
         <div className="review-evidence"><div><h3>证据来源与处置</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{valueLabel(evidence.sourceType)}</strong><span>{valueLabel(evidence.sourceRef || "runtime")} · {evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span>{display(evidence.payload)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div><div><h3>裁决历史</h3>{detail.rulingHistory?.length ? [...detail.rulingHistory].reverse().map((ruling: any) => <p key={ruling.id}><strong>{ruling.fieldPath} · {valueLabel(ruling.decision)}</strong><span>{ruling.actor} · {new Date(ruling.createdAt).toLocaleString()} · {display(ruling.oldValue)} → {display(ruling.newValue)} · {ruling.note}</span></p>) : <p><span>暂无人工裁决</span></p>}</div><div><h3>对象演变</h3>{[...(detail.transitions || [])].reverse().map((transition: any) => <p key={`transition-${transition.id}`}><strong>{valueLabel(transition.fromStatus)} → {valueLabel(transition.toStatus)}</strong><span>{new Date(transition.createdAt).toLocaleString()} · {valueLabel(transition.fromDisposition)} → {valueLabel(transition.toDisposition)} · {valueLabel(transition.reason)}</span></p>)}{[...(detail.versions || [])].reverse().map((version: any) => <p key={`version-${version.id}`}><strong>版本 {version.version} · {valueLabel(version.status)}</strong><span>{new Date(version.createdAt).toLocaleString()} · {valueLabel(version.origin)} · {display(version.payload)}</span></p>)}</div></div>
       </>}
     </div>
