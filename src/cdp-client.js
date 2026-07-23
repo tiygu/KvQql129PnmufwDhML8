@@ -12,6 +12,12 @@ class CdpClient extends EventEmitter {
     this.nextId = 1;
     this.pending = new Map();
     this.contexts = new Map();
+    this.diagnostics = {
+      roundTrips: 0,
+      requestBytes: 0,
+      resultBytes: 0,
+      methods: {},
+    };
   }
 
   async connect(signal = null) {
@@ -46,13 +52,15 @@ class CdpClient extends EventEmitter {
 
   _handleMessage(data) {
     let message;
+    const serialized = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
     try {
-      message = JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
+      message = JSON.parse(serialized);
     } catch (_) {
       return;
     }
 
     if (typeof message.id === "number" && this.pending.has(message.id)) {
+      this.diagnostics.resultBytes += Buffer.byteLength(serialized);
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
@@ -109,12 +117,25 @@ class CdpClient extends EventEmitter {
       this.pending.set(id, { resolve, reject, timer, abort, signal });
       signal?.addEventListener?.("abort", abort, { once: true });
       try {
-        this.socket.send(JSON.stringify({ id, method, params }));
+        const payload = JSON.stringify({ id, method, params });
+        this.socket.send(payload);
+        this.diagnostics.roundTrips += 1;
+        this.diagnostics.requestBytes += Buffer.byteLength(payload);
+        this.diagnostics.methods[method] = (this.diagnostics.methods[method] || 0) + 1;
       } catch (error) {
         cleanup();
         reject(error);
       }
     });
+  }
+
+  diagnosticsSnapshot() {
+    return {
+      roundTrips: this.diagnostics.roundTrips,
+      requestBytes: this.diagnostics.requestBytes,
+      resultBytes: this.diagnostics.resultBytes,
+      methods: { ...this.diagnostics.methods },
+    };
   }
 
   async enableRuntime(signal = null) {

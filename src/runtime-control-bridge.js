@@ -36,6 +36,29 @@ function cloneRecord(value) {
   return value == null ? value : structuredClone(value);
 }
 
+function createRuntimeControlDiagnostics() {
+  return {
+    semanticCommands: 0,
+    runtimeEvents: 0,
+    targetedReads: 0,
+    baselineReads: 0,
+    broadSnapshots: 0,
+    fallbacks: 0,
+    resyncs: 0,
+    confirmationPaths: { delta: 0, targeted: 0, event: 0, legacy: 0 },
+    confirmationLatencyMs: { count: 0, total: 0, max: 0, last: 0 },
+  };
+}
+
+function recordRuntimeControlLatency(diagnostics, startedAt) {
+  const elapsed = Math.max(0, Date.now() - startedAt);
+  const latency = diagnostics.confirmationLatencyMs;
+  latency.count += 1;
+  latency.total += elapsed;
+  latency.max = Math.max(latency.max, elapsed);
+  latency.last = elapsed;
+}
+
 function waitForAbortable(value, signal) {
   if (!signal) return Promise.resolve(value);
   if (signal.aborted) return Promise.reject(abortError());
@@ -1329,6 +1352,92 @@ class CdpRuntimeControlAdapter {
     this.eventsSinceLastRead = [];
     this.buttonFallbackUsage = 0;
     this.buttonFallbackResolutions = { "component-handler": 0, "node-event": 0, "coordinate-input": 0 };
+    this.latestFallback = null;
+    this.latestRecoveryReason = null;
+    this.diagnostics = createRuntimeControlDiagnostics();
+  }
+
+  _evaluate(expression, signal, category = "targeted") {
+    if (category === "targeted") this.diagnostics.targetedReads += 1;
+    if (category === "baseline") this.diagnostics.baselineReads += 1;
+    if (category === "command") this.diagnostics.semanticCommands += 1;
+    return this.client.evaluate(expression, this.contextId, { signal });
+  }
+
+  async _readLegacyState(signal, reason) {
+    this.diagnostics.broadSnapshots += 1;
+    this.latestRecoveryReason = reason || this.latestRecoveryReason;
+    return this.legacy.readState(signal);
+  }
+
+  async _executeLegacy(command, request, capability, reason = "semantic-capability-unavailable") {
+    this.cachedBaseline = null;
+    this.requiresBroadReconciliation = true;
+    this.diagnostics.fallbacks += 1;
+    this.diagnostics.confirmationPaths.legacy += 1;
+    this.latestFallback = { capability, reason };
+    return this.legacy.execute(command, request);
+  }
+
+  _recordConfirmation(path) {
+    if (Object.prototype.hasOwnProperty.call(this.diagnostics.confirmationPaths, path)) {
+      this.diagnostics.confirmationPaths[path] += 1;
+    }
+  }
+
+  _capabilityForCommand(command, merge = null) {
+    if (merge !== null && merge !== undefined) return "merge";
+    if (command?.plannedAction?.type === "produce") return "production";
+    if (command?.type === "submit-order") return "orderSubmission";
+    if (command?.type === "navigate") return "navigation";
+    return String(command?.type || "unknown");
+  }
+
+  checkpoint() {
+    const handshake = this.readiness || {};
+    return {
+      contextGeneration: handshake.contextGeneration ?? this.contextGeneration,
+      revision: handshake.revision ?? null,
+      gameFingerprint: handshake.gameFingerprint ?? null,
+    };
+  }
+
+  async reconcileForMutation(checkpoint, signal = null) {
+    assertNotAborted(signal);
+    await this.ready(signal);
+    if (this.fallbackReason) {
+      return { reconciled: false, reason: "legacy-runtime-control", checkpoint: this.checkpoint() };
+    }
+    let current;
+    try {
+      current = validateHandshake(await this._evaluate(
+        "globalThis.miniGameCtl.handshake()",
+        signal,
+        "targeted",
+      ), this.contextGeneration);
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      this.requiresBroadReconciliation = false;
+      this.latestRecoveryReason = "idle-context-generation-changed";
+      this.diagnostics.resyncs += 1;
+      const contextChanged = new Error("execution context changed; reconnect before mutation", { cause: error });
+      contextChanged.code = "RUNTIME_CONTROL_CONTEXT_CHANGED";
+      contextChanged.reason = this.latestRecoveryReason;
+      throw contextChanged;
+    }
+    this.readiness = { ...this.readiness, ...current };
+    const generationChanged = checkpoint?.contextGeneration !== current.contextGeneration
+      || checkpoint?.gameFingerprint !== current.gameFingerprint;
+    const revisionChanged = checkpoint?.revision !== current.revision;
+    if (!generationChanged && !revisionChanged) {
+      return { reconciled: false, reason: "idle-runtime-unchanged", checkpoint: this.checkpoint() };
+    }
+    this.requiresBroadReconciliation = true;
+    this.latestRecoveryReason = generationChanged
+      ? "idle-context-generation-changed"
+      : "idle-runtime-revision-changed";
+    await this.recoverEventGap(signal);
+    return { reconciled: true, reason: this.latestRecoveryReason, checkpoint: this.checkpoint() };
   }
 
   async ready(signal = null) {
@@ -1345,14 +1454,14 @@ class CdpRuntimeControlAdapter {
 
   async install(signal = null) {
     try {
-      const installed = await this.client.evaluate(
+      const installed = await this._evaluate(
         buildBridgeInstallExpression(this.contextGeneration),
-        this.contextId,
-        { signal },
+        signal,
+        "baseline",
       );
       const handshake = validateHandshake(installed?.handshake, this.contextGeneration);
       const semanticBaseline = validateBaseline(installed?.baseline);
-      this.reconciledState = validateBaseline(await this.legacy.readState(signal));
+      this.reconciledState = validateBaseline(await this._readLegacyState(signal, null));
       this.cachedBaseline = mergeReconciledBaseline(this.reconciledState, semanticBaseline);
       this.readiness = {
         adapterId: "semantic-cdp",
@@ -1407,6 +1516,7 @@ class CdpRuntimeControlAdapter {
       return;
     }
     this.appliedEventRevision = event.revision;
+    this.diagnostics.runtimeEvents += 1;
     this.eventsSinceLastRead.push(cloneRecord(event));
     while (this.eventsSinceLastRead.length > 64) this.eventsSinceLastRead.shift();
     if (event.eventType === "cache-invalidated") {
@@ -1420,12 +1530,14 @@ class CdpRuntimeControlAdapter {
 
   async recoverEventGap(signal = null) {
     assertNotAborted(signal);
+    this.diagnostics.resyncs += 1;
+    this.latestRecoveryReason = this.latestRecoveryReason || "event-revision-gap";
     // Level 1: drain event queue from last applied revision
     try {
-      const events = await this.client.evaluate(
+      const events = await this._evaluate(
         `globalThis.miniGameCtl.drainEventQueue(${this.appliedEventRevision})`,
-        this.contextId,
-        { signal },
+        signal,
+        "targeted",
       );
       if (Array.isArray(events)) {
         for (const event of events) {
@@ -1434,46 +1546,47 @@ class CdpRuntimeControlAdapter {
           }
         }
       }
-      if (!this.requiresBroadReconciliation) return;
+      if (!this.requiresBroadReconciliation) return "event-queue";
     } catch (_) { /* escalate to next recovery level */ }
     // Level 2: targeted board read
     try {
-      const board = await this.client.evaluate(
+      const board = await this._evaluate(
         "globalThis.miniGameCtl.readBoard()",
-        this.contextId,
-        { signal },
+        signal,
+        "targeted",
       );
       if (board?.ok && Number.isInteger(board.revision)) {
         if (this.readiness) this.readiness.revision = board.revision;
         this.requiresBroadReconciliation = false;
-        return;
+        return "targeted";
       }
     } catch (_) { /* escalate to baseline */ }
     // Level 3: baseline read
     try {
-      const baseline = await this.client.evaluate(
+      const baseline = await this._evaluate(
         "globalThis.miniGameCtl.readBaseline()",
-        this.contextId,
-        { signal },
+        signal,
+        "baseline",
       );
-      validateBaseline(baseline);
-      if (this.readiness) this.readiness.revision = this.readiness.revision ?? 0;
+      const validated = validateBaseline(baseline);
+      if (this.readiness) this.readiness.revision = validated.revision;
+      this.cachedBaseline = mergeReconciledBaseline(this.reconciledState, validated);
       this.requiresBroadReconciliation = false;
-      return;
+      return "baseline";
     } catch (_) { /* escalate to broad snapshot */ }
     // Level 4: broad snapshot via legacy adapter
-    this.reconciledState = validateBaseline(await this.legacy.readState(signal));
+    this.reconciledState = validateBaseline(await this._readLegacyState(signal, this.latestRecoveryReason || "event-gap-broad-reconciliation"));
     this.requiresBroadReconciliation = false;
+    return "broad";
   }
 
   async readState(signal = null) {
     assertNotAborted(signal);
     await this.ready(signal);
-    if (this.fallbackReason) return this.legacy.readState(signal);
+    if (this.fallbackReason) return this._readLegacyState(signal, this.fallbackReason);
     if (this.requiresBroadReconciliation) {
-      this.reconciledState = validateBaseline(await this.legacy.readState(signal));
-      this.requiresBroadReconciliation = false;
-      return cloneRecord(this.reconciledState);
+      const recoveryLevel = await this.recoverEventGap(signal);
+      if (recoveryLevel === "broad") return cloneRecord(this.reconciledState);
     }
     if (this.cachedBaseline) {
       const baseline = this.cachedBaseline;
@@ -1481,22 +1594,32 @@ class CdpRuntimeControlAdapter {
       return cloneRecord(baseline);
     }
     try {
-      const baseline = validateBaseline(await this.client.evaluate(
+      const baseline = validateBaseline(await this._evaluate(
         "globalThis.miniGameCtl.readBaseline()",
-        this.contextId,
-        { signal },
+        signal,
+        "baseline",
       ));
+      if (this.readiness) this.readiness.revision = baseline.revision;
       return mergeReconciledBaseline(this.reconciledState, baseline);
     } catch (error) {
       if (error?.name === "AbortError") throw error;
       this.fallbackReason = error?.code || "RUNTIME_CONTROL_BASELINE_FAILED";
       this.fallbackReadiness = await this.legacy.ready(signal);
       this.readiness = null;
-      return this.legacy.readState(signal);
+      return this._readLegacyState(signal, this.fallbackReason);
     }
   }
 
   async execute(command, request = {}) {
+    const startedAt = Date.now();
+    try {
+      return await this._execute(command, request);
+    } finally {
+      recordRuntimeControlLatency(this.diagnostics, startedAt);
+    }
+  }
+
+  async _execute(command, request = {}) {
     const signal = request.signal || null;
     assertNotAborted(signal);
     await this.ready(signal);
@@ -1537,7 +1660,7 @@ class CdpRuntimeControlAdapter {
       let deliveryError = null;
       for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
         try {
-          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+          acknowledgement = await this._evaluate(expression, signal, "command");
         } catch (error) {
           if (error?.name === "AbortError") {
             this.requiresBroadReconciliation = true;
@@ -1635,6 +1758,7 @@ class CdpRuntimeControlAdapter {
       };
       if (productionInvariantComplete) {
         this.requiresBroadReconciliation = false;
+        this._recordConfirmation("delta");
         return {
           ok: true,
           executed: true,
@@ -1652,11 +1776,7 @@ class CdpRuntimeControlAdapter {
           : null;
       if (uncertaintyReason) {
         try {
-          targetedVerification = await this.client.evaluate(
-            "globalThis.miniGameCtl.readBoard()",
-            this.contextId,
-            { signal },
-          );
+          targetedVerification = await this._evaluate("globalThis.miniGameCtl.readBoard()", signal, "targeted");
           if (Number.isInteger(targetedVerification?.revision)) {
             this.readiness.revision = targetedVerification.revision;
           }
@@ -1666,6 +1786,7 @@ class CdpRuntimeControlAdapter {
             .map((grid) => String(grid.itemId));
           if (verifiedOutputIds.length > 0) {
             this.requiresBroadReconciliation = false;
+            this._recordConfirmation("targeted");
             return {
               ok: true,
               executed: true,
@@ -1739,7 +1860,7 @@ class CdpRuntimeControlAdapter {
       let deliveryError = null;
       for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
         try {
-          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+          acknowledgement = await this._evaluate(expression, signal, "command");
         } catch (error) {
           if (error?.name === "AbortError") {
             this.requiresBroadReconciliation = true;
@@ -1824,7 +1945,7 @@ class CdpRuntimeControlAdapter {
         let slotReadError = null;
         try {
           const slotExpr = `globalThis.miniGameCtl.readOrderSlot(${JSON.stringify(slot)})`;
-          targetedSlot = await this.client.evaluate(slotExpr, this.contextId, { signal });
+          targetedSlot = await this._evaluate(slotExpr, signal, "targeted");
         } catch (error) {
           if (error?.name === "AbortError") throw error;
           slotReadError = error?.message || String(error);
@@ -1852,6 +1973,7 @@ class CdpRuntimeControlAdapter {
         };
         if (invariantComplete && coinsChanged) {
           this.requiresBroadReconciliation = false;
+          this._recordConfirmation("targeted");
           return {
             ok: true,
             executed: true,
@@ -1865,6 +1987,7 @@ class CdpRuntimeControlAdapter {
         }
         if (invariantComplete && !coinsChanged) {
           this.requiresBroadReconciliation = false;
+          this._recordConfirmation("targeted");
           return {
             ok: true,
             executed: true,
@@ -1935,7 +2058,7 @@ class CdpRuntimeControlAdapter {
       let deliveryError = null;
       for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
         try {
-          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+          acknowledgement = await this._evaluate(expression, signal, "command");
         } catch (error) {
           if (error?.name === "AbortError") {
             this.requiresBroadReconciliation = true;
@@ -2014,6 +2137,7 @@ class CdpRuntimeControlAdapter {
       }
       if (acknowledgement.outcome === "accepted-unchanged") {
         this.requiresBroadReconciliation = false;
+        this._recordConfirmation("delta");
         return {
           ok: true,
           executed: false,
@@ -2033,11 +2157,7 @@ class CdpRuntimeControlAdapter {
       for (let attempt = 0; !arrived && attempt < maxVerificationAttempts; attempt += 1) {
         assertNotAborted(signal);
         try {
-          areaRead = await this.client.evaluate(
-            "globalThis.miniGameCtl.readGameplayArea()",
-            this.contextId,
-            { signal },
-          );
+          areaRead = await this._evaluate("globalThis.miniGameCtl.readGameplayArea()", signal, "targeted");
         } catch (error) {
           if (error?.name === "AbortError") throw error;
           lastError = error?.message || String(error);
@@ -2053,6 +2173,7 @@ class CdpRuntimeControlAdapter {
       }
       if (arrived) {
         this.requiresBroadReconciliation = false;
+        this._recordConfirmation(areaRead ? "targeted" : "delta");
         return {
           ok: true,
           executed: true,
@@ -2092,23 +2213,15 @@ class CdpRuntimeControlAdapter {
       // Step 1: enumerate buttons to find candidates for navigation
       let buttonEnum = null;
       try {
-        buttonEnum = await this.client.evaluate(
-          "globalThis.miniGameCtl.enumerateButtons()",
-          this.contextId,
-          { signal },
-        );
+        buttonEnum = await this._evaluate("globalThis.miniGameCtl.enumerateButtons()", signal, "targeted");
       } catch (error) {
         if (error?.name === "AbortError") throw error;
-        // Fall through to legacy if enumeration fails
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
+        // Fall through to legacy if enumeration fails.
+        return this._executeLegacy(command, request, "navigation");
       }
       if (!buttonEnum || !Array.isArray(buttonEnum.buttons) || buttonEnum.count === 0) {
-        // No buttons found — fall through to legacy
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
+        // No buttons found — fall through to legacy.
+        return this._executeLegacy(command, request, "navigation");
       }
       // Step 2: build a hint for the button we want
       // For map→board navigation, look for button whose handler calls onBoardClick or targets EntranceViewController
@@ -2147,10 +2260,8 @@ class CdpRuntimeControlAdapter {
         // Ambiguous — skip this hint, try next
       }
       if (!matchingButton) {
-        // No unambiguous button match — fall through to legacy
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
+        // No unambiguous button match — fall through to legacy.
+        return this._executeLegacy(command, request, "navigation");
       }
       // Step 4: execute button fallback via the injected bridge
       const operationId = String(command.operationId || `btn-fallback-${randomUUID()}`);
@@ -2170,7 +2281,7 @@ class CdpRuntimeControlAdapter {
       let acknowledgement = null;
       for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
         try {
-          acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+          acknowledgement = await this._evaluate(expression, signal, "command");
         } catch (error) {
           if (error?.name === "AbortError") {
             this.requiresBroadReconciliation = true;
@@ -2187,21 +2298,15 @@ class CdpRuntimeControlAdapter {
         }
       }
       if (acknowledgement == null) {
-        // Bridge call failed — fall through to legacy
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
+        // Bridge call failed — fall through to legacy.
+        return this._executeLegacy(command, request, "navigation");
       }
       const ackValid = acknowledgement
         && typeof acknowledgement === "object"
         && Number.isInteger(acknowledgement.revision)
         && typeof acknowledgement.outcome === "string"
         && typeof acknowledgement.reason === "string";
-      if (!ackValid) {
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
-      }
+      if (!ackValid) return this._executeLegacy(command, request, "navigation");
       this.readiness.revision = acknowledgement.revision;
       // Track fallback resolution tier
       const fallbackTier = acknowledgement.delta?.buttonFallback?.tier;
@@ -2223,10 +2328,8 @@ class CdpRuntimeControlAdapter {
         };
       }
       if (["rejected-precondition", "unsupported-capability", "bridge-failure"].includes(acknowledgement.outcome)) {
-        // Button fallback rejected — fall through to legacy
-        this.cachedBaseline = null;
-        this.requiresBroadReconciliation = true;
-        return this.legacy.execute(command, request);
+        // Button fallback rejected — fall through to legacy.
+        return this._executeLegacy(command, request, "navigation");
       }
       // Dispatched — verify with gameplay-area targeted reads, same as semantic navigation
       let arrived = acknowledgement.outcome === "accepted-changed"
@@ -2236,11 +2339,7 @@ class CdpRuntimeControlAdapter {
       for (let attempt = 0; !arrived && attempt < maxVerificationAttempts; attempt += 1) {
         assertNotAborted(signal);
         try {
-          areaRead = await this.client.evaluate(
-            "globalThis.miniGameCtl.readGameplayArea()",
-            this.contextId,
-            { signal },
-          );
+          areaRead = await this._evaluate("globalThis.miniGameCtl.readGameplayArea()", signal, "targeted");
         } catch (error) {
           if (error?.name === "AbortError") throw error;
           continue;
@@ -2255,6 +2354,7 @@ class CdpRuntimeControlAdapter {
       }
       if (arrived) {
         this.requiresBroadReconciliation = false;
+        this._recordConfirmation(areaRead ? "targeted" : "delta");
         return {
           ok: true,
           executed: true,
@@ -2266,19 +2366,17 @@ class CdpRuntimeControlAdapter {
           diagnostics: { buttonFallback: { tier: fallbackTier, nodeName: acknowledgement.delta?.buttonFallback?.nodeName } },
         };
       }
-      // Fall through to legacy as last resort
-      this.cachedBaseline = null;
-      this.requiresBroadReconciliation = true;
-      return this.legacy.execute(command, request);
+      // Fall through to Legacy as the final per-capability fallback.
+      return this._executeLegacy(command, request, "navigation");
     }
     const canUseSemanticMerge = !this.fallbackReason
       && this.readiness?.capabilities?.merge === true
       && command?.type === "run-board-action"
       && merge != null;
     if (!canUseSemanticMerge) {
-      this.cachedBaseline = null;
-      this.requiresBroadReconciliation = true;
-      return this.legacy.execute(command, request);
+      const capability = this._capabilityForCommand(command, merge);
+      const reason = this.fallbackReason || "semantic-capability-unavailable";
+      return this._executeLegacy(command, request, capability, reason);
     }
     const sourceGrid = Number(merge.from);
     const targetGrid = Number(merge.to);
@@ -2309,7 +2407,7 @@ class CdpRuntimeControlAdapter {
     let deliveryError = null;
     for (let attempt = 0; attempt < 2 && acknowledgement == null; attempt += 1) {
       try {
-        acknowledgement = await this.client.evaluate(expression, this.contextId, { signal });
+        acknowledgement = await this._evaluate(expression, signal, "command");
       } catch (error) {
         if (error?.name === "AbortError") {
           this.requiresBroadReconciliation = true;
@@ -2400,6 +2498,7 @@ class CdpRuntimeControlAdapter {
     };
     if (deltaInvariantComplete) {
       this.requiresBroadReconciliation = false;
+      this._recordConfirmation("delta");
       return {
         ok: true,
         executed: true,
@@ -2417,11 +2516,7 @@ class CdpRuntimeControlAdapter {
         : null;
     if (uncertaintyReason) {
       try {
-        targetedVerification = await this.client.evaluate(
-          "globalThis.miniGameCtl.readBoard()",
-          this.contextId,
-          { signal },
-        );
+        targetedVerification = await this._evaluate("globalThis.miniGameCtl.readBoard()", signal, "targeted");
         const target = targetedVerification?.grids
           ?.find((grid) => Number(grid.index) === targetGrid);
         if (Number.isInteger(targetedVerification?.revision)) {
@@ -2429,6 +2524,7 @@ class CdpRuntimeControlAdapter {
         }
         if (targetedMergeInvariantComplete(targetedVerification, semanticCommand)) {
           this.requiresBroadReconciliation = false;
+          this._recordConfirmation("targeted");
           return {
             ok: true,
             executed: true,
@@ -2485,6 +2581,14 @@ class CdpRuntimeControlAdapter {
       revision: handshake.revision ?? null,
       capabilities: cloneRecord(handshake.capabilities || {}),
       fallback: { active: !!this.fallbackReason, reason: this.fallbackReason },
+      latestFallback: cloneRecord(this.latestFallback),
+      latestRecoveryReason: this.latestRecoveryReason,
+      diagnostics: {
+        ...cloneRecord(this.diagnostics),
+        transport: typeof this.client.diagnosticsSnapshot === "function"
+          ? this.client.diagnosticsSnapshot()
+          : null,
+      },
       eventBinding: { active: !!this.bindingListener, appliedRevision: this.appliedEventRevision },
       buttonFallback: {
         usageCount: this.buttonFallbackUsage,
@@ -2508,6 +2612,7 @@ class LegacyRuntimeControlAdapter {
     this.selection = selection;
     this.collectState = collectState;
     this.onWarehouseInventoryInvalidated = onWarehouseInventoryInvalidated;
+    this.diagnostics = createRuntimeControlDiagnostics();
   }
 
   async ready(signal = null) {
@@ -2520,9 +2625,12 @@ class LegacyRuntimeControlAdapter {
   }
 
   async readState(signal = null) {
+    this.diagnostics.baselineReads += 1;
+    this.diagnostics.broadSnapshots += 1;
     const snapshot = await this.lab.snapshot(this.selection, { signal });
     let boardState = null;
     try {
+      this.diagnostics.targetedReads += 1;
       boardState = await this.lab.client.evaluate(BOARD_SCAN_EXPRESSION, this.selection.probe.context.id, { signal });
     } catch (error) {
       if (error?.name === "AbortError") throw error;
@@ -2530,9 +2638,19 @@ class LegacyRuntimeControlAdapter {
     return buildGameState({ state: summarizeSnapshot(snapshot), boardState });
   }
 
-  async execute(command, { signal = null, options = {} } = {}) {
+  async execute(command, request = {}) {
+    const startedAt = Date.now();
+    try {
+      return await this._execute(command, request);
+    } finally {
+      recordRuntimeControlLatency(this.diagnostics, startedAt);
+    }
+  }
+
+  async _execute(command, { signal = null, options = {} } = {}) {
     assertNotAborted(signal);
     if (!command?.type) throw Object.assign(new Error("runtime control command type is required"), { code: "RUNTIME_CONTROL_COMMAND_INVALID" });
+    this.diagnostics.confirmationPaths.legacy += 1;
     const contextId = this.selection.probe.context.id;
     const collectState = (nextSignal = null) => this.collectState(nextSignal);
     const settleMs = options.settleMs;
@@ -2586,6 +2704,38 @@ class LegacyRuntimeControlAdapter {
       reason: "runtime-control-command-unsupported",
     });
   }
+
+  checkpoint() {
+    return { contextGeneration: String(this.selection.probe.context.id), revision: null, gameFingerprint: null };
+  }
+
+  status() {
+    return {
+      adapterId: "legacy-cdp",
+      ready: true,
+      protocolVersion: null,
+      bridgeVersion: null,
+      gameFingerprint: null,
+      contextGeneration: String(this.selection.probe.context.id),
+      revision: null,
+      capabilities: {
+        baseline: true,
+        merge: false,
+        production: false,
+        orderSubmission: false,
+        navigation: false,
+      },
+      fallback: { active: true, reason: "semantic-runtime-control-unavailable" },
+      latestFallback: null,
+      latestRecoveryReason: null,
+      diagnostics: {
+        ...cloneRecord(this.diagnostics),
+        transport: typeof this.lab.client?.diagnosticsSnapshot === "function"
+          ? this.lab.client.diagnosticsSnapshot()
+          : null,
+      },
+    };
+  }
 }
 
 /**
@@ -2593,13 +2743,16 @@ class LegacyRuntimeControlAdapter {
  * records, Errors, or async functions receiving the command and AbortSignal.
  */
 class FakeRuntimeControlAdapter {
-  constructor({ states = [], results = [], readiness = null } = {}) {
+  constructor({ states = [], results = [], readiness = null, controlPath = "semantic" } = {}) {
     this.states = [...states];
     this.results = [...results];
+    this.controlPath = controlPath === "legacy" ? "legacy" : "semantic";
     this.readiness = readiness || { adapterId: "fake-runtime-control", contextId: "fake-context", capabilities: ["state", "actions"] };
     this.commands = [];
     this.readCount = 0;
     this.readyCount = 0;
+    this.diagnostics = createRuntimeControlDiagnostics();
+    this.latestRecoveryReason = null;
   }
 
   async ready(signal = null) {
@@ -2610,6 +2763,11 @@ class FakeRuntimeControlAdapter {
   async readState(signal = null) {
     const index = this.readCount;
     this.readCount += 1;
+    this.diagnostics.baselineReads += 1;
+    if (this.controlPath === "legacy") {
+      this.diagnostics.broadSnapshots += 1;
+      this.diagnostics.targetedReads += 1;
+    }
     const entry = this.states[Math.min(index, this.states.length - 1)];
     if (entry == null) throw Object.assign(new Error("fake runtime control has no state"), { code: "FAKE_RUNTIME_CONTROL_STATE_MISSING" });
     return resolveFakeEntry(entry, { signal, readIndex: index, adapter: this });
@@ -2617,11 +2775,75 @@ class FakeRuntimeControlAdapter {
 
   async execute(command, { signal = null } = {}) {
     assertNotAborted(signal);
-    const index = this.commands.length;
-    this.commands.push(cloneRecord(command));
-    const entry = this.results[index];
-    if (entry == null) throw Object.assign(new Error(`fake runtime control has no result for ${command?.type || "unknown"}`), { code: "FAKE_RUNTIME_CONTROL_RESULT_MISSING" });
-    return resolveFakeEntry(entry, { signal, command: cloneRecord(command), commandIndex: index, adapter: this });
+    const startedAt = Date.now();
+    try {
+      const index = this.commands.length;
+      this.commands.push(cloneRecord(command));
+      if (this.controlPath === "semantic") this.diagnostics.semanticCommands += 1;
+      else {
+        this.diagnostics.broadSnapshots += 1;
+        this.diagnostics.targetedReads += 1;
+        this.diagnostics.confirmationPaths.legacy += 1;
+      }
+      const entry = this.results[index];
+      if (entry == null) throw Object.assign(new Error(`fake runtime control has no result for ${command?.type || "unknown"}`), { code: "FAKE_RUNTIME_CONTROL_RESULT_MISSING" });
+      const result = await resolveFakeEntry(entry, { signal, command: cloneRecord(command), commandIndex: index, adapter: this });
+      if (this.controlPath === "semantic") {
+        if (result?.targetedVerification !== null && result?.targetedVerification !== undefined) {
+          this.diagnostics.targetedReads += 1;
+          this.diagnostics.confirmationPaths.targeted += 1;
+        } else if (result?.acknowledgement?.delta !== null && result?.acknowledgement?.delta !== undefined) {
+          this.diagnostics.confirmationPaths.delta += 1;
+        }
+      }
+      return result;
+    } finally {
+      recordRuntimeControlLatency(this.diagnostics, startedAt);
+    }
+  }
+
+  checkpoint() {
+    return {
+      contextGeneration: this.readiness?.contextGeneration ?? this.readiness?.contextId ?? null,
+      revision: this.readiness?.revision ?? null,
+      gameFingerprint: this.readiness?.gameFingerprint ?? null,
+    };
+  }
+
+  async reconcileForMutation(checkpoint, signal = null) {
+    assertNotAborted(signal);
+    const current = this.checkpoint();
+    const changed = checkpoint?.contextGeneration !== current.contextGeneration
+      || checkpoint?.revision !== current.revision
+      || checkpoint?.gameFingerprint !== current.gameFingerprint;
+    if (changed) {
+      this.diagnostics.resyncs += 1;
+      this.latestRecoveryReason = checkpoint?.contextGeneration !== current.contextGeneration
+        ? "idle-context-generation-changed"
+        : "idle-runtime-revision-changed";
+    }
+    return { reconciled: changed, reason: changed ? this.latestRecoveryReason : "idle-runtime-unchanged", checkpoint: current };
+  }
+
+  status() {
+    return {
+      adapterId: this.controlPath === "legacy"
+        ? "fake-legacy-runtime-control"
+        : this.readiness?.adapterId || "fake-runtime-control",
+      ready: true,
+      protocolVersion: this.readiness?.protocolVersion ?? null,
+      bridgeVersion: this.readiness?.bridgeVersion ?? null,
+      gameFingerprint: this.readiness?.gameFingerprint ?? null,
+      contextGeneration: this.readiness?.contextGeneration ?? this.readiness?.contextId ?? null,
+      revision: this.readiness?.revision ?? null,
+      capabilities: cloneRecord(this.readiness?.capabilities || {}),
+      fallback: this.controlPath === "legacy"
+        ? { active: true, reason: "fake-legacy-baseline" }
+        : { active: false, reason: null },
+      latestFallback: null,
+      latestRecoveryReason: this.latestRecoveryReason,
+      diagnostics: cloneRecord(this.diagnostics),
+    };
   }
 }
 

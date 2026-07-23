@@ -1386,6 +1386,8 @@ test("CDP Adapter returns already-there when navigation target is the active are
   assert.equal(result.reason, "navigation-already-there");
   assert.equal(result.navigation.alreadyThere, true);
   assert.equal(legacyCalled, false);
+  assert.equal(adapter.status().diagnostics.confirmationPaths.delta, 1);
+  assert.equal(adapter.status().diagnostics.confirmationLatencyMs.count, 1);
 });
 
 test("CDP Adapter requests replan on stale revision for navigation", async () => {

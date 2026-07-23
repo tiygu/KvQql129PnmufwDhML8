@@ -10,7 +10,7 @@ function isConnectionFailure(error) {
   let detail;
   try { detail = typeof error === "string" ? error : JSON.stringify(error); } catch (_) { detail = String(error); }
   detail = `${error?.message || ""} ${error?.code || ""} ${detail || ""}`;
-  return /cdp|websocket|econn|enotconn|epipe|etimedout|socket (?:closed|hang up)|connection (?:closed|lost|refused|reset)|disconnect(?:ed|ion)?|offline|target (?:closed|detached|crashed)|execution context (?:was )?destroyed|cannot find context/i.test(detail);
+  return /cdp|websocket|econn|enotconn|epipe|etimedout|socket (?:closed|hang up)|connection (?:closed|lost|refused|reset)|disconnect(?:ed|ion)?|offline|target (?:closed|detached|crashed)|execution context (?:(?:was )?destroyed|changed)|runtime_control_context_changed|cannot find context/i.test(detail);
 }
 
 function timestampMs(value) {
@@ -48,11 +48,13 @@ function defaultClock() {
 }
 
 class IdleAutomationSession {
-  constructor({ ensureConnection, collectState, planState, runBoundedSession, waitIfPaused = null, onEvent = null, clock = defaultClock(), connectionBackoffMs = DEFAULT_CONNECTION_BACKOFF_MS }) {
+  constructor({ ensureConnection, collectState, planState, runBoundedSession, getRuntimeCheckpoint = null, reconcileBeforeMutation = null, waitIfPaused = null, onEvent = null, clock = defaultClock(), connectionBackoffMs = DEFAULT_CONNECTION_BACKOFF_MS }) {
     this.ensureConnection = ensureConnection;
     this.collectState = collectState;
     this.planState = planState;
     this.runBoundedSession = runBoundedSession;
+    this.getRuntimeCheckpoint = getRuntimeCheckpoint;
+    this.reconcileBeforeMutation = reconcileBeforeMutation;
     this.waitIfPaused = waitIfPaused;
     this.onEvent = onEvent;
     this.clock = clock;
@@ -92,6 +94,7 @@ class IdleAutomationSession {
     this.running = true;
     let backoff = this.connectionBackoffMs;
     let cycles = 0;
+    let wakeCheckpoint = null;
     try {
       while (!signal?.aborted) {
         await this.waitIfPaused?.(signal);
@@ -103,6 +106,11 @@ class IdleAutomationSession {
         signal?.addEventListener("abort", abortPreparation, { once: true });
         try {
           await this.ensureConnection(preparationController.signal);
+          if (wakeCheckpoint && this.reconcileBeforeMutation) {
+            const reconciliation = await this.reconcileBeforeMutation(wakeCheckpoint, preparationController.signal);
+            this.onEvent?.({ type: "idle-wake-reconciliation", ...reconciliation });
+            wakeCheckpoint = null;
+          }
           state = await this.collectState(preparationController.signal);
           plan = await this.planState(state);
           backoff = this.connectionBackoffMs;
@@ -120,6 +128,7 @@ class IdleAutomationSession {
         const requiredEnergy = requiredEnergyFromPlan(plan, state);
         const wakeDelay = computeEnergyWakeDelay(state, { requiredEnergy, now: this.clock.now() });
         if (wakeDelay > 0) {
+          wakeCheckpoint = await this.getRuntimeCheckpoint?.() || null;
           await this.sleep(wakeDelay, signal, { reason: "energy-recovery", energy: Number(state.energy?.amount ?? state.resources?.energy), requiredEnergy, recoverAt: this.clock.now() + wakeDelay });
           continue;
         }

@@ -777,5 +777,9 @@ test("abort after semantic dispatch returns uncertainty and schedules reconcilia
   assert.equal(fixture.live.mergeExecutions(), 1);
 
   await fixture.adapter.readState();
-  assert.equal(fixture.legacyReads(), 2);
+  const diagnostics = fixture.adapter.status().diagnostics;
+  assert.equal(fixture.legacyReads(), 1);
+  assert.equal(diagnostics.broadSnapshots, 1);
+  assert.ok(diagnostics.targetedReads >= 1);
+  assert.equal(diagnostics.resyncs, 1);
 });

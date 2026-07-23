@@ -182,6 +182,25 @@ class AutomationRuntime {
     return this.runtimeControl;
   }
 
+  async reconcileRuntimeControlForMutation(checkpoint, signal = null) {
+    const runtimeControl = this.ensureRuntimeControl();
+    if (typeof runtimeControl.reconcileForMutation !== "function") {
+      return { reconciled: false, reason: "runtime-control-reconciliation-unavailable" };
+    }
+    try {
+      return await runtimeControl.reconcileForMutation(checkpoint, signal);
+    } catch (error) {
+      if (error?.code !== "RUNTIME_CONTROL_CONTEXT_CHANGED" || this.runtimeControlInjected) throw error;
+      const failedLab = this.lab;
+      this.selection = null;
+      this.lab = null;
+      this.runtimeControl = null;
+      await failedLab?.close().catch(() => {});
+      this.emit("connection", { connected: false, reason: "execution-context-changed" });
+      throw error;
+    }
+  }
+
   getCatalogView({ includeRepositoryObjects = true } = {}) {
     const executionMode = this.getSettings().mode;
     const projection = this.database.getCatalogProjection({ includeProvisional: true, executionMode });
@@ -592,17 +611,22 @@ class AutomationRuntime {
     return normalized;
   }
 
-  async exportDiagnostic(targetPath) {
-    const destination = path.resolve(String(targetPath));
-    const state = await this.collectState().catch((error) => ({ collectionError: error.message }));
-    const payload = {
+  buildDiagnosticPayload(state) {
+    return {
       exportedAt: new Date().toISOString(),
       appVersion: "0.1.0",
       platform: { platform: process.platform, arch: process.arch, release: os.release(), node: process.version },
       settings: this.getSettings(),
       catalog: { revision: this.database.getCatalogRevision(), ...this.database.getCatalogRepositorySummary() },
+      runtimeControl: this.runtimeControl?.status?.() || null,
       state,
     };
+  }
+
+  async exportDiagnostic(targetPath) {
+    const destination = path.resolve(String(targetPath));
+    const state = await this.collectState().catch((error) => ({ collectionError: error.message }));
+    const payload = this.buildDiagnosticPayload(state);
     await fsp.mkdir(path.dirname(destination), { recursive: true });
     await new Promise((resolve, reject) => {
       const output = fs.createWriteStream(destination);
@@ -788,6 +812,8 @@ class AutomationRuntime {
       collectState: (signal) => this.collectState(signal),
       planState: async (state) => buildOptimizationPlan({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }),
       runBoundedSession: ({ signal }) => this.createRuntime(settings, sessionId, () => ++idleSequence).run({ execute: true, maxActions: null, signal }),
+      getRuntimeCheckpoint: () => this.runtimeControl?.checkpoint?.() || null,
+      reconcileBeforeMutation: (checkpoint, signal) => this.reconcileRuntimeControlForMutation(checkpoint, signal),
       waitIfPaused: (signal) => this.pauseGate.wait(signal),
       onEvent: (event) => {
         this.database.logAction({ sessionId, sequence: ++idleSequence, type: event.type, reason: event.reason, ok: event.ok, details: event });
