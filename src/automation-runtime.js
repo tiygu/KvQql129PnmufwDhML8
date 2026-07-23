@@ -528,11 +528,13 @@ class AutomationRuntime {
       const replanned = this.catalogReviewReplanner
         ? await this.catalogReviewReplanner({ object: committed, input })
         : await this._replanAfterCatalogReview();
+      const blockingReviewTarget = replanned?.blockingReviewTarget || null;
       planningResult = {
         status: replanned?.status || (replanned?.recovered ? "ready" : "waiting"),
         recovered: replanned?.recovered ?? replanned?.status === "ready",
         boundaryReason: replanned?.boundaryReason ?? null,
         recommendedOrderSlot: replanned?.recommendedOrderSlot ?? replanned?.recommended?.slot ?? null,
+        ...(blockingReviewTarget ? { blockingReviewTarget } : {}),
       };
     } catch (error) {
       planningResult = {
@@ -557,11 +559,16 @@ class AutomationRuntime {
       executionMode: settings.mode,
     });
     this.lastPlan = plan;
+    const blockingReviewTarget = plan.evidenceBlocks
+      ?.flatMap((block) => block.blockers || [])
+      .map((blocker) => blocker.reviewTarget)
+      .find(Boolean) || null;
     return {
       status: plan.status,
       recovered: plan.status === "ready",
       boundaryReason: plan.boundaryReason,
       recommendedOrderSlot: plan.recommended?.slot ?? null,
+      blockingReviewTarget,
     };
   }
 

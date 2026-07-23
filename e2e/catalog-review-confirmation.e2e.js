@@ -117,6 +117,7 @@ async function main() {
       filePath: iconFile,
     },
   });
+  seedReviewCandidate(runtime, { objectId: "browser-after-next", name: "后续候选", level: 3 });
   seedReviewCandidate(runtime, { objectId: "browser-next", name: "下一候选", level: 2 });
   let first = seedReviewCandidate(runtime, { objectId: "browser-first", name: "园艺手套", level: 1 });
   runtime.database.observeCatalogObject({
@@ -139,12 +140,51 @@ async function main() {
     expectedRevision: first.revision,
   });
   assert.notDeepEqual(first.effectiveValue, first.algorithmCandidate);
-  runtime.catalogReviewReplanner = async () => ({
-    status: "ready",
-    recovered: true,
-    boundaryReason: null,
-    recommendedOrderSlot: "order-a",
-  });
+  let relatedConflictSeeded = false;
+  runtime.catalogReviewReplanner = async ({ input }) => {
+    if (input.objectId === editable.objectId) {
+      return {
+        status: "evidence-waiting",
+        recovered: false,
+        boundaryReason: "evidence-waiting",
+        recommendedOrderSlot: null,
+      };
+    }
+    if (input.objectId === "flower-2") {
+      if (!relatedConflictSeeded) {
+        runtime.database.observeCatalogObject({
+          objectType: "item-identity",
+          objectId: "flower-3",
+          payload: {
+            itemId: "flower-3",
+            chainId: "browser-flower-chain",
+            level: 3,
+            baseUnits: 4,
+            name: "盛放花新线索",
+            type: "花材",
+          },
+          sourceType: "structural-inference",
+          sourceRef: "flower-3-related-conflict.json",
+          countDuplicate: false,
+        });
+        runtime.catalogGate.evaluateObject("item-identity", "flower-3");
+        relatedConflictSeeded = true;
+      }
+      return {
+        status: "evidence-waiting",
+        recovered: false,
+        boundaryReason: "evidence-waiting",
+        recommendedOrderSlot: null,
+        blockingReviewTarget: { objectType: "item-identity", objectId: "flower-3" },
+      };
+    }
+    return {
+      status: "ready",
+      recovered: true,
+      boundaryReason: null,
+      recommendedOrderSlot: "order-a",
+    };
+  };
   runtime.dashboard = async () => ({
     connected: false,
     connectionError: "browser fixture",
@@ -195,11 +235,35 @@ async function main() {
     await page.getByText("普通确认无需填写备注").waitFor();
     assert.equal(await page.getByText("完整对象 JSON").isVisible(), false);
 
+    const skippedBefore = runtime.getCatalogObject("item-identity", first.objectId);
+    const planningBeforeSkip = runtime.getPlanningCatalog();
+    await page.getByRole("button", { name: "暂时跳过" }).click();
+    await page.getByRole("status").filter({ hasText: "已暂时跳过，本轮稍后再处理" }).waitFor();
+    await page.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
+    await page.getByRole("button", { name: /疑似“园艺手套”.*已跳过/ }).waitFor();
+    const skippedAfter = runtime.getCatalogObject("item-identity", first.objectId);
+    assert.equal(skippedAfter.revision, skippedBefore.revision);
+    assert.deepEqual(skippedAfter.activeVersion, skippedBefore.activeVersion);
+    assert.deepEqual(skippedAfter.effectiveValue, skippedBefore.effectiveValue);
+    assert.deepEqual(skippedAfter.evidence, skippedBefore.evidence);
+    assert.deepEqual(skippedAfter.reviewReasons, skippedBefore.reviewReasons);
+    assert.deepEqual(runtime.getPlanningCatalog(), planningBeforeSkip);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: first.objectId }).length, 0);
+    assert.equal(runtime.database.listCatalogAuditSummaries({ objectId: first.objectId }).length, 0);
+
+    await page.getByRole("button", { name: "确认无误" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    await page.getByRole("heading", { name: "疑似“后续候选”" }).waitFor();
+    await page.getByRole("button", { name: /疑似“园艺手套”.*已跳过/ }).waitFor();
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: "browser-next" }).length, 1);
+
+    await firstQueueEntry.click();
+    await page.getByRole("heading", { name: "疑似“园艺手套”" }).waitFor();
     await page.getByRole("button", { name: "确认无误" }).click();
     await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
     await page.getByText("Catalog Audit Summary").waitFor();
     await page.getByText("规划已恢复").waitFor();
-    await page.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
+    await page.getByRole("heading", { name: "疑似“后续候选”" }).waitFor();
 
     const confirmationRequest = completionRequests.at(-1);
     assert.ok(confirmationRequest);
@@ -222,7 +286,8 @@ async function main() {
 
     await page.reload({ waitUntil: "networkidle" });
     await page.getByRole("button", { name: "图鉴" }).click();
-    await page.getByRole("button", { name: /疑似“下一候选”/ }).waitFor();
+    await page.getByRole("button", { name: /疑似“后续候选”/ }).waitFor();
+    assert.equal(await page.getByRole("button", { name: /疑似“下一候选”/ }).count(), 0);
     assert.equal(await page.getByRole("button", { name: /疑似“园艺手套”/ }).count(), 0);
     const restored = runtime.getCatalogObject("item-identity", "browser-first");
     assert.equal(restored.reviewStatus, "clear");
@@ -244,7 +309,9 @@ async function main() {
     assert.equal(await page.getByRole("textbox", { name: "类型", exact: true }).inputValue(), "园艺工具");
     assert.equal(await page.getByRole("button", { name: "确认无误" }).count(), 0);
     await page.getByRole("button", { name: "修改后确认" }).click();
-    await page.getByRole("status").filter({ hasText: "审核结论已保存" }).waitFor();
+    await page.getByRole("status").filter({ hasText: "裁决已保存、规划尚未恢复" }).waitFor();
+    await page.getByText(/当前订单仍在等待图鉴证据.*已保留当前诊断上下文/).waitFor();
+    await page.getByRole("heading", { name: "新名称" }).waitFor();
 
     const modificationRequest = completionRequests.at(-1);
     assert.equal(modificationRequest.decision, "modify");
@@ -308,7 +375,8 @@ async function main() {
     await page.getByRole("button", { name: /选择结果物.*盛放花.*第 3 级/ }).click();
     await page.getByText(/合成为.*盛放花/).waitFor();
     await page.getByRole("button", { name: "修改后确认" }).click();
-    await page.getByRole("status").filter({ hasText: "审核结论已保存" }).waitFor();
+    await page.getByRole("status").filter({ hasText: /裁决已保存、规划尚未恢复.*阻塞已转移到关联对象/ }).waitFor();
+    await page.getByRole("heading", { name: /盛放花/ }).waitFor();
     const relationRequest = completionRequests.at(-1);
     assert.equal(relationRequest.objectType, "merge-relation");
     assert.equal(relationRequest.decision, "modify");

@@ -137,6 +137,7 @@ export default function App() {
   const reloadCatalog = async () => {
     const catalogView = await controlApi.getCatalog();
     if (catalogView) setData((old: any) => ({ ...old, catalog: catalogView.stats || old.catalog, catalogView }));
+    return catalogView;
   };
 
   const refresh = async () => { setLoading(true); try { const next = await controlApi.getDashboard(); if (next) { setData((old:any) => ({ ...next, catalogView: { ...next.catalogView, repository: { ...old.catalogView?.repository, ...next.catalogView?.repository } } })); setConnectionRoute(next.connectionRoute || connectionRoute); setMessage(next.connected ? "运行时状态已同步" : next.connectionRoute?.starting ? "正在自动启动 CDP…" : next.connectionRoute?.listening ? "CDP 已就绪，正在等待目标游戏…" : "正在准备 CDP 连接…"); } } catch (e: any) { setData((x: any) => ({ ...x, connected: false })); setMessage("仪表盘暂时不可用，正在重试连接"); } finally { setLoading(false); } };

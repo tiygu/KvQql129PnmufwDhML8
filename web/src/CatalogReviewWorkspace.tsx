@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronLeft, ChevronRight, History, Image, Pause, Play, RotateCcw, Save, Upload, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronLeft, ChevronRight, History, Image, Pause, Play, RotateCcw, Save, SkipForward, Upload, X } from "lucide-react";
 import { controlApi } from "./control-api";
 import { ImageLightbox } from "./ImageLightbox";
 
@@ -211,6 +211,18 @@ function humanReadableReason(detail: any) {
   return reviewReasonMetadata["new-observation"].explanation;
 }
 
+function planningBoundaryText(boundaryReason: any) {
+  const explanations: Record<string, string> = {
+    "evidence-waiting": "当前订单仍在等待图鉴证据",
+    "catalog-review-replan-failed": "重新规划执行失败",
+    "inventory-unavailable": "当前订单仍缺少可用库存",
+    "insufficient-energy": "当前订单仍受体力不足影响",
+    "board-space-deadlock": "当前订单仍受棋盘空间限制",
+    "no-feasible-order": "当前还没有可执行订单",
+  };
+  return explanations[String(boundaryReason || "")] || "当前订单仍受重新规划结果阻塞";
+}
+
 function parseObjectDraft(value: string) {
   const parsed = JSON.parse(value);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("完整对象必须是 JSON 对象");
@@ -226,11 +238,12 @@ function markIconSelected(value: any, candidateId: number) {
   return { ...value, iconCandidates, selectedIcon: iconCandidates.find((candidate: any) => candidate.selected) || value?.selectedIcon || null };
 }
 
-export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: (catalog?: any) => void | Promise<void>; focusObject?: { objectType: string; objectId: string } | null }) {
+export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: () => Promise<any>; focusObject?: { objectType: string; objectId: string } | null }) {
   const queue = repository?.reviewQueue || [];
   const laterQueue = repository?.laterQueue || [];
   const objects = repository?.objects || [];
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [skippedKeys, setSkippedKeys] = useState<string[]>([]);
   const [detail, setDetail] = useState<any>(null);
   const [objectDraft, setObjectDraft] = useState("{}");
   const [identityDraft, setIdentityDraft] = useState({ name: "", level: "", type: "" });
@@ -250,12 +263,19 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const identityDraftDirty = useRef(false);
   const relationChainRef = useRef<HTMLDivElement>(null);
 
+  const orderedQueue = useMemo(() => {
+    const entriesByKey = new Map(queue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
+    const skipped = skippedKeys.flatMap((key) => entriesByKey.has(key) ? [entriesByKey.get(key)] : []);
+    const skippedSet = new Set(skippedKeys);
+    return [...queue.filter((entry: any) => !skippedSet.has(`${entry.objectType}:${entry.objectId}`)), ...skipped];
+  }, [queue, skippedKeys]);
+
   const selectedSummary = useMemo(() => {
-    const queuedKeys = new Set([...queue, ...laterQueue].map((item: any) => `${item.objectType}:${item.objectId}`));
-    const candidates = [...queue, ...laterQueue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
+    const queuedKeys = new Set([...orderedQueue, ...laterQueue].map((item: any) => `${item.objectType}:${item.objectId}`));
+    const candidates = [...orderedQueue, ...laterQueue, ...objects.filter((item: any) => !queuedKeys.has(`${item.objectType}:${item.objectId}`))];
     if (!selectedKey) return null;
     return candidates.find((item: any) => `${item.objectType}:${item.objectId}` === selectedKey) || null;
-  }, [laterQueue, objects, queue, selectedKey]);
+  }, [laterQueue, objects, orderedQueue, selectedKey]);
 
   const loadDetail = async (summary = selectedSummary) => {
     const requestId = ++detailRequestId.current;
@@ -288,6 +308,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
 
   const selectSummary = (entry: any) => {
     const key = `${entry.objectType}:${entry.objectId}`;
+    setSkippedKeys((current) => current.filter((candidate) => candidate !== key));
     if (selectedKey === key) loadDetail(entry);
     else setSelectedKey(key);
   };
@@ -360,6 +381,20 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
     return [...nodes, ...unknownLevelMembers];
   }, [relationItems, relationSource]);
 
+  const skipCurrentReview = () => {
+    if (!detail || orderedQueue.length === 0) return;
+    const currentKey = `${detail.objectType}:${detail.objectId}`;
+    const currentIndex = orderedQueue.findIndex((entry: any) => `${entry.objectType}:${entry.objectId}` === currentKey);
+    if (currentIndex < 0) return;
+    const nextEntry = orderedQueue.length > 1 ? orderedQueue[(currentIndex + 1) % orderedQueue.length] : null;
+    setSkippedKeys((current) => [...current.filter((key) => key !== currentKey), currentKey]);
+    setMessage("已暂时跳过，本轮稍后再处理；对象事实与规划资格均未改变。");
+    if (nextEntry) {
+      setSelectedKey(`${nextEntry.objectType}:${nextEntry.objectId}`);
+      setDetail(null);
+    }
+  };
+
   const completeReview = async (decision: "confirm" | "modify") => {
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     if (detail.objectType === "item-identity" && !identityLevelValid) {
@@ -402,16 +437,34 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       identityDraftDirty.current = false;
       setNote("");
       completionRequest.current = null;
-      const planningRecovered = updated.reviewResolution?.planningResult?.recovered === true;
+      const planningResult = updated.reviewResolution?.planningResult || {};
+      const planningRecovered = planningResult.recovered === true;
+      const refreshedCatalog = await onChanged();
+      const refreshedQueue = refreshedCatalog?.repository?.reviewQueue || queue;
+      const refreshedEntriesByKey = new Map(refreshedQueue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
+      const refreshedSkipped = skippedKeys.flatMap((key) => refreshedEntriesByKey.has(key) ? [refreshedEntriesByKey.get(key)] : []);
+      const refreshedSkippedSet = new Set(skippedKeys);
+      const refreshedOrderedQueue = [
+        ...refreshedQueue.filter((entry: any) => !refreshedSkippedSet.has(`${entry.objectType}:${entry.objectId}`)),
+        ...refreshedSkipped,
+      ];
+      setSkippedKeys((current) => current.filter((key) => refreshedEntriesByKey.has(key)));
+      const currentKey = `${updated.objectType}:${updated.objectId}`;
+      const blockingTarget = planningResult.blockingReviewTarget;
+      const relatedEntry = !planningRecovered && blockingTarget
+        ? refreshedQueue.find((entry: any) => entry.objectType === blockingTarget.objectType && entry.objectId === blockingTarget.objectId)
+        : null;
+      const nextEntry = refreshedOrderedQueue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
+      const nextReviewKey = relatedEntry && `${relatedEntry.objectType}:${relatedEntry.objectId}` !== currentKey
+        ? `${relatedEntry.objectType}:${relatedEntry.objectId}`
+        : updated.reviewStatus === "needs-review" || !planningRecovered
+          ? currentKey
+          : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
       setMessage(planningRecovered
         ? "审核结论已保存，规划已经恢复"
-        : "审核结论已保存，规划尚未恢复；请继续查看当前诊断");
-      await onChanged();
-      const currentKey = `${updated.objectType}:${updated.objectId}`;
-      const nextEntry = queue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
-      const nextReviewKey = updated.reviewStatus === "needs-review" || !planningRecovered
-        ? currentKey
-        : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
+        : relatedEntry && nextReviewKey !== currentKey
+          ? `裁决已保存、规划尚未恢复：阻塞已转移到关联对象“${relatedEntry.displayTitle || "未命名物品"}”，正在切换到该对象独立审核。`
+          : `裁决已保存、规划尚未恢复：${planningBoundaryText(planningResult.boundaryReason)}；已保留当前诊断上下文。`);
       setSelectedKey(nextReviewKey);
       if (nextReviewKey !== currentKey) setDetail(null);
     } catch (error: any) {
@@ -546,10 +599,13 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
       <div className="panel review-queue">
         <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
         <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补等完整性缺口放在“以后再看”，不影响当前规划。</p>
-        <div className="review-queue-list">{queue.length ? queue.map((entry: any) => <button key={`${entry.objectType}:${entry.objectId}`} className={`${selectedKey === `${entry.objectType}:${entry.objectId}` ? "active" : ""}`} onClick={() => selectSummary(entry)}>
-          <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus || "需要处理"}</small></span>
+        <div className="review-queue-list">{orderedQueue.length ? orderedQueue.map((entry: any) => {
+          const entryKey = `${entry.objectType}:${entry.objectId}`;
+          return <button key={entryKey} className={`${selectedKey === entryKey ? "active" : ""}`} onClick={() => selectSummary(entry)}>
+          <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {skippedKeys.includes(entryKey) ? "已跳过" : entry.actionStatus || "需要处理"}</small></span>
           <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reviewReasonMetadata[reason.type]?.label || reason.type}</i>)}</span>
-        </button>) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
+        </button>;
+        }) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
         <details className="later-review-queue">
           <summary><span>以后再看</span><b>{laterQueue.length}</b></summary>
           <p>这里只收纳不影响当前规划的完整性缺口。</p>
@@ -623,7 +679,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
               ? <button disabled={busy || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
               : detail.objectType === "merge-relation"
                 ? <button disabled={busy || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
-              : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}</div>
+              : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
             {message && <p className="review-message" role="status">{message}</p>}
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
           </div>}

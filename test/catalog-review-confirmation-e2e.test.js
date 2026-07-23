@@ -56,6 +56,40 @@ function seedReviewCandidate(runtime, objectId, level) {
   return runtime.catalogGate.evaluateObject("item-identity", objectId);
 }
 
+test("真实重规划从证据阻塞中返回首个独立审核对象", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-review-production-replan-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  runtime.getPlanningCatalog = () => ({
+    coverage: {},
+    items: [],
+    producers: [],
+    evidence: { objects: [] },
+  });
+  runtime.lastState = {
+    schemaVersion: 1,
+    scene: "board",
+    resources: { energy: 10 },
+    board: { signature: "empty", empty: 9, grids: [], mergeCandidates: [] },
+    orders: [{ slot: "blocked", rewardCoins: 10, items: [{ itemId: "unknown-item", complete: false }] }],
+  };
+  try {
+    const result = await runtime._replanAfterCatalogReview();
+
+    assert.equal(result.status, "evidence-waiting");
+    assert.deepEqual(result.blockingReviewTarget, {
+      objectType: "item-identity",
+      objectId: "unknown-item",
+    });
+  } finally {
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("控制台确认无误后保存 SQLite 审计、重规划、同步所有控制台并可刷新恢复", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-review-confirm-e2e-"));
   const runtime = new AutomationRuntime({

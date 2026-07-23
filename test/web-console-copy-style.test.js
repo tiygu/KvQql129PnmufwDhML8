@@ -79,10 +79,15 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, /controlApi\.setCatalogEvidenceDisposition/);
   for (const label of ["采用证据", "暂停证据", "否决证据", "恢复证据"]) assert.match(source, new RegExp(label));
 
-  assert.match(source, /controlApi\.completeCatalogReview[\s\S]{0,2400}await\s+onChanged\([\s\S]{0,1200}setSelectedKey\(/);
+  assert.match(source, /const\s+refreshedCatalog\s*=\s*await\s+onChanged\(\)/);
+  assert.match(source, /refreshedCatalog\?\.repository\?\.reviewQueue/);
+  assert.match(source, /planningResult\.blockingReviewTarget/);
   assert.match(source, /updated\.reviewStatus\s*===\s*"needs-review"\s*\|\|\s*!planningRecovered/);
   assert.match(source, /const\s+nextReviewKey\s*=[\s\S]{0,500}\?[\s\S]{0,300}:\s*null/);
   assert.match(source, /setSelectedKey\(nextReviewKey\)/);
+  assert.match(source, />暂时跳过</);
+  const skipReview = source.slice(source.indexOf("const skipCurrentReview"), source.indexOf("const completeReview"));
+  assert.doesNotMatch(skipReview, /controlApi|onChanged/);
 });
 
 test("图鉴审核默认只展示领域摘要，原始数据和完整历史收进只读技术详情", () => {
