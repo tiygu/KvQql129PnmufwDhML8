@@ -131,12 +131,44 @@ test("database stores uncertain actions separately and emits review events for s
   const planningBeforeUncertain = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution;
   database.recordProductionActionObservation({ actionId: "uncertain-1", attributable: false, reason: "verification_read_error", outcomeItemIds: ["apple"] });
   const planningAfterUncertain = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution;
+  const mode = database.observeCatalogObject({
+    objectType: "production-mode",
+    objectId: "tree:fruit",
+    payload: {
+      producerItemId: "tree",
+      modeId: "fruit",
+      energyCost: 1,
+      outputs: [{ itemId: "apple", count: 1, probability: 1 }],
+      unlocked: true,
+      switchEntry: { status: "available", method: "fixture" },
+    },
+    sourceType: "production-attribution-conflict",
+    sourceRef: "uncertain-1",
+    countDuplicate: false,
+  });
+  const unreliableEvidence = database.getCatalogObject("production-mode", "tree:fruit").evidence[0];
+  const rejectedMode = database.setCatalogEvidenceDisposition(
+    "production-mode",
+    "tree:fruit",
+    unreliableEvidence.id,
+    "rejected",
+    {
+      reason: "operator: sample attribution unresolved",
+      actor: "operator",
+      note: "sample attribution unresolved",
+      action: "reject-evidence",
+      expectedRevision: mode.revision,
+    },
+  );
+  const planningAfterRejection = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution;
 
   const state = database.getProductionDistribution("tree", "fruit");
   assert.equal(state.observedDistribution.sampleSize, 12);
   assert.equal(database.listUncertainProductionActions().length, 1);
   assert.equal(database.listUncertainProductionActions()[0].assignedOutcomeItemIds.length, 0);
   assert.deepEqual(planningAfterUncertain, planningBeforeUncertain);
+  assert.deepEqual(planningAfterRejection, planningBeforeUncertain);
+  assert.equal(rejectedMode.catalogAuditSummary.action, "reject-evidence");
   assert.equal(state.confidence.level, "reduced");
   assert.ok(database.listProductionDistributionReviewEvents().some((event) => event.eventType === "theory-observation-conflict"));
 

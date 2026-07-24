@@ -151,6 +151,63 @@ test("证据冲突只比较不同来源的当前候选并在冲突证据失效�
   assert.equal(database.listCatalogConflicts().length, 0);
 }));
 
+test("采用证据只记录审计并保留完整确认边界，否决后原始来源仍可追溯", () => withDatabase((database) => {
+  activeIdentity(database, "evidence-choice", { name: "可信名称" });
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: "evidence-choice",
+    payload: { itemId: "evidence-choice", chainId: "other-chain", level: 2, baseUnits: 2, name: "不可信名称" },
+    sourceType: "structured-runtime",
+    sourceRef: "conflicting-source.json",
+    countDuplicate: false,
+  });
+  const gate = new CatalogReviewGate(database);
+  gate.evaluateObject("item-identity", "evidence-choice");
+  let object = database.getCatalogObject("item-identity", "evidence-choice");
+  const trusted = object.evidence.find((evidence) => evidence.sourceType === "runtime-capture");
+  const untrusted = object.evidence.find((evidence) => evidence.sourceType === "structured-runtime");
+  const resolutionsBefore = database.listCatalogReviewResolutions({ objectId: object.objectId }).length;
+
+  const accepted = gate.setEvidenceDisposition(
+    object.objectType,
+    object.objectId,
+    trusted.id,
+    "eligible",
+    "operator-a: 采用运行时证据",
+    object.revision,
+    { actor: "operator-a", note: "采用运行时证据", action: "accept-evidence" },
+  );
+  assert.equal(accepted.reviewStatus, "needs-review");
+  assert.equal(accepted.evidence.every((evidence) => evidence.disposition === "eligible"), true);
+  assert.equal(database.listCatalogReviewResolutions({ objectId: object.objectId }).length, resolutionsBefore);
+  assert.equal(accepted.catalogAuditSummary.action, "accept-evidence");
+  assert.equal(accepted.catalogAuditSummary.evidenceReference.sourceRef, "capture.json");
+  assert.deepEqual(accepted.catalogAuditSummary.adoptedPayload, trusted.payload);
+
+  const rejected = gate.setEvidenceDisposition(
+    object.objectType,
+    object.objectId,
+    untrusted.id,
+    "rejected",
+    "operator-a: 与现场不符",
+    accepted.revision,
+    { actor: "operator-a", note: "与现场不符", action: "reject-evidence" },
+  );
+  const rejectedEvidence = rejected.evidence.find((evidence) => evidence.id === untrusted.id);
+  assert.equal(rejectedEvidence.disposition, "rejected");
+  assert.equal(rejectedEvidence.sourceRef, "conflicting-source.json");
+  assert.deepEqual(rejectedEvidence.payload, untrusted.payload);
+  assert.equal(rejected.catalogAuditSummary.action, "reject-evidence");
+  assert.deepEqual(rejected.catalogAuditSummary.impact, {
+    excludedFromInference: true,
+    excludedFromPlanning: true,
+  });
+  assert.deepEqual(database.listCatalogEvidenceAuditSummaries({ objectId: object.objectId }).map((audit) => audit.action), [
+    "accept-evidence",
+    "reject-evidence",
+  ]);
+}));
+
 test("人工有效值参与真实规划而无关字段继续使用算法值", () => withDatabase((database) => {
   const legacy = { coverage: {}, chains: [{ id: "c", complete: true }], items: [{ id: "i1", chainId: "c", level: 1, baseUnits: 1, mergeTarget: null }], producers: [] };
   let identity = activeIdentity(database);

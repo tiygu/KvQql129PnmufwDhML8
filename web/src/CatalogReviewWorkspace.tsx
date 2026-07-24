@@ -151,6 +151,10 @@ function meaningfulDifferences(detail: any, fields: string[]) {
 
 function identityDraftFromDetail(detail: any) {
   const candidate = reviewCandidateSnapshot(detail);
+  return identityDraftFromPayload(candidate);
+}
+
+function identityDraftFromPayload(candidate: any) {
   return {
     name: candidate.name == null ? "" : String(candidate.name),
     level: candidate.level == null ? "" : String(candidate.level),
@@ -182,6 +186,10 @@ function snapshotDifferences(before: any, after: any, fields: string[]) {
 
 function relationDraftFromDetail(detail: any) {
   const candidate = reviewCandidateSnapshot(detail);
+  return relationDraftFromPayload(candidate);
+}
+
+function relationDraftFromPayload(candidate: any) {
   return {
     requiredCount: String(candidate.requiredCount ?? 2),
     mergeTarget: candidate.mergeTarget == null ? "" : String(candidate.mergeTarget),
@@ -266,6 +274,22 @@ function planningBoundaryText(boundaryReason: any) {
   return explanations[String(boundaryReason || "")] || "当前订单仍受重新规划结果阻塞";
 }
 
+function catalogAuditSummarySentence(summary: any) {
+  const action = summary?.action === "confirm"
+    ? "确认完整候选"
+    : summary?.action === "modify"
+      ? "修改后确认"
+      : summary?.action === "accept-evidence"
+        ? "采用证据"
+        : summary?.action === "reject-evidence"
+          ? "否决证据"
+          : summary?.action === "pause-evidence" ? "暂停证据" : "恢复证据";
+  const result = summary?.planningResult
+    ? summary.planningResult.recovered ? "规划已恢复" : "规划尚未恢复"
+    : ["accept-evidence", "reject-evidence"].includes(summary?.action) ? "对象仍待完整确认" : "证据已重新评估";
+  return `${summary?.actor || "系统"} 已${action}“${summary?.displayTitle || "未命名对象"}” · ${result}`;
+}
+
 function parseObjectDraft(value: string) {
   const parsed = JSON.parse(value);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new TypeError("完整对象必须是 JSON 对象");
@@ -300,6 +324,8 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [latestAuditSummary, setLatestAuditSummary] = useState<any>(null);
   const [pauseConfirmationOpen, setPauseConfirmationOpen] = useState(false);
+  const [adoptedEvidencePayload, setAdoptedEvidencePayload] = useState<any>(null);
+  const [pendingEvidenceRejection, setPendingEvidenceRejection] = useState<any>(null);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
@@ -331,13 +357,14 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       const value = await controlApi.getCatalogObject(summary.objectType, summary.objectId);
       if (requestId !== detailRequestId.current) return;
       setDetail(value);
-      setObjectDraft(JSON.stringify(value.candidateVersion?.payload || value.algorithmCandidate || value.effectiveValue || {}, null, 2));
       const valueKey = `${value.objectType}:${value.objectId}`;
-      if (identityDraftKey.current !== valueKey || !identityDraftDirty.current) {
-        setIdentityDraft(identityDraftFromDetail(value));
+      const adoptedPayload = adoptedEvidencePayload?.objectKey === valueKey ? adoptedEvidencePayload.payload : null;
+      setObjectDraft(JSON.stringify(adoptedPayload || value.candidateVersion?.payload || value.algorithmCandidate || value.effectiveValue || {}, null, 2));
+      if (adoptedPayload || identityDraftKey.current !== valueKey || !identityDraftDirty.current) {
+        setIdentityDraft(adoptedPayload ? identityDraftFromPayload(adoptedPayload) : identityDraftFromDetail(value));
         identityDraftDirty.current = false;
       }
-      if (value.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(value));
+      if (value.objectType === "merge-relation") setRelationDraft(adoptedPayload ? relationDraftFromPayload(adoptedPayload) : relationDraftFromDetail(value));
       identityDraftKey.current = valueKey;
     } catch (error: any) {
       if (requestId !== detailRequestId.current) return;
@@ -350,6 +377,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
   useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
   useEffect(() => { setPauseConfirmationOpen(false); }, [detail?.objectType, detail?.objectId, detail?.revision]);
+  useEffect(() => {
+    setAdoptedEvidencePayload(null);
+    setPendingEvidenceRejection(null);
+  }, [selectedKey]);
 
   const selectSummary = (entry: any) => {
     const key = `${entry.objectType}:${entry.objectId}`;
@@ -371,7 +402,13 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     ...Object.keys(detail?.humanValues || {}),
   ])).sort(), [detail]);
   const visibleFields = useMemo(() => domainFields(detail), [detail]);
-  const reviewCandidate = useMemo(() => reviewCandidateSnapshot(detail), [detail]);
+  const detailKey = detail ? `${detail.objectType}:${detail.objectId}` : "";
+  const reviewCandidate = useMemo(
+    () => adoptedEvidencePayload?.objectKey === detailKey
+      ? structuredClone(adoptedEvidencePayload.payload)
+      : reviewCandidateSnapshot(detail),
+    [adoptedEvidencePayload, detail, detailKey],
+  );
   const identitySnapshot = useMemo(
     () => itemIdentitySnapshot(reviewCandidate, identityDraft, detail?.selectedIcon),
     [detail?.selectedIcon, identityDraft, reviewCandidate],
@@ -476,6 +513,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       });
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
+      setAdoptedEvidencePayload(null);
       setObjectDraft(JSON.stringify(updated.candidateVersion?.payload || updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
       setIdentityDraft(identityDraftFromDetail(updated));
       if (updated.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(updated));
@@ -526,24 +564,33 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     } finally { setBusy(false); }
   };
 
-  const setEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected") => {
+  const setEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected", action?: string) => {
     if (!detail || !note.trim() || !actor.trim()) { setMessage("处置证据前请填写操作者和审核备注"); return null; }
     const updated = await controlApi.setCatalogEvidenceDisposition({
       objectType: detail.objectType, objectId: detail.objectId, evidenceId, disposition,
-      reason: `${actor.trim()}: ${note.trim()}`, expectedRevision: detail.revision,
+      reason: `${actor.trim()}: ${note.trim()}`, actor: actor.trim(), note: note.trim(), action, expectedRevision: detail.revision,
     });
     setDetail(updated);
     setObjectDraft(JSON.stringify(updated.effectiveValue || updated.algorithmCandidate || {}, null, 2));
+    setLatestAuditSummary(updated.catalogAuditSummary || null);
     return updated;
   };
 
   const updateEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected") => {
+    if (disposition === "rejected" && Number(pendingEvidenceRejection?.id) !== Number(evidenceId)) {
+      if (!note.trim() || !actor.trim()) { setMessage("否决证据前请填写操作者和审核备注"); return; }
+      setPendingEvidenceRejection(detail?.evidence?.find((evidence: any) => Number(evidence.id) === Number(evidenceId)) || null);
+      setMessage("");
+      return;
+    }
     setBusy(true);
     try {
-      const updated = await setEvidenceDisposition(evidenceId, disposition);
+      const action = disposition === "rejected" ? "reject-evidence" : disposition === "paused" ? "pause-evidence" : "restore-evidence";
+      const updated = await setEvidenceDisposition(evidenceId, disposition, action);
       if (!updated) return;
+      setPendingEvidenceRejection(null);
       setNote("");
-      setMessage(disposition === "eligible" ? "证据已恢复并重新评估" : disposition === "paused" ? "证据已暂停并重新评估" : "证据已否决并重新评估");
+      setMessage(disposition === "eligible" ? "证据已恢复并重新评估" : disposition === "paused" ? "证据已暂停并重新评估" : "证据已否决并从后续自动推断及规划融合中排除");
       await onChanged();
     } catch (error: any) {
       if (error.payload?.currentObject) setDetail(error.payload.currentObject);
@@ -555,23 +602,25 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     if (!detail || !note.trim() || !actor.trim()) { setMessage("采用证据前请填写操作者和审核备注"); return; }
     setBusy(true);
     try {
-      const conflictEvidenceIds = new Set<number>((detail.reviewReasons || [])
-        .filter((reason: any) => reason.type === "evidence-conflict")
-        .flatMap((reason: any) => (reason.details?.variants || []).flatMap((variant: any[]) => variant.map((item: any) => Number(item.evidenceId)))));
-      let updated = detail;
-      const selected = updated.evidence?.find((evidence: any) => Number(evidence.id) === Number(evidenceId));
-      if (selected?.disposition !== "eligible") updated = await setEvidenceDisposition(evidenceId, "eligible") || updated;
-      for (const evidence of updated.evidence || []) {
-        if (Number(evidence.id) === Number(evidenceId) || evidence.disposition !== "eligible" || !conflictEvidenceIds.has(Number(evidence.id))) continue;
-        updated = await controlApi.setCatalogEvidenceDisposition({
-          objectType: updated.objectType, objectId: updated.objectId, evidenceId: evidence.id, disposition: "paused",
-          reason: `${actor.trim()}: 采用证据 ${evidenceId}；${note.trim()}`, expectedRevision: updated.revision,
-        });
-      }
+      const selected = detail.evidence?.find((evidence: any) => Number(evidence.id) === Number(evidenceId));
+      if (!selected) throw new Error("证据不存在或已刷新");
+      const updated = await setEvidenceDisposition(evidenceId, "eligible", "accept-evidence");
+      if (!updated) return;
+      setAdoptedEvidencePayload({
+        objectKey: `${updated.objectType}:${updated.objectId}`,
+        evidenceId,
+        payload: structuredClone(selected.payload),
+      });
       setDetail(updated);
-      setObjectDraft(JSON.stringify(updated.effectiveValue || updated.algorithmCandidate || {}, null, 2));
+      setLatestAuditSummary(updated.catalogAuditSummary || null);
+      setObjectDraft(JSON.stringify(selected.payload, null, 2));
+      if (updated.objectType === "item-identity") {
+        setIdentityDraft(identityDraftFromPayload(selected.payload));
+        identityDraftDirty.current = true;
+      }
+      if (updated.objectType === "merge-relation") setRelationDraft(relationDraftFromPayload(selected.payload));
       setNote("");
-      setMessage("已采用该证据，并暂停同一冲突中的其他候选证据");
+      setMessage("已采用该证据并带入领域表单；仍需确认完整对象快照，不会隐式确认关联对象");
       await onChanged();
     } catch (error: any) {
       if (error.payload?.currentObject) setDetail(error.payload.currentObject);
@@ -671,7 +720,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         </details>
       </div>
       <div className="panel review-detail">
-        {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{latestAuditSummary.actor} 已{latestAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{latestAuditSummary.displayTitle}” · {latestAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
+        {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(latestAuditSummary)}</span></div>}
         {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
           <div className="panel-head">
             <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
@@ -772,7 +821,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                 ? <button disabled={busy || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
               : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
             {message && <p className="review-message" role="status">{message}</p>}
-            {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
+            {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(detail.catalogAuditSummary)}</span></div>}
           </div>)}
           <details className="technical-review-details">
             <summary>只读技术详情</summary>
@@ -805,6 +854,14 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                     <div className="pause-impact-actions"><button className="danger" disabled={busy} onClick={togglePause}>确认暂停对象</button><button className="ghost-btn" disabled={busy} onClick={() => setPauseConfirmationOpen(false)}>取消</button></div>
                   </div>}
             </div>
+            {pendingEvidenceRejection && <div className="evidence-rejection-confirmation" role="alertdialog" aria-label="确认否决证据">
+              <h4>否决影响预览</h4>
+              <p><strong>证据来源</strong> {valueLabel(pendingEvidenceRejection.sourceType)} · {valueLabel(pendingEvidenceRejection.sourceRef || "runtime")} · {pendingEvidenceRejection.observationCount} 次观测</p>
+              <code>{display(pendingEvidenceRejection.payload)}</code>
+              <p>{detail.planningImpact?.summary || "当前没有直接关联的订单或关系。"}</p>
+              <p className="evidence-rejection-warning">确认后原始证据和来源仍保留审计，但它会从后续自动推断及规划融合中排除。</p>
+              <div><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(pendingEvidenceRejection.id, "rejected")}>确认否决证据</button><button className="ghost-btn" disabled={busy} onClick={() => setPendingEvidenceRejection(null)}>取消</button></div>
+            </div>}
             <div className="review-evidence"><div><h3>证据采用与否决</h3>{detail.evidence?.map((evidence: any, index: number) => <p key={evidence.id}><strong>证据 {index + 1} · {valueLabel(evidence.sourceType)}</strong><span>{evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div></div>
           </details>
         </>}

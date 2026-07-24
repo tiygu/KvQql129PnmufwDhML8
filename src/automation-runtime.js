@@ -467,9 +467,16 @@ class AutomationRuntime {
   getCatalogObject(objectType, objectId) {
     const object = this.database.getCatalogObject(objectType, objectId);
     if (!object) return object;
+    const catalogEvidenceAuditSummaries = this.database.listCatalogEvidenceAuditSummaries({ objectType, objectId });
+    const catalogAuditSummary = [object.catalogAuditSummary, catalogEvidenceAuditSummaries.at(-1)]
+      .filter(Boolean)
+      .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
+      .at(-1) || null;
     const enrichedObject = {
       ...object,
       planningImpact: buildCatalogPlanningImpact(this.database, this.lastState, object),
+      catalogEvidenceAuditSummaries,
+      ...(catalogAuditSummary ? { catalogAuditSummary } : {}),
     };
     const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
     if (objectType === "item-identity") {
@@ -701,8 +708,13 @@ class AutomationRuntime {
     return object;
   }
 
-  setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision) {
-    const object = this.catalogGate.setEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision);
+  setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision, audit = {}) {
+    const changed = this.catalogGate.setEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision, audit);
+    const object = {
+      ...this.getCatalogObject(objectType, objectId),
+      catalogAuditSummary: changed.catalogAuditSummary,
+      catalogEvidenceAuditSummaries: changed.catalogEvidenceAuditSummaries,
+    };
     this.emit("catalog-state-updated", { object });
     return object;
   }

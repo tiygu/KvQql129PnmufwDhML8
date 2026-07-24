@@ -563,6 +563,50 @@ async function main() {
     assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).count(), 1);
     assert.equal(runtime.getCatalogObject("merge-relation", "conflict-source").reviewStatus, "needs-review");
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "conflict-source" }).length, 0);
+    const conflictBeforeEvidenceAction = runtime.getCatalogObject("merge-relation", "conflict-source");
+    await page.getByLabel("补充说明（选填）").fill("采用真实动作证据");
+    await page.getByText("高级诊断与证据处置").click();
+    const evidencePanel = page.locator(".review-evidence");
+    const trustedEvidenceRow = evidencePanel.locator("p").filter({ hasText: "passive-action-diff" });
+    await trustedEvidenceRow.getByRole("button", { name: "采用证据" }).click();
+    await page.getByRole("status").filter({ hasText: /已采用该证据.*带入领域表单.*仍需确认完整对象/ }).waitFor();
+    const actualTargetChoice = page.getByRole("button", { name: /选择结果物.*实见花.*第 2 级/ });
+    assert.match(await actualTargetChoice.getAttribute("class"), /selected/);
+    const afterEvidenceAcceptance = runtime.getCatalogObject("merge-relation", "conflict-source");
+    assert.equal(afterEvidenceAcceptance.reviewStatus, "needs-review");
+    assert.equal(afterEvidenceAcceptance.evidence.every((evidence) => evidence.disposition === "eligible"), true);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "conflict-source" }).length, 0);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "item-identity", objectId: "actual-target" }).length, 0);
+    assert.equal(runtime.database.listCatalogEvidenceAuditSummaries({ objectType: "merge-relation", objectId: "conflict-source" }).at(-1).action, "accept-evidence");
+    await page.getByText(/已采用证据.*对象仍待完整确认/).first().waitFor();
+
+    await page.getByLabel("补充说明（选填）").fill("旧推断与真实动作不符");
+    if ((await page.locator("details.advanced-review-actions").getAttribute("open")) === null) {
+      await page.getByText("高级诊断与证据处置").click();
+    }
+    const inferredEvidenceRow = evidencePanel.locator("p").filter({ hasText: "structural-inference" });
+    const evidencePostsBeforeRejection = postRequests.filter((url) => url.endsWith("/api/catalog/evidence/disposition")).length;
+    await inferredEvidenceRow.getByRole("button", { name: "否决证据" }).click();
+    const rejectionDialog = page.getByRole("alertdialog", { name: "确认否决证据" });
+    await rejectionDialog.getByRole("heading", { name: "否决影响预览" }).waitFor();
+    await rejectionDialog.getByText(/证据来源.*structural-inference/).waitFor();
+    await rejectionDialog.getByText(/后续自动推断及规划融合中排除/).waitFor();
+    assert.equal(postRequests.filter((url) => url.endsWith("/api/catalog/evidence/disposition")).length, evidencePostsBeforeRejection);
+    await rejectionDialog.getByRole("button", { name: "取消" }).click();
+    assert.equal(runtime.getCatalogObject("merge-relation", "conflict-source").evidence.find((evidence) => evidence.sourceType === "structural-inference").disposition, "eligible");
+    await inferredEvidenceRow.getByRole("button", { name: "否决证据" }).click();
+    await rejectionDialog.getByRole("button", { name: "确认否决证据" }).click();
+    await page.getByRole("status").filter({ hasText: /证据已否决.*自动推断及规划融合中排除/ }).waitFor();
+    const afterEvidenceRejection = runtime.getCatalogObject("merge-relation", "conflict-source");
+    const rejectedEvidence = afterEvidenceRejection.evidence.find((evidence) => evidence.sourceType === "structural-inference");
+    assert.equal(rejectedEvidence.disposition, "rejected");
+    assert.equal(rejectedEvidence.sourceRef, "conflict-source-relation.json");
+    assert.deepEqual(rejectedEvidence.payload, conflictBeforeEvidenceAction.evidence.find((evidence) => evidence.sourceType === "structural-inference").payload);
+    assert.deepEqual(runtime.database.listCatalogEvidenceAuditSummaries({ objectType: "merge-relation", objectId: "conflict-source" }).map((audit) => audit.action), [
+      "accept-evidence",
+      "reject-evidence",
+    ]);
+    await page.getByText(/已否决证据/).first().waitFor();
 
     runtime.queuePassiveCatalogEvidence({
       actionDiff: {

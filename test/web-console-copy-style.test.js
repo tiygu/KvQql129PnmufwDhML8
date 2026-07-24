@@ -175,6 +175,22 @@ test("对象暂停在高级诊断中先预览订单与关系并二次确认，�
   assert.match(source, /detail\.disposition === "paused"[\s\S]*togglePause/);
 });
 
+test("证据采用直接带入领域表单且否决先展示影响并二次确认", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const acceptBody = source.slice(source.indexOf("const acceptEvidence"), source.indexOf("const togglePause"));
+  const advanced = source.slice(source.indexOf("advanced-review-actions"));
+
+  assert.match(acceptBody, /setAdoptedEvidencePayload/);
+  assert.match(acceptBody, /selected\.payload/);
+  assert.match(acceptBody, /仍需确认完整对象/);
+  assert.doesNotMatch(acceptBody, /disposition:\s*"paused"/);
+  for (const copy of ["否决影响预览", "证据来源", "后续自动推断", "规划融合", "确认否决证据", "取消"]) {
+    assert.match(advanced, new RegExp(copy));
+  }
+  assert.match(source, /pendingEvidenceRejection/);
+  assert.match(source, /catalogAuditSummary/);
+});
+
 test("图鉴证据风险入口直接定位第一个真实阻塞项", () => {
   const source = read("web/src/App.tsx");
   assert.match(source, /const evidenceReviewTarget = [\s\S]*blocker\.reviewTarget/);

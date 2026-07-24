@@ -217,8 +217,25 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/catalog/evidence/disposition") {
         const body = await readJson(req);
         if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !body.evidenceId || !body.disposition || !body.reason || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-catalog-evidence-request" });
-        const object = runtime.setCatalogEvidenceDisposition(body.objectType, body.objectId, body.evidenceId, body.disposition, body.reason, Number(body.expectedRevision));
-        broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
+        const object = runtime.setCatalogEvidenceDisposition(
+          body.objectType,
+          body.objectId,
+          body.evidenceId,
+          body.disposition,
+          body.reason,
+          Number(body.expectedRevision),
+          { actor: body.actor, note: body.note, action: body.action },
+        );
+        broadcast({
+          type: "catalog-review-updated",
+          objectType: object.objectType,
+          objectId: object.objectId,
+          revision: object.revision,
+          reviewStatus: object.reviewStatus,
+          ...(object.catalogAuditSummary?.action
+            ? { evidenceAction: object.catalogAuditSummary.action }
+            : {}),
+        });
         return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/review/complete") {

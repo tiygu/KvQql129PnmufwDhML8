@@ -230,10 +230,22 @@ class CatalogReviewGate {
     return this.database.setCatalogObjectDisposition(objectType, objectId, disposition, { reason, expectedRevision });
   }
 
-  setEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision) {
+  setEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision, audit = {}) {
     return this.database.transaction(() => {
-      this.database.setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, { reason, expectedRevision });
-      return this.evaluateObject(objectType, objectId);
+      const changed = this.database.setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, {
+        reason,
+        expectedRevision,
+        actor: audit.actor,
+        note: audit.note,
+        action: audit.action,
+      });
+      const evaluated = this.evaluateObject(objectType, objectId);
+      const summaries = this.database.listCatalogEvidenceAuditSummaries({ objectType, objectId });
+      return {
+        ...evaluated,
+        catalogAuditSummary: changed.catalogAuditSummary || summaries.at(-1) || null,
+        catalogEvidenceAuditSummaries: summaries,
+      };
     });
   }
 }

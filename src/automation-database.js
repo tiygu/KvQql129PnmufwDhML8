@@ -307,6 +307,17 @@ class AutomationDatabase {
         updated_at TEXT NOT NULL,
         FOREIGN KEY(resolution_id) REFERENCES catalog_review_resolutions(id) ON DELETE RESTRICT
       );
+      CREATE TABLE IF NOT EXISTS catalog_evidence_audit_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_id INTEGER NOT NULL,
+        evidence_id INTEGER NOT NULL,
+        object_revision INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        summary_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
+        FOREIGN KEY(evidence_id) REFERENCES catalog_repository_evidence(id) ON DELETE RESTRICT
+      );
       CREATE TABLE IF NOT EXISTS catalog_icon_assets (
         hash TEXT PRIMARY KEY,
         mime_type TEXT NOT NULL,
@@ -402,6 +413,7 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_repository_rulings_object_field ON catalog_repository_rulings(object_id, field_path, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_review_resolutions_object ON catalog_review_resolutions(object_id, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_audit_summaries_created ON catalog_audit_summaries(created_at, id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_evidence_audits_object ON catalog_evidence_audit_summaries(object_id, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_object ON catalog_icon_candidates(object_id, selected, id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_asset ON catalog_icon_candidates(asset_hash);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_icon_candidates_one_selected ON catalog_icon_candidates(object_id) WHERE selected=1;
@@ -943,6 +955,18 @@ class AutomationDatabase {
       }));
   }
 
+  listCatalogEvidenceAuditSummaries({ objectType = null, objectId = null } = {}) {
+    const clauses = [], values = [];
+    if (objectType != null) { clauses.push("object.object_type=?"); values.push(String(objectType)); }
+    if (objectId != null) { clauses.push("object.object_id=?"); values.push(String(objectId)); }
+    const where = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT audit.id,audit.summary_json
+      FROM catalog_evidence_audit_summaries audit
+      JOIN catalog_repository_objects object ON object.id=audit.object_id
+      ${where} ORDER BY audit.id`).all(...values)
+      .map((row) => ({ id: Number(row.id), ...parseJson(row.summary_json) }));
+  }
+
   finalizeCatalogReviewPlanning(requestId, planningResult) {
     const normalizedRequestId = String(requestId || "").trim();
     if (!normalizedRequestId) throw new TypeError("catalog review requestId is required");
@@ -1016,7 +1040,13 @@ class AutomationDatabase {
     });
   }
 
-  setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, { reason, expectedRevision } = {}) {
+  setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, {
+    reason,
+    expectedRevision,
+    actor = null,
+    note = null,
+    action = null,
+  } = {}) {
     const identity = validateCatalogIdentity(objectType, objectId);
     if (!CATALOG_EVIDENCE_DISPOSITIONS.has(String(disposition))) throw new TypeError(`unsupported catalog evidence disposition: ${disposition}`);
     if (!reason) throw new TypeError("catalog evidence disposition reason is required");
@@ -1026,13 +1056,61 @@ class AutomationDatabase {
       this._assertCatalogRevision(before, expectedRevision);
       const evidence = this.db.prepare("SELECT * FROM catalog_repository_evidence WHERE id=? AND object_id=?").get(Number(evidenceId), before.id);
       if (!evidence) throw new Error(`catalog evidence not found: ${evidenceId}`);
-      if (evidence.disposition === disposition) return this._catalogObjectResult(before);
+      const auditAction = String(action || (disposition === "eligible" ? "restore-evidence" : disposition === "rejected" ? "reject-evidence" : "pause-evidence"));
+      const recordSameDisposition = auditAction === "accept-evidence";
+      if (evidence.disposition === disposition && !recordSameDisposition) return this._catalogObjectResult(before);
+      const algorithmCandidate = this._catalogAlgorithmCandidate(before);
+      const effectiveBefore = [...this._activeCatalogRulings(before.id).values()]
+        .reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
+      const evidencePayload = parseJson(evidence.payload_json) || {};
+      const auditActor = String(actor || String(reason).split(":")[0] || "system").trim() || "system";
+      const auditNote = String(note || reason).trim();
       const now = new Date().toISOString();
-      this.db.prepare("UPDATE catalog_repository_evidence SET disposition=? WHERE id=?").run(String(disposition), evidence.id);
+      if (evidence.disposition !== disposition) {
+        this.db.prepare("UPDATE catalog_repository_evidence SET disposition=? WHERE id=?").run(String(disposition), evidence.id);
+      }
       this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, before.id);
       const after = this._catalogObjectRow(identity.objectType, identity.objectId);
-      this._recordCatalogTransition(after, { fromStatus: before.status, fromDisposition: before.disposition, reason: `evidence-${disposition}:${reason}`, evidenceRevision: after.revision });
-      return this._catalogObjectResult(after);
+      this._recordCatalogTransition(after, { fromStatus: before.status, fromDisposition: before.disposition, reason: `${auditAction}:${evidence.id}:${reason}`, evidenceRevision: after.revision });
+      const auditSummary = {
+        objectType: identity.objectType,
+        objectId: identity.objectId,
+        objectRevision: Number(after.revision),
+        actor: auditActor,
+        action: auditAction,
+        displayTitle: catalogDisplayTitle(effectiveBefore),
+        evidenceReference: {
+          id: Number(evidence.id),
+          sourceType: evidence.source_type,
+          sourceRef: evidence.source_ref || null,
+        },
+        priorDisposition: evidence.disposition,
+        disposition: String(disposition),
+        adoptedPayload: auditAction === "accept-evidence" ? evidencePayload : null,
+        meaningfulDifferences: auditAction === "accept-evidence"
+          ? meaningfulCatalogDifferences(effectiveBefore, evidencePayload)
+          : [],
+        impact: auditAction === "reject-evidence"
+          ? { excludedFromInference: true, excludedFromPlanning: true }
+          : { excludedFromInference: false, excludedFromPlanning: false },
+        optionalNote: auditNote || null,
+        createdAt: now,
+      };
+      this.db.prepare(`INSERT INTO catalog_evidence_audit_summaries(
+        object_id,evidence_id,object_revision,action,summary_json,created_at
+      ) VALUES(?,?,?,?,?,?)`).run(
+        before.id,
+        Number(evidence.id),
+        Number(after.revision),
+        auditAction,
+        canonicalJson(auditSummary),
+        now,
+      );
+      return {
+        ...this._catalogObjectResult(after),
+        catalogAuditSummary: auditSummary,
+        catalogEvidenceAuditSummaries: this.listCatalogEvidenceAuditSummaries(identity),
+      };
     });
   }
 
