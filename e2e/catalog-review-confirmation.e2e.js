@@ -70,6 +70,7 @@ async function main() {
     dataDir,
     manageConnectionRoute: false,
   });
+  runtime.saveSettings({ ...runtime.getSettings(), mode: "automatic" });
   for (const identity of [
     { objectId: "flower-1", name: "花苞", level: 1 },
     { objectId: "flower-2", name: "初绽花", level: 2 },
@@ -134,6 +135,19 @@ async function main() {
     countDuplicate: false,
   });
   runtime.catalogGate.evaluateObject("production-mode", "profile-producer:single");
+  runtime.database.upsertTheoreticalProductionDistribution({
+    producerItemId: "profile-producer",
+    modeId: "single",
+    theoreticalDistribution: {
+      configVersion: "cfg-browser-19",
+      extractionSource: "runtime:browser-production-mode",
+      outputsPerAction: 2,
+      outcomes: [
+        { itemId: "profile-output-a", weight: 3 },
+        { itemId: "profile-output-b", weight: 1 },
+      ],
+    },
+  });
   const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
@@ -517,6 +531,11 @@ async function main() {
       objectType: "production-profile",
       objectId: "profile-producer",
     }).length, 0);
+    const planningBeforeAttributionConflict = runtime.database.getProductionDistribution(
+      "profile-producer",
+      "single",
+      { executionMode: "automatic" },
+    );
 
     runtime.queuePassiveCatalogEvidence({
       actionDiff: {
@@ -534,6 +553,13 @@ async function main() {
       },
     });
     await runtime.passiveCatalogDrainPromise;
+    const planningAfterAttributionConflict = runtime.database.getProductionDistribution(
+      "profile-producer",
+      "single",
+      { executionMode: "automatic" },
+    );
+    assert.equal(planningAfterAttributionConflict.observedDistribution.sampleSize, 1);
+    assert.deepEqual(planningAfterAttributionConflict.planningDistribution, planningBeforeAttributionConflict.planningDistribution);
     await page.reload({ waitUntil: "networkidle" });
     await page.getByRole("button", { name: "图鉴" }).click();
     const profileEntry = page.getByRole("button", { name: /“园艺篮”的产出档案.*需要处理/ });
@@ -541,16 +567,34 @@ async function main() {
     await page.getByRole("heading", { name: "产出档案", exact: true }).waitFor();
     await page.getByText(/产出动作.*来源.*归因.*互相矛盾/).waitFor();
     const profilePanel = page.getByRole("region", { name: "产出档案内容" });
-    await profilePanel.getByText("所属产出物").waitFor();
+    await profilePanel.getByText("所属产出物", { exact: true }).waitFor();
     await profilePanel.getByText("园艺篮（第 1 级）").waitFor();
-    await profilePanel.getByText("候选产物集合").waitFor();
+    await profilePanel.getByText("候选产物集合", { exact: true }).first().waitFor();
     await profilePanel.getByText("晨露（第 1 级）").waitFor();
     await profilePanel.getByText("花粉（第 2 级）").waitFor();
-    await profilePanel.getByText("可用产出档位").waitFor();
+    await profilePanel.getByText("可用产出档位", { exact: true }).first().waitFor();
     await profilePanel.getByText("single", { exact: true }).waitFor();
     assert.equal(await profilePanel.getByText("体力消耗", { exact: true }).count(), 0);
     assert.equal(await profilePanel.getByText("理论产出分布", { exact: true }).count(), 0);
     assert.equal(await profilePanel.getByText("真实观测分布", { exact: true }).count(), 0);
+    await profilePanel.getByText("single", { exact: true }).click();
+    await page.getByRole("heading", { name: "产出档位", exact: true }).waitFor();
+    const modePanel = page.getByRole("region", { name: "产出档位分布" });
+    await modePanel.getByText("单次体力 1").waitFor();
+    await modePanel.getByRole("heading", { name: "理论产出分布" }).waitFor();
+    await modePanel.getByText("cfg-browser-19").waitFor();
+    await modePanel.getByText("runtime:browser-production-mode").waitFor();
+    await modePanel.getByRole("heading", { name: "真实观测分布" }).waitFor();
+    await modePanel.getByText("样本量 1 次动作 · 实见产物 2 个").waitFor();
+    await modePanel.getByText(/晨露.*1 个/).waitFor();
+    await modePanel.getByText(/花粉.*1 个/).waitFor();
+    await modePanel.getByText(/低样本.*仍在积累/).waitFor();
+    await modePanel.getByRole("heading", { name: "规划采用分布" }).waitFor();
+    await modePanel.getByText("保守可行性").waitFor();
+    await modePanel.getByText(/未见产物余量/).waitFor();
+    assert.equal(await modePanel.locator("input").count(), 0);
+    await profileEntry.click();
+    await page.getByRole("heading", { name: "产出档案", exact: true }).waitFor();
     const profileBeforeReview = runtime.getCatalogObject("production-profile", "profile-producer");
     await page.getByRole("button", { name: "确认无误" }).click();
     await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();

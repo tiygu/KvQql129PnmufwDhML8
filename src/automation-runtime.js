@@ -383,6 +383,43 @@ class AutomationRuntime {
     if (objectType === "item-identity") {
       return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
     }
+    if (objectType === "production-mode") {
+      const mode = object.effectiveValue || object.algorithmCandidate || {};
+      const producerItemId = String(mode.producerItemId || "");
+      const modeId = String(mode.modeId || "");
+      const executionMode = this.getSettings().mode;
+      const distribution = producerItemId && modeId
+        ? this.database.getProductionDistribution(producerItemId, modeId, { executionMode })
+        : null;
+      const itemIds = new Set([
+        ...(distribution?.theoreticalDistribution?.outcomes || []).map((entry) => entry.itemId),
+        ...(distribution?.observedDistribution?.outcomes || []).map((entry) => entry.itemId),
+        ...(distribution?.planningDistribution?.outcomes || []).map((entry) => entry.itemId),
+      ].map(String));
+      const items = Object.fromEntries([...itemIds].map((itemId) => {
+        const identity = this.database.getCatalogObject("item-identity", itemId);
+        const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
+        const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
+          .find((candidate) => String(candidate || "").trim());
+        const level = Number(value.level);
+        return [itemId, {
+          name: String(name || "未命名物品").trim(),
+          level: Number.isInteger(level) && level > 0 ? level : null,
+        }];
+      }));
+      return {
+        ...object,
+        productionModeContext: {
+          producerItemId,
+          modeId,
+          energyCost: Number(mode.energyCost),
+          unlocked: mode.unlocked !== false,
+          executionMode,
+          distribution,
+          items,
+        },
+      };
+    }
     if (objectType === "production-profile") {
       const profile = object.effectiveValue || object.algorithmCandidate || {};
       const describeItem = (itemId) => {

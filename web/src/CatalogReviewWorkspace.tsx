@@ -57,6 +57,9 @@ const valueLabels: Record<string, string> = {
   resource: "资源",
   selected: "已选择",
   unselected: "未选择",
+  observation: "观察",
+  assisted: "协助",
+  automatic: "自动",
 };
 
 function valueLabel(value: any) {
@@ -191,6 +194,20 @@ function relationItemLabel(item: any) {
 
 function productionProfileItemLabel(item: any) {
   return `${item?.name || "未命名物品"}（${item?.level == null ? "等级未知" : `第 ${item.level} 级`}）`;
+}
+
+function productionDistributionItemLabel(context: any, itemId: any) {
+  const item = context?.items?.[String(itemId)] || {};
+  return `${item.name || "未命名物品"}${item.level == null ? "" : `（第 ${item.level} 级）`}`;
+}
+
+function percentage(value: any) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${(number * 100).toFixed(1)}%` : "未知";
+}
+
+function planningBasisLabel(value: any) {
+  return value === "conservative-feasibility" ? "保守可行性" : "后验期望";
 }
 
 function relationObjectKey(item: any) {
@@ -694,6 +711,29 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
               <div><span>候选产物集合</span><div className="production-profile-items">{detail.productionProfileContext?.candidateOutputs?.length ? detail.productionProfileContext.candidateOutputs.map((item: any) => <button className="production-profile-item" key={item.itemKey} onClick={() => focusRelatedObject("item-identity", item.itemKey)}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{productionProfileItemLabel(item)}</strong></button>) : <p>尚未取得可归因的真实产物。</p>}</div></div>
               <div><span>可用产出档位</span><div className="production-profile-modes">{detail.productionProfileContext?.productionModes?.length ? detail.productionProfileContext.productionModes.map((mode: any) => <button key={mode.modeId} onClick={() => focusRelatedObject("production-mode", mode.modeKey)}><strong>{mode.modeId}</strong><small>{mode.unlocked ? "可用" : "未解锁"} · {valueLabel(mode.status)}</small></button>) : <p>尚未观测到可用产出档位。</p>}</div></div>
             </div>
+          </section>}
+          {detail.objectType === "production-mode" && <section className="production-mode-review" role="region" aria-label="产出档位分布">
+            <div className="production-mode-head"><div><span className="eyebrow">档位知识</span><h3>产出档位</h3></div><strong>系统融合，普通审核只读</strong></div>
+            <p className="independent-review-note">单次体力 {Number.isFinite(detail.productionModeContext?.energyCost) ? detail.productionModeContext.energyCost : "未知"} · 档位 {detail.productionModeContext?.modeId || "未知"}；理论配置不计入真实样本，未解决来源或归因的动作不会进入规划分布。</p>
+            {detail.productionModeContext?.distribution ? <div className="production-distribution-grid">
+              <article>
+                <h4>理论产出分布</h4>
+                <p className="distribution-source">配置 {detail.productionModeContext.distribution.theoreticalDistribution.configVersion} · 来源 {detail.productionModeContext.distribution.theoreticalDistribution.extractionSource}</p>
+                <div className="distribution-outcomes">{detail.productionModeContext.distribution.theoreticalDistribution.outcomes.map((outcome: any) => <p key={outcome.itemId}><strong>{productionDistributionItemLabel(detail.productionModeContext, outcome.itemId)}</strong><span>权重 {outcome.weight} · {percentage(outcome.probability)}</span></p>)}</div>
+              </article>
+              <article>
+                <h4>真实观测分布</h4>
+                <p className="distribution-source">样本量 {detail.productionModeContext.distribution.observedDistribution.sampleSize} 次动作 · 实见产物 {detail.productionModeContext.distribution.observedDistribution.totalOutcomeCount} 个</p>
+                <div className="distribution-outcomes">{detail.productionModeContext.distribution.observedDistribution.outcomes.length ? detail.productionModeContext.distribution.observedDistribution.outcomes.map((outcome: any) => <p key={outcome.itemId}><strong>{productionDistributionItemLabel(detail.productionModeContext, outcome.itemId)} · {outcome.count} 个</strong><span>{percentage(outcome.probability)}</span></p>) : <p><span>尚无可归因的真实产出样本</span></p>}</div>
+                {detail.productionModeContext.distribution.planningDistribution.stability === "low-sample" && <p className="distribution-stability low">低样本：仍在积累，达到 {detail.productionModeContext.distribution.planningDistribution.rules.minimumReliableActions} 次动作前保留更高不确定性。</p>}
+              </article>
+              <article>
+                <h4>规划采用分布</h4>
+                <p className="distribution-source">{planningBasisLabel(detail.productionModeContext.distribution.planningDistribution.basis)} · {valueLabel(detail.productionModeContext.executionMode)}模式</p>
+                <div className="distribution-outcomes">{detail.productionModeContext.distribution.planningDistribution.outcomes.map((outcome: any) => <p key={outcome.itemId}><strong>{productionDistributionItemLabel(detail.productionModeContext, outcome.itemId)}</strong><span>采用 {percentage(outcome.probability)} · 期望 {percentage(outcome.expectedProbability)}</span></p>)}</div>
+                <p className="distribution-stability">未见产物余量 {percentage(detail.productionModeContext.distribution.planningDistribution.uncertaintyMass)} · 自动模式按 95% 置信下界保守规划。</p>
+              </article>
+            </div> : <div className="empty-state compact"><History/><span>尚未取得带来源的理论配置，真实样本会暂存并在配置出现后重放。</span></div>}
           </section>}
           <div className="candidate-snapshot">
             <h3>本次将确认的完整候选</h3>

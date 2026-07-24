@@ -5,6 +5,14 @@ const DEFAULT_PRIOR_STRENGTH = 4;
 const DEFAULT_UNSEEN_ALPHA = 1;
 const CONFLICT_MINIMUM_ACTIONS = 8;
 const CONFLICT_DISTANCE_THRESHOLD = 0.35;
+const PRODUCTION_DISTRIBUTION_RULES = Object.freeze({
+  priorStrength: DEFAULT_PRIOR_STRENGTH,
+  unseenOutcomeAlpha: DEFAULT_UNSEEN_ALPHA,
+  minimumReliableActions: CONFLICT_MINIMUM_ACTIONS,
+  conflictDistanceThreshold: CONFLICT_DISTANCE_THRESHOLD,
+  automaticProbability: "lower-95-confidence-bound",
+  unresolvedAttribution: "excluded",
+});
 
 function finiteNonNegative(value, fallback = 0) {
   const number = Number(value);
@@ -138,10 +146,14 @@ function projectPlanningDistribution(state, executionMode = "assisted") {
     source: "planning-posterior",
     mode: normalizedMode,
     basis: normalizedMode === "automatic" ? "conservative-feasibility" : "posterior-expectation",
+    stability: state.observedDistribution.sampleSize < PRODUCTION_DISTRIBUTION_RULES.minimumReliableActions
+      ? "low-sample"
+      : state.confidence.reviewRequired ? "conflicted" : "established",
     sampleSize: state.observedDistribution.sampleSize,
     expectedOutcomesPerAction,
     feasibilityOutcomesPerAction: Math.max(expectedOutcomesPerAction, Number(state.theoreticalDistribution.outputsPerAction || 1)),
     confidence: state.confidence,
+    rules: PRODUCTION_DISTRIBUTION_RULES,
     uncertaintyMass: Math.max(state.posteriorDistribution.unseen.probability, 1 - outcomes.reduce((sum, entry) => sum + entry.probability, 0)),
     outcomes,
   };
@@ -149,6 +161,7 @@ function projectPlanningDistribution(state, executionMode = "assisted") {
 
 module.exports = {
   UNSEEN_OUTCOME,
+  PRODUCTION_DISTRIBUTION_RULES,
   normalizeTheoreticalDistribution,
   createDistributionState,
   updateDistributionState,

@@ -146,6 +146,23 @@ test("图鉴差异使用冲突证据候选，产出档案只展示所属产出�
   assert.match(source, /集合由真实动作自动维护/);
 });
 
+test("产出档位分开显示三类分布、样本稳定性且普通路径没有概率输入", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const modePanel = source.slice(
+    source.indexOf('detail.objectType === "production-mode" && <section'),
+    source.indexOf('<div className="candidate-snapshot">'),
+  );
+
+  assert.match(modePanel, /理论产出分布/);
+  assert.match(modePanel, /真实观测分布/);
+  assert.match(modePanel, /规划采用分布/);
+  assert.match(modePanel, /样本量/);
+  assert.match(modePanel, /低样本/);
+  assert.match(modePanel, /未见产物余量/);
+  assert.match(modePanel, /系统融合，普通审核只读/);
+  assert.doesNotMatch(modePanel, /<input/);
+});
+
 test("图鉴证据风险入口直接定位第一个真实阻塞项", () => {
   const source = read("web/src/App.tsx");
   assert.match(source, /const evidenceReviewTarget = [\s\S]*blocker\.reviewTarget/);

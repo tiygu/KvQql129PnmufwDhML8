@@ -120,7 +120,9 @@ test("attributable production updates the profile automatically while attributio
     entry.objectType === "production-profile" && entry.objectId === "p");
   assert.ok(conflict);
   assert.equal(conflict.reasons.some((reason) => reason.type === "production-attribution-conflict"), true);
-  assert.deepEqual(database.getCatalogObject("production-profile", "p").algorithmCandidate, automaticallyAdopted.activeVersion.payload);
+  const conflictDetail = database.getCatalogObject("production-profile", "p");
+  assert.equal(conflictDetail.reviewReasons.some((reason) => reason.type === "production-attribution-conflict"), true);
+  assert.deepEqual(conflictDetail.algorithmCandidate, automaticallyAdopted.activeVersion.payload);
 
   const reviewed = database.completeCatalogReview({
     objectType: "production-profile",

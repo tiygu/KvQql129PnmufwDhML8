@@ -507,7 +507,14 @@ class AutomationDatabase {
     if (row.status === "observed") reasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
     if (row.candidate_version_id != null) reasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
     for (const conflict of this.db.prepare("SELECT conflict_type,details_json FROM catalog_repository_conflicts WHERE object_type=? AND object_id=? AND status='open' ORDER BY id").all(row.object_type, row.object_id)) {
-      reasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
+      const productionAttribution = row.object_type === "production-profile"
+        && conflict.conflict_type === "production-attribution-conflict";
+      reasons.push({
+        type: productionAttribution ? "production-attribution-conflict" : "evidence-conflict",
+        conflictType: conflict.conflict_type,
+        details: parseJson(conflict.details_json),
+        message: productionAttribution ? "产出动作来源或归因互相矛盾" : "证据来源存在冲突",
+      });
     }
     for (const ruling of activeRulings.values()) {
       const candidate = fieldValue(algorithmCandidate, ruling.fieldPath);

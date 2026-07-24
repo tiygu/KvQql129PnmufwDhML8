@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 const {
+  PRODUCTION_DISTRIBUTION_RULES,
   createDistributionState,
   updateDistributionState,
   projectPlanningDistribution,
@@ -90,6 +91,9 @@ test("planning projections expose uncertainty, posterior expectation, and conser
   assert.equal(assisted.outcomes[0].probability, assisted.outcomes[0].expectedProbability);
   assert.ok(automatic.outcomes.every((entry, index) => entry.probability <= assisted.outcomes[index].probability));
   assert.equal(automatic.basis, "conservative-feasibility");
+  assert.equal(automatic.rules.minimumReliableActions, PRODUCTION_DISTRIBUTION_RULES.minimumReliableActions);
+  assert.equal(automatic.rules.automaticProbability, "lower-95-confidence-bound");
+  assert.equal(automatic.stability, "low-sample");
 });
 
 test("posterior planning preserves per-mode output multiplicity", () => {
@@ -124,12 +128,15 @@ test("database stores uncertain actions separately and emits review events for s
   for (let index = 0; index < 12; index += 1) {
     database.recordProductionActionObservation({ actionId: `certain-${index}`, producerItemId: "tree", modeId: "fruit", outcomeItemIds: ["pear"], attributable: true });
   }
+  const planningBeforeUncertain = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution;
   database.recordProductionActionObservation({ actionId: "uncertain-1", attributable: false, reason: "verification_read_error", outcomeItemIds: ["apple"] });
+  const planningAfterUncertain = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution;
 
   const state = database.getProductionDistribution("tree", "fruit");
   assert.equal(state.observedDistribution.sampleSize, 12);
   assert.equal(database.listUncertainProductionActions().length, 1);
   assert.equal(database.listUncertainProductionActions()[0].assignedOutcomeItemIds.length, 0);
+  assert.deepEqual(planningAfterUncertain, planningBeforeUncertain);
   assert.equal(state.confidence.level, "reduced");
   assert.ok(database.listProductionDistributionReviewEvents().some((event) => event.eventType === "theory-observation-conflict"));
 
