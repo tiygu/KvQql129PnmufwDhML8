@@ -109,6 +109,31 @@ async function main() {
     sourceType: "structural-inference",
     chainId: "conflict-chain",
   });
+  seedActiveIdentity(runtime, { objectId: "profile-producer", name: "园艺篮", level: 1, chainId: "profile-producer-chain" });
+  seedActiveIdentity(runtime, { objectId: "profile-output-a", name: "晨露", level: 1, chainId: "profile-output-chain" });
+  seedActiveIdentity(runtime, { objectId: "profile-output-b", name: "花粉", level: 2, chainId: "profile-output-chain" });
+  seedRelation(runtime, { objectId: "profile-producer", level: 1, mergeTarget: null, chainId: "profile-producer-chain" });
+  seedRelation(runtime, { objectId: "profile-output-a", level: 1, mergeTarget: "profile-output-b", chainId: "profile-output-chain" });
+  seedRelation(runtime, { objectId: "profile-output-b", level: 2, mergeTarget: null, chainId: "profile-output-chain" });
+  runtime.database.observeCatalogObject({
+    objectType: "production-mode",
+    objectId: "profile-producer:single",
+    payload: {
+      producerItemId: "profile-producer",
+      modeId: "single",
+      energyCost: 1,
+      outputs: [
+        { itemId: "profile-output-a", count: 1, probability: 1 },
+        { itemId: "profile-output-b", count: 1, probability: 1 },
+      ],
+      unlocked: true,
+      switchEntry: { status: "available", method: "setMultipleMode" },
+    },
+    sourceType: "runtime-capture",
+    sourceRef: "profile-producer-single-mode.json",
+    countDuplicate: false,
+  });
+  runtime.catalogGate.evaluateObject("production-mode", "profile-producer:single");
   const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
@@ -465,6 +490,82 @@ async function main() {
     assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).count(), 1);
     assert.equal(runtime.getCatalogObject("merge-relation", "conflict-source").reviewStatus, "needs-review");
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "conflict-source" }).length, 0);
+
+    runtime.queuePassiveCatalogEvidence({
+      actionDiff: {
+        actionId: "browser-production-auto-1",
+        type: "produce",
+        verified: true,
+        attributable: true,
+        producerItemId: "profile-producer",
+        productionModeId: "single",
+        actualOutputItemIds: ["profile-output-a", "profile-output-b"],
+      },
+    });
+    await runtime.passiveCatalogDrainPromise;
+    const adoptedProfile = runtime.getCatalogObject("production-profile", "profile-producer");
+    assert.equal(adoptedProfile.status, "active");
+    assert.equal(adoptedProfile.reviewStatus, "clear");
+    assert.deepEqual(adoptedProfile.activeVersion.payload, {
+      producerItemId: "profile-producer",
+      candidateOutputs: ["profile-output-a", "profile-output-b"],
+      productionModes: ["single"],
+    });
+    assert.equal(runtime.database.getCatalogReviewQueue().some((entry) =>
+      entry.objectType === "production-profile" && entry.objectId === "profile-producer"), false);
+    assert.equal(runtime.database.listCatalogAuditSummaries({
+      objectType: "production-profile",
+      objectId: "profile-producer",
+    }).length, 0);
+
+    runtime.queuePassiveCatalogEvidence({
+      actionDiff: {
+        actionId: "browser-production-conflict-1",
+        type: "produce",
+        verified: true,
+        attributable: false,
+        producerItemId: "profile-producer",
+        productionModeId: "single",
+        actualOutputItemIds: ["profile-output-b"],
+        attributionConflict: {
+          candidateProducerItemIds: ["profile-producer", "other-producer"],
+          sourceRefs: ["board-grid:4", "action-baseline:producer"],
+        },
+      },
+    });
+    await runtime.passiveCatalogDrainPromise;
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    const profileEntry = page.getByRole("button", { name: /“园艺篮”的产出档案.*需要处理/ });
+    await profileEntry.click();
+    await page.getByRole("heading", { name: "产出档案", exact: true }).waitFor();
+    await page.getByText(/产出动作.*来源.*归因.*互相矛盾/).waitFor();
+    const profilePanel = page.getByRole("region", { name: "产出档案内容" });
+    await profilePanel.getByText("所属产出物").waitFor();
+    await profilePanel.getByText("园艺篮（第 1 级）").waitFor();
+    await profilePanel.getByText("候选产物集合").waitFor();
+    await profilePanel.getByText("晨露（第 1 级）").waitFor();
+    await profilePanel.getByText("花粉（第 2 级）").waitFor();
+    await profilePanel.getByText("可用产出档位").waitFor();
+    await profilePanel.getByText("single", { exact: true }).waitFor();
+    assert.equal(await profilePanel.getByText("体力消耗", { exact: true }).count(), 0);
+    assert.equal(await profilePanel.getByText("理论产出分布", { exact: true }).count(), 0);
+    assert.equal(await profilePanel.getByText("真实观测分布", { exact: true }).count(), 0);
+    const profileBeforeReview = runtime.getCatalogObject("production-profile", "profile-producer");
+    await page.getByRole("button", { name: "确认无误" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    const profileReviewRequest = completionRequests.at(-1);
+    assert.equal(profileReviewRequest.objectType, "production-profile");
+    assert.deepEqual(profileReviewRequest.snapshot, profileBeforeReview.activeVersion.payload);
+    assert.equal(runtime.getCatalogObject("production-profile", "profile-producer").reviewStatus, "clear");
+    assert.equal(runtime.database.listCatalogReviewResolutions({
+      objectType: "production-profile",
+      objectId: "profile-producer",
+    }).length, 1);
+    assert.equal(runtime.database.listCatalogAuditSummaries({
+      objectType: "production-profile",
+      objectId: "profile-producer",
+    }).length, 1);
   } finally {
     await browser.close();
     await server.close();

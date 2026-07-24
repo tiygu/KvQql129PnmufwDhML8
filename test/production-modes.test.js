@@ -57,6 +57,83 @@ test("Production Profile and each Production Mode have independent evidence life
   assert.equal(database.getCatalogObject("production-mode", "p:double").status, "active");
 }));
 
+test("attributable production updates the profile automatically while attribution conflicts require a full snapshot review", () => withDatabase((database) => {
+  observe(database, "item-identity", "p", { id: "p", chainId: "producer", level: 1 });
+  observe(database, "item-identity", "a1", { id: "a1", chainId: "a", level: 1 });
+  observe(database, "item-identity", "a2", { id: "a2", chainId: "a", level: 2 });
+  observe(database, "merge-relation", "p", { itemId: "p", chainId: "producer", level: 1, mergeTarget: null });
+  observe(database, "merge-relation", "a1", { itemId: "a1", chainId: "a", level: 1, mergeTarget: "a2" });
+  observe(database, "merge-relation", "a2", { itemId: "a2", chainId: "a", level: 2, mergeTarget: null });
+  observe(database, "production-mode", "p:single", {
+    producerItemId: "p",
+    modeId: "single",
+    energyCost: 1,
+    outputs: [{ itemId: "a1", count: 1, probability: 1 }],
+    unlocked: true,
+    switchEntry: { status: "available", method: "setMultipleMode" },
+  });
+  new CatalogReviewGate(database).evaluateAll();
+
+  collectPassiveCatalogEvidence(database, {
+    actionDiff: {
+      actionId: "production-profile-auto-1",
+      type: "produce",
+      verified: true,
+      attributable: true,
+      producerItemId: "p",
+      productionModeId: "single",
+      actualOutputItemIds: ["a1", "a2"],
+    },
+  });
+  new CatalogReviewGate(database).evaluateAll();
+
+  const automaticallyAdopted = database.getCatalogObject("production-profile", "p");
+  assert.equal(automaticallyAdopted.status, "active");
+  assert.deepEqual(automaticallyAdopted.activeVersion.payload, {
+    producerItemId: "p",
+    candidateOutputs: ["a1", "a2"],
+    productionModes: ["single"],
+  });
+  assert.equal(Object.hasOwn(automaticallyAdopted.activeVersion.payload, "energyCost"), false);
+  assert.equal(Object.hasOwn(automaticallyAdopted.activeVersion.payload, "theoreticalDistribution"), false);
+  assert.equal(Object.hasOwn(automaticallyAdopted.activeVersion.payload, "observedDistribution"), false);
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectType === "production-profile" && entry.objectId === "p"), false);
+
+  collectPassiveCatalogEvidence(database, {
+    actionDiff: {
+      actionId: "production-profile-conflict-1",
+      type: "produce",
+      verified: true,
+      attributable: false,
+      producerItemId: "p",
+      productionModeId: "single",
+      actualOutputItemIds: ["a2"],
+      attributionConflict: {
+        candidateProducerItemIds: ["p", "other-producer"],
+        sourceRefs: ["board-grid:4", "action-baseline:producer"],
+      },
+    },
+  });
+  new CatalogReviewGate(database).evaluateObject("production-profile", "p");
+
+  const conflict = database.getCatalogReviewQueue().find((entry) =>
+    entry.objectType === "production-profile" && entry.objectId === "p");
+  assert.ok(conflict);
+  assert.equal(conflict.reasons.some((reason) => reason.type === "production-attribution-conflict"), true);
+  assert.deepEqual(database.getCatalogObject("production-profile", "p").algorithmCandidate, automaticallyAdopted.activeVersion.payload);
+
+  const reviewed = database.completeCatalogReview({
+    objectType: "production-profile",
+    objectId: "p",
+    decision: "confirm",
+    snapshot: automaticallyAdopted.activeVersion.payload,
+    actor: "tester",
+    expectedRevision: database.getCatalogObject("production-profile", "p").revision,
+  });
+  assert.equal(reviewed.reviewStatus, "clear");
+  assert.equal(database.getCatalogReviewQueue().some((entry) => entry.objectType === "production-profile" && entry.objectId === "p"), false);
+}));
+
 test("current production mode uses structured runtime distribution without requiring a production action first", () => withDatabase((database) => {
   observe(database, "item-identity", "p", { id: "p", chainId: "producer", level: 1 });
   observe(database, "item-identity", "a1", { id: "a1", chainId: "a", level: 1 });

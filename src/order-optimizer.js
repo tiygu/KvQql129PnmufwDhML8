@@ -40,7 +40,7 @@ function rankPlans(plans, strategy = "efficiency", prioritySlot = null) {
 const EVIDENCE_FIELDS = Object.freeze({
   "item-identity": ["itemId", "chainId", "level", "baseUnits"],
   "merge-relation": ["itemId", "chainId", "level", "mergeTarget"],
-  "production-profile": ["producerItemId", "energyCost", "planningDistribution"],
+  "production-profile": ["producerItemId", "candidateOutputs", "productionModes"],
   "production-mode": ["producerItemId", "modeId", "energyCost", "outputs", "unlocked", "switchEntry", "humanLocked"],
 });
 

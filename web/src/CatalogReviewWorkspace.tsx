@@ -16,6 +16,10 @@ const reviewReasonMetadata: Record<string, { label: string; explanation: string 
     label: "证据冲突",
     explanation: "系统发现不同来源对这个对象的含义说法不一致，相关订单的规划可能因此受阻。请核对下方候选快照是否与游戏中看到的一致。",
   },
+  "production-attribution-conflict": {
+    label: "产出归因冲突",
+    explanation: "真实产出动作的来源或所属产出物归因互相矛盾，候选产物暂不自动扩展。请核对完整产出档案快照。",
+  },
   "icon-gap": {
     label: "图标缺口",
     explanation: "对象只缺少展示图标，不影响当前规划。请在方便时补充视觉线索。",
@@ -69,6 +73,9 @@ const fieldLabels: Record<string, string> = {
   mergeTarget: "结果物",
   requiredCount: "所需数量",
   producerId: "产出物编号",
+  producerItemId: "所属产出物",
+  candidateOutputs: "候选产物集合",
+  productionModes: "可用产出档位",
   energyCost: "体力消耗",
   probability: "概率",
   drops: "产出分布",
@@ -100,7 +107,7 @@ function catalogObjectTitle(detail: any, summary: any) {
 const domainFieldOrder: Record<string, string[]> = {
   "item-identity": ["name", "displayName", "descriptionKey", "level", "type", "iconResourceIdentifier", "saleValue"],
   "merge-relation": ["level", "mergeTarget", "requiredCount"],
-  "production-profile": ["level", "energyCost", "theoreticalDistribution", "observedDistribution", "candidateOutputs", "productionModes"],
+  "production-profile": ["candidateOutputs", "productionModes"],
   "production-mode": ["energyCost", "outputs", "unlocked", "switchEntry"],
 };
 
@@ -182,6 +189,10 @@ function relationItemLabel(item: any) {
   return `${item?.name || "未命名物品"}（${item?.level == null ? "等级未知" : `第 ${item.level} 级`}）`;
 }
 
+function productionProfileItemLabel(item: any) {
+  return `${item?.name || "未命名物品"}（${item?.level == null ? "等级未知" : `第 ${item.level} 级`}）`;
+}
+
 function relationObjectKey(item: any) {
   return item?.objectId || "";
 }
@@ -205,6 +216,10 @@ function humanReadableReason(detail: any) {
   const planningResult = detail?.reviewResolution?.planningResult;
   if (planningResult && planningResult.recovered !== true) return reviewReasonMetadata["planning-recovery-pending"].explanation;
   const reasons = detail?.reviewReasons || [];
+  if (detail?.objectType === "production-profile"
+    && reasons.some((entry: any) => entry.type === "production-attribution-conflict")) {
+    return reviewReasonMetadata["production-attribution-conflict"].explanation;
+  }
   const priority = ["planning-recovery-pending", "evidence-conflict", "human-ruling-conflict", "inference-change", "new-observation"];
   const reason = priority.find((type) => reasons.some((entry: any) => entry.type === type));
   if (reason) return reviewReasonMetadata[reason].explanation;
@@ -670,6 +685,15 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                 {next && <span className={broken ? "breakpoint" : ""} aria-label={broken ? `断点：${relationItemLabel(node)}到${relationItemLabel(next)}` : `${relationItemLabel(node)}合成为${relationItemLabel(next)}`}>{broken ? "链条断点" : "×2 →"}</span>}
               </div>;
             })}</div>
+          </section>}
+          {detail.objectType === "production-profile" && <section className="production-profile-review" role="region" aria-label="产出档案内容">
+            <div className="production-profile-head"><div><span className="eyebrow">关系上下文</span><h3>产出档案</h3></div><strong>集合由真实动作自动维护</strong></div>
+            <p className="independent-review-note">档案只说明所属产出物、候选产物和可用档位；每个产出档位独立裁决体力与产物分布。</p>
+            <div className="production-profile-groups">
+              <div><span>所属产出物</span><button className="production-profile-item producer" onClick={() => detail.productionProfileContext?.producer && focusRelatedObject("item-identity", detail.productionProfileContext.producer.itemKey)}>{detail.productionProfileContext?.producer?.iconUrl ? <img src={detail.productionProfileContext.producer.iconUrl} alt=""/> : <Image/>}<strong>{productionProfileItemLabel(detail.productionProfileContext?.producer)}</strong></button></div>
+              <div><span>候选产物集合</span><div className="production-profile-items">{detail.productionProfileContext?.candidateOutputs?.length ? detail.productionProfileContext.candidateOutputs.map((item: any) => <button className="production-profile-item" key={item.itemKey} onClick={() => focusRelatedObject("item-identity", item.itemKey)}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{productionProfileItemLabel(item)}</strong></button>) : <p>尚未取得可归因的真实产物。</p>}</div></div>
+              <div><span>可用产出档位</span><div className="production-profile-modes">{detail.productionProfileContext?.productionModes?.length ? detail.productionProfileContext.productionModes.map((mode: any) => <button key={mode.modeId} onClick={() => focusRelatedObject("production-mode", mode.modeKey)}><strong>{mode.modeId}</strong><small>{mode.unlocked ? "可用" : "未解锁"} · {valueLabel(mode.status)}</small></button>) : <p>尚未观测到可用产出档位。</p>}</div></div>
+            </div>
           </section>}
           <div className="candidate-snapshot">
             <h3>本次将确认的完整候选</h3>

@@ -1757,7 +1757,9 @@ class CdpRuntimeControlAdapter {
         step: 1,
         type: "produce",
         producer: producerIndex,
-        producerItemId: null, // resolved from baseline when available
+        producerItemId: command.plannedAction.producerItemId == null
+          ? null
+          : String(command.plannedAction.producerItemId),
         productionModeId: semanticCommand.expectedProductionModeId,
         actualOutputItemIds: producedItemIds,
         touches,

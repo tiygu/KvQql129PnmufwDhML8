@@ -725,6 +725,9 @@ class AutomationDatabase {
       const versionId = Number(inserted.lastInsertRowid);
       this.db.prepare("UPDATE catalog_repository_objects SET status='active',candidate_version_id=NULL,active_version_id=?,revision=?,updated_at=? WHERE id=?")
         .run(versionId, nextRevision, now, before.id);
+      if (identity.objectType === "production-profile") {
+        this.resolveCatalogConflicts(identity.objectType, identity.objectId, "production-attribution-conflict");
+      }
       const after = this._catalogObjectRow(identity.objectType, identity.objectId);
       this._recordCatalogTransition(after, {
         fromStatus: before.status,
@@ -1149,7 +1152,14 @@ class AutomationDatabase {
       if (row.status === "observed") semanticReasons.push({ type: "new-observation", message: "新观测等待更多证据或人工检查" });
       if (row.candidate_version_id != null) semanticReasons.push({ type: "inference-change", message: "存在尚未生效的算法候选" });
       for (const conflict of conflictsByObject.get(`${row.object_type}:${row.object_id}`) || []) {
-        semanticReasons.push({ type: "evidence-conflict", conflictType: conflict.conflict_type, details: parseJson(conflict.details_json), message: "证据来源存在冲突" });
+        const productionAttribution = row.object_type === "production-profile"
+          && conflict.conflict_type === "production-attribution-conflict";
+        semanticReasons.push({
+          type: productionAttribution ? "production-attribution-conflict" : "evidence-conflict",
+          conflictType: conflict.conflict_type,
+          details: parseJson(conflict.details_json),
+          message: productionAttribution ? "产出动作来源或归因互相矛盾" : "证据来源存在冲突",
+        });
       }
       const version = versionById.get(Number(row.active_version_id)) || versionById.get(Number(row.candidate_version_id)) || latestVersionByObject.get(Number(row.id));
       const algorithmCandidate = parseJson(version?.payload_json) || {};
@@ -1182,6 +1192,16 @@ class AutomationDatabase {
             displayTitle: `“${source.name}”的合成关系${source.level == null ? "" : `（第 ${source.level} 级）`}`,
             titleState: "relation",
             baseTitle: `“${source.name}”的合成关系`,
+          };
+        }
+      }
+      if (row.object_type === "production-profile") {
+        const producer = this._catalogIdentityDescriptor(algorithmCandidate.producerItemId ?? row.object_id);
+        if (producer) {
+          title = {
+            displayTitle: `“${producer.name}”的产出档案${producer.level == null ? "" : `（第 ${producer.level} 级）`}`,
+            titleState: "production-profile",
+            baseTitle: `“${producer.name}”的产出档案`,
           };
         }
       }
@@ -1566,22 +1586,62 @@ class AutomationDatabase {
     }).filter(Boolean);
     const producers = byType("production-profile").map((summary) => {
       const profile = planningPayload(summary);
-      const planningDistribution = profile?.planningDistribution || profile?.theoreticalDistribution;
-      const outcomes = planningDistribution?.outcomes;
-      if (!profile || !Array.isArray(outcomes) || !itemById.has(String(profile.producerItemId)) || !outcomes.every((outcome) => itemById.has(String(outcome.itemId)))) return null;
+      const producerItemId = String(profile?.producerItemId ?? "");
+      const producerIdentity = itemById.get(producerItemId);
+      if (!profile || !producerIdentity) return null;
+      const requestedModes = new Set((profile.productionModes || []).map(String));
+      let modes = productionModes
+        .filter((mode) => mode.producerItemId === producerItemId && (!requestedModes.size || requestedModes.has(mode.modeId)))
+        .sort((left, right) => left.modeId.localeCompare(right.modeId));
+      if (!modes.length) {
+        const object = this.getCatalogObject("production-profile", summary.objectId);
+        const legacy = [profile, ...(object?.evidence || []).map((entry) => entry.payload).reverse()]
+          .find((payload) => payload?.planningDistribution?.outcomes || payload?.theoreticalDistribution?.outcomes || payload?.drops?.length);
+        const distribution = legacy?.planningDistribution || legacy?.theoreticalDistribution;
+        const outcomes = distribution?.outcomes || legacy?.drops || [];
+        if (outcomes.length && outcomes.every((outcome) => itemById.has(String(outcome.itemId)))) {
+          modes = [{
+            producerItemId,
+            modeId: "legacy-default",
+            energyCost: Number(legacy.energyCost),
+            unlocked: true,
+            switchEntry: { status: "unavailable", method: null },
+            humanLocked: false,
+            inferred: summary.status === "provisional",
+            repositoryRevision: summary.revision,
+            theoreticalDistribution: legacy.theoreticalDistribution || null,
+            observedDistribution: legacy.observedDistribution || null,
+            planningDistribution: legacy.planningDistribution || legacy.theoreticalDistribution || null,
+            confidence: null,
+            uncertaintyMass: null,
+            drops: outcomes.map((outcome) => {
+              const item = itemById.get(String(outcome.itemId));
+              return {
+                itemId: String(outcome.itemId),
+                count: Number(outcome.count ?? outcome.weight ?? 1),
+                probability: Number(outcome.probability),
+                expectedProbability: Number(outcome.probability),
+                uncertainty: null,
+                chainId: item.chainId,
+                level: item.level,
+                baseUnits: item.baseUnits,
+              };
+            }),
+          }];
+        }
+      }
+      if (!modes.length) return null;
+      const primaryMode = modes[0];
       return {
-        itemId: String(profile.producerItemId),
-        chainId: profile.chainId == null ? null : String(profile.chainId),
-        level: profile.level ?? null,
-        energyCost: Number(profile.energyCost),
-        sampleSize: Number(planningDistribution.sampleSpaceSize ?? planningDistribution.sampleSize),
-        drops: outcomes.map((outcome) => {
-          const item = itemById.get(String(outcome.itemId));
-          return { itemId: String(outcome.itemId), count: Number(outcome.weight ?? outcome.count), probability: Number(outcome.probability), chainId: item.chainId, level: item.level, baseUnits: item.baseUnits };
-        }),
+        itemId: producerItemId,
+        chainId: producerIdentity.chainId,
+        level: producerIdentity.level,
+        energyCost: primaryMode.energyCost,
+        sampleSize: Number(primaryMode.planningDistribution?.sampleSpaceSize ?? primaryMode.planningDistribution?.sampleSize ?? 0),
+        drops: primaryMode.drops,
         inferred: summary.status === "provisional",
         repositoryRevision: summary.revision,
-        modes: productionModes.filter((mode) => mode.producerItemId === String(profile.producerItemId)).sort((left, right) => left.modeId.localeCompare(right.modeId)),
+        modes,
       };
     }).filter(Boolean);
     const chains = [...new Set(items.map((item) => item.chainId).filter(Boolean))].sort().map((chainId) => {

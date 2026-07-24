@@ -383,6 +383,42 @@ class AutomationRuntime {
     if (objectType === "item-identity") {
       return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
     }
+    if (objectType === "production-profile") {
+      const profile = object.effectiveValue || object.algorithmCandidate || {};
+      const describeItem = (itemId) => {
+        const identity = this.database.getCatalogObject("item-identity", String(itemId));
+        const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
+        const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
+          .find((candidate) => String(candidate || "").trim());
+        const level = Number(value.level);
+        const selectedIcon = this.database.getSelectedIconCandidate(String(itemId));
+        return {
+          itemKey: String(itemId),
+          name: String(name || "未命名物品").trim(),
+          level: Number.isInteger(level) && level > 0 ? level : null,
+          iconUrl: selectedIcon ? `/api/catalog/icon/${selectedIcon.assetHash}` : null,
+          reviewStatus: identity?.reviewStatus || "clear",
+        };
+      };
+      const productionModes = (profile.productionModes || []).map(String).map((modeId) => {
+        const mode = this.database.getCatalogObject("production-mode", `${object.objectId}:${modeId}`);
+        const value = mode?.effectiveValue || mode?.algorithmCandidate || {};
+        return {
+          modeKey: `${object.objectId}:${modeId}`,
+          modeId,
+          status: mode?.status || "observed",
+          unlocked: value.unlocked !== false,
+        };
+      });
+      return {
+        ...object,
+        productionProfileContext: {
+          producer: describeItem(profile.producerItemId || object.objectId),
+          candidateOutputs: (profile.candidateOutputs || []).map(describeItem),
+          productionModes,
+        },
+      };
+    }
     if (objectType !== "merge-relation") return object;
     const items = this.database.listCatalogObjects({ objectType: "item-identity" }).map((summary) => {
       const identity = this.database.getCatalogObject(summary.objectType, summary.objectId);

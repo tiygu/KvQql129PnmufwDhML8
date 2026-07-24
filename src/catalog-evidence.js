@@ -14,8 +14,38 @@ function buildCatalogEvidenceIndex(database) {
   };
 }
 
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => String(value ?? "")).filter(Boolean))].sort();
+}
+
+function productionProfileSnapshot(payload = {}, { producerItemId, outputItemIds = [], modeIds = [] }) {
+  const distributionCandidate = payload.theoreticalDistribution?.outcomes || payload.planningDistribution?.outcomes || payload.drops;
+  const legacyDistribution = Array.isArray(distributionCandidate) ? distributionCandidate : [];
+  const existingCandidateOutputs = Array.isArray(payload.candidateOutputs) ? payload.candidateOutputs : [];
+  const existingProductionModes = Array.isArray(payload.productionModes) ? payload.productionModes : [];
+  const legacyModes = Array.isArray(payload.modes) ? payload.modes : [];
+  const candidateOutputs = uniqueStrings([
+    ...existingCandidateOutputs,
+    ...legacyDistribution.map((output) => output?.itemId),
+    payload.latestObservedOutputItemId,
+    payload.outputItemId,
+    ...outputItemIds,
+  ]);
+  const normalizedModes = uniqueStrings([
+    ...existingProductionModes,
+    ...legacyModes.map((mode) => mode?.modeId ?? mode),
+    ...modeIds,
+  ]);
+  return {
+    producerItemId: String(producerItemId ?? payload.producerItemId ?? payload.itemId ?? ""),
+    candidateOutputs,
+    productionModes: normalizedModes,
+  };
+}
+
 function collectPassiveCatalogEvidence(database, { state = null, actionDiff = null } = {}) {
   const observations = [];
+  const conflicts = [];
   const observationKeys = new Set();
   const objectCache = new Map();
   const existingObject = (objectType, objectId) => {
@@ -112,21 +142,35 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
       sourceType: "passive-action-diff", sourceRef: "verified-merge", countDuplicate: false,
     });
   }
-  if (actionDiff?.type === "produce" && actionDiff.producerItemId != null && (actionDiff.outputItemId ?? actionDiff.actualOutputItemId) != null) {
+  const actionOutputItemIds = uniqueStrings([
+    ...(actionDiff?.actualOutputItemIds || []),
+    actionDiff?.outputItemId,
+    actionDiff?.actualOutputItemId,
+  ]);
+  if (actionDiff?.type === "produce" && actionDiff.verified === true) {
+    for (const outputItemId of actionOutputItemIds) addObservedItem(outputItemId, {}, "action-diff:production-output");
+  }
+  if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.attributable !== false
+    && actionDiff.producerItemId != null && actionOutputItemIds.length) {
     const producerItemId = String(actionDiff.producerItemId);
-    const outputItemId = String(actionDiff.outputItemId ?? actionDiff.actualOutputItemId);
-    addObservedItem(outputItemId, {}, "action-diff:production-output");
     const existing = existingObject("production-profile", producerItemId);
     addObservation({
       objectType: "production-profile", objectId: producerItemId,
-      payload: { ...(existing?.effectiveValue || existing?.algorithmCandidate || {}), producerItemId, latestObservedOutputItemId: outputItemId },
-      sourceType: "passive-action-diff", sourceRef: "verified-production", countDuplicate: false,
+      payload: productionProfileSnapshot(existing?.effectiveValue || existing?.algorithmCandidate, {
+        producerItemId,
+        outputItemIds: actionOutputItemIds,
+        modeIds: actionDiff.productionModeId == null ? [] : [actionDiff.productionModeId],
+      }),
+      sourceType: "verified-production-profile",
+      sourceRef: `verified-production:${actionDiff.actionId || "runtime"}`,
+      countDuplicate: false,
     });
   }
-  if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.producerItemId != null && actionDiff.productionModeId != null && actionDiff.actualOutputItemIds?.length) {
+  if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.attributable !== false
+    && actionDiff.producerItemId != null && actionDiff.productionModeId != null && actionOutputItemIds.length) {
     const producerItemId = String(actionDiff.producerItemId), modeId = String(actionDiff.productionModeId);
-    const counts = new Map(actionDiff.actualOutputItemIds.map(String).map((itemId) => [itemId, 0]));
-    for (const itemId of actionDiff.actualOutputItemIds.map(String)) counts.set(itemId, (counts.get(itemId) || 0) + 1);
+    const counts = new Map(actionOutputItemIds.map((itemId) => [itemId, 0]));
+    for (const itemId of (actionDiff.actualOutputItemIds || actionOutputItemIds).map(String)) counts.set(itemId, (counts.get(itemId) || 0) + 1);
     const existing = existingObject("production-mode", `${producerItemId}:${modeId}`);
     addObservation({
       objectType: "production-mode", objectId: `${producerItemId}:${modeId}`,
@@ -136,9 +180,39 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
       },
       sourceType: "verified-production-mode", sourceRef: `verified-production-mode:${producerItemId}:${modeId}`,
     });
-    recordProductionObservation({ actionId: actionDiff.actionId, producerItemId, modeId, outcomeItemIds: actionDiff.actualOutputItemIds, attributable: true });
+    recordProductionObservation({ actionId: actionDiff.actionId, producerItemId, modeId, outcomeItemIds: actionOutputItemIds, attributable: true });
   }
-  if (actionDiff?.uncertain === true || actionDiff?.type === "producer-touch" && actionDiff?.attributable === false) {
+  if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.producerItemId != null
+    && actionDiff.attributionConflict) {
+    const producerItemId = String(actionDiff.producerItemId);
+    const existing = existingObject("production-profile", producerItemId);
+    const payload = productionProfileSnapshot(existing?.effectiveValue || existing?.algorithmCandidate, {
+      producerItemId,
+    });
+    addObservation({
+      objectType: "production-profile",
+      objectId: producerItemId,
+      payload,
+      sourceType: "production-attribution-conflict",
+      sourceRef: `production-attribution-conflict:${actionDiff.actionId || "runtime"}`,
+      countDuplicate: false,
+    });
+    conflicts.push({
+      objectType: "production-profile",
+      objectId: producerItemId,
+      conflictType: "production-attribution-conflict",
+      details: {
+        actionId: actionDiff.actionId || null,
+        productionModeId: actionDiff.productionModeId == null ? null : String(actionDiff.productionModeId),
+        candidateProducerItemIds: uniqueStrings(actionDiff.attributionConflict.candidateProducerItemIds || [producerItemId]),
+        sourceRefs: uniqueStrings(actionDiff.attributionConflict.sourceRefs || []),
+        reason: actionDiff.attributionConflict.reason || "production-action-source-or-attribution-conflict",
+      },
+      countDuplicate: false,
+    });
+  }
+  if (actionDiff?.uncertain === true || actionDiff?.type === "producer-touch" && actionDiff?.attributable === false
+    || actionDiff?.attributionConflict) {
     recordProductionObservation({
       actionId: actionDiff.actionId,
       producerItemId: actionDiff.producerItemId ?? null,
@@ -147,9 +221,10 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
       reason: actionDiff.reason || "production-action-uncertain",
     });
   }
-  if (!observations.length) return [];
+  if (!observations.length && !conflicts.length) return [];
   database.observeCatalogBatch(observations);
+  for (const conflict of conflicts) database.recordCatalogConflict(conflict);
   return observations.map((observation) => `${observation.objectType}:${observation.objectId}`);
 }
 
-module.exports = { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence };
+module.exports = { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence, productionProfileSnapshot };

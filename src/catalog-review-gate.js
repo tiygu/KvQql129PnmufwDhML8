@@ -1,6 +1,5 @@
 "use strict";
 
-const { distributionFromDrops, observedDistribution } = require("./catalog-migration");
 const { canonicalJson } = require("./canonical-json");
 
 const STRUCTURED_SOURCES = new Set(["runtime-capture", "structured-runtime", "legacy-migration"]);
@@ -39,15 +38,28 @@ function relationPayload(payload) {
   };
 }
 
+function uniqueStrings(values) {
+  return [...new Set(values.map((value) => String(value ?? "")).filter(Boolean))].sort();
+}
+
 function profilePayload(payload) {
-  if (payload.theoreticalDistribution) return payload;
+  const distributionCandidate = payload.theoreticalDistribution?.outcomes || payload.planningDistribution?.outcomes || payload.drops;
+  const legacyDistribution = Array.isArray(distributionCandidate) ? distributionCandidate : [];
+  const candidateOutputs = Array.isArray(payload.candidateOutputs) ? payload.candidateOutputs : [];
+  const productionModes = Array.isArray(payload.productionModes) ? payload.productionModes : [];
+  const legacyModes = Array.isArray(payload.modes) ? payload.modes : [];
   return {
     producerItemId: String(payload.producerItemId ?? payload.itemId ?? ""),
-    chainId: payload.chainId == null ? null : String(payload.chainId),
-    level: payload.level ?? null,
-    energyCost: Number(payload.energyCost),
-    theoreticalDistribution: distributionFromDrops(payload.drops || [], payload.sampleSize),
-    observedDistribution: observedDistribution([]),
+    candidateOutputs: uniqueStrings([
+      ...candidateOutputs,
+      ...legacyDistribution.map((output) => output?.itemId),
+      payload.latestObservedOutputItemId,
+      payload.outputItemId,
+    ]),
+    productionModes: uniqueStrings([
+      ...productionModes,
+      ...legacyModes.map((mode) => mode?.modeId ?? mode),
+    ]),
   };
 }
 
@@ -86,6 +98,10 @@ class CatalogReviewGate {
   }
 
   _recordEvidenceConflict(object, evidence) {
+    if (object.objectType === "production-profile") {
+      this.database.resolveCatalogConflicts(object.objectType, object.objectId, "evidence-conflict");
+      return;
+    }
     const normalize = object.objectType === "item-identity" ? identityPayload
       : object.objectType === "merge-relation" ? relationPayload
         : object.objectType === "production-mode" ? modePayload : profilePayload;
@@ -176,23 +192,16 @@ class CatalogReviewGate {
     }
 
     const payload = profilePayload(selected.payload);
-    const outcomes = Array.isArray(payload.theoreticalDistribution?.outcomes) ? payload.theoreticalDistribution.outcomes : [];
-    const sampleSize = Number(payload.theoreticalDistribution?.sampleSpaceSize);
-    const probabilitySum = outcomes.reduce((sum, outcome) => sum + Number(outcome.probability), 0);
-    const countSum = outcomes.reduce((sum, outcome) => sum + Number(outcome.weight), 0);
-    const producerIdentity = this.database.getCatalogObject("item-identity", String(payload.producerItemId));
-    const outputsActive = outcomes.every((outcome) => {
-      const identity = this.database.getCatalogObject("item-identity", String(outcome.itemId));
-      return identity?.status === "active" && identity.disposition === "enabled";
-    });
-    const distributionValid = payload.producerItemId === object.objectId && Number.isFinite(payload.energyCost) && payload.energyCost >= 0
-      && Number.isInteger(sampleSize) && sampleSize > 0 && outcomes.length > 0
-      && outcomes.every((outcome) => Number.isInteger(Number(outcome.weight)) && Number(outcome.weight) >= 0 && Number.isFinite(Number(outcome.probability)) && Number(outcome.probability) >= 0 && Number(outcome.probability) <= 1)
-      && Math.abs(probabilitySum - 1) <= 1e-9 && countSum === sampleSize;
-    const dependenciesActive = producerIdentity?.status === "active" && producerIdentity.disposition === "enabled" && outputsActive;
-    if (structured && distributionValid && dependenciesActive) return { status: "active", payload, reason: "structured-runtime-consistent:production-profile" };
-    if (distributionValid) return { status: "provisional", payload, reason: structured ? "structured-runtime-incomplete:production-profile" : `provisional-only-source:${selected.sourceType}` };
-    return { status: "observed", payload, reason: "distribution-inconsistent:production-profile" };
+    const valid = payload.producerItemId === object.objectId
+      && payload.candidateOutputs.every(Boolean)
+      && payload.productionModes.every(Boolean);
+    if (valid) {
+      const reason = selected.sourceType === "verified-production-profile"
+        ? "attributable-production-consistent:production-profile"
+        : "source-consistent:production-profile";
+      return { status: "active", payload, reason };
+    }
+    return { status: "observed", payload, reason: "production-profile-identity-inconsistent" };
   }
 
   evaluateObject(objectType, objectId) {

@@ -128,7 +128,7 @@ test("图鉴审核展示以后再看集合，并从规划结果与版本基线�
   assert.doesNotMatch(differenceBody, /JSON\.stringify\(oldValue/);
 });
 
-test("图鉴差异使用冲突证据候选，产出档案展示实际领域字段", () => {
+test("图鉴差异使用冲突证据候选，产出档案只展示所属产出物与自动维护集合", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   const candidateBody = source.slice(source.indexOf("function reviewCandidate"), source.indexOf("function meaningfulDifferences"));
   const fieldMap = source.slice(source.indexOf("const domainFieldOrder"), source.indexOf("function domainFields"));
@@ -137,9 +137,13 @@ test("图鉴差异使用冲突证据候选，产出档案展示实际领域字�
   assert.match(candidateBody, /detail\?\.evidence/);
   assert.match(candidateBody, /evidence\.disposition === "eligible"/);
   assert.match(candidateBody, /display\(evidence\.payload\) !== display\(baseline\)/);
-  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"energyCost"/);
-  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"theoreticalDistribution"/);
-  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"observedDistribution"/);
+  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"candidateOutputs"/);
+  assert.match(fieldMap, /"production-profile":\s*\[[^\]]*"productionModes"/);
+  assert.doesNotMatch(fieldMap, /"production-profile":\s*\[[^\]]*"energyCost"/);
+  assert.doesNotMatch(fieldMap, /"production-profile":\s*\[[^\]]*"theoreticalDistribution"/);
+  assert.doesNotMatch(fieldMap, /"production-profile":\s*\[[^\]]*"observedDistribution"/);
+  assert.match(source, /aria-label="产出档案内容"/);
+  assert.match(source, /集合由真实动作自动维护/);
 });
 
 test("图鉴证据风险入口直接定位第一个真实阻塞项", () => {
