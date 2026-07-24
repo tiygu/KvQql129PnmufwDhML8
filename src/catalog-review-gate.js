@@ -119,13 +119,21 @@ class CatalogReviewGate {
     this._recordEvidenceConflict(object, evidence);
     const structured = this._structuredEvidence(evidence);
     const provisional = this._provisionalEvidence(evidence);
-    const selected = structured || provisional || evidence.at(-1);
+    const verifiedMerge = object.objectType === "merge-relation"
+      ? [...evidence].reverse().find((item) => item.sourceType === "passive-action-diff" && item.payload?.mergeTarget != null)
+      : null;
+    const selected = verifiedMerge || structured || provisional || evidence.at(-1);
 
     if (object.objectType === "item-identity") {
       const payload = identityPayload(selected.payload);
       const consistent = payload.itemId === object.objectId && payload.chainId && Number.isInteger(payload.level) && payload.level > 0
         && Number.isFinite(payload.baseUnits) && payload.baseUnits > 0 && payload.baseUnits === 2 ** (payload.level - 1);
+      const passiveObservation = [...evidence].reverse().find((item) => item.sourceType === "passive-runtime");
+      const inferredObservation = [...evidence].reverse().find((item) => item.sourceType === "structural-inference");
+      const passivelyConfirmed = passiveObservation && inferredObservation
+        && canonicalJson(identityPayload(passiveObservation.payload)) === canonicalJson(identityPayload(inferredObservation.payload));
       if (structured && consistent) return { status: "active", payload, reason: "structured-runtime-consistent:item-identity" };
+      if (passivelyConfirmed && consistent) return { status: "active", payload, reason: "passive-runtime-consistent:item-identity" };
       if ((provisional || selected.sourceType === "historic-action") && consistent) return { status: "provisional", payload, reason: `provisional-only-source:${selected.sourceType}` };
       return { status: "observed", payload, reason: consistent ? "insufficient-source-authority:item-identity" : "identity-inconsistent" };
     }
@@ -144,6 +152,7 @@ class CatalogReviewGate {
         const target = this.database.getCatalogObject("item-identity", payload.mergeTarget);
         dependenciesActive = target?.status === "active" && target.disposition === "enabled";
       }
+      if (verifiedMerge && shapeValid && dependenciesActive) return { status: "active", payload, reason: "passive-merge-consistent:merge-relation" };
       if (structured && shapeValid && dependenciesActive) return { status: "active", payload, reason: "structured-runtime-consistent:merge-relation" };
       if (shapeValid) return { status: "provisional", payload, reason: structured ? "structured-runtime-incomplete:merge-relation" : `provisional-only-source:${selected.sourceType}` };
       return { status: "observed", payload, reason: "relation-inconsistent" };

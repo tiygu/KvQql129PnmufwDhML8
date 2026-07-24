@@ -201,6 +201,7 @@ function relationValidationError(source: any, target: any, requiredCount: string
 }
 
 function humanReadableReason(detail: any) {
+  if (waitingForMergeObservation(detail)) return "这个合成结果还没有在真实订单推进中出现；结果字段保持只读，请返回自动化继续收集线索。";
   const planningResult = detail?.reviewResolution?.planningResult;
   if (planningResult && planningResult.recovered !== true) return reviewReasonMetadata["planning-recovery-pending"].explanation;
   const reasons = detail?.reviewReasons || [];
@@ -209,6 +210,16 @@ function humanReadableReason(detail: any) {
   if (reason) return reviewReasonMetadata[reason].explanation;
   if (detail?.completenessGaps?.length) return reviewReasonMetadata["icon-gap"].explanation;
   return reviewReasonMetadata["new-observation"].explanation;
+}
+
+function waitingForMergeObservation(detail: any) {
+  if (detail?.objectType !== "merge-relation") return false;
+  const candidate = detail?.algorithmCandidate || detail?.effectiveValue || {};
+  const hasInference = (detail?.evidence || []).some((evidence: any) => evidence.disposition !== "rejected" && evidence.sourceType === "structural-inference");
+  const hasVerifiedMerge = (detail?.evidence || []).some((evidence: any) => evidence.disposition !== "rejected"
+    && evidence.sourceType === "passive-action-diff" && evidence.payload?.mergeTarget != null);
+  const target = (detail?.relationContext?.items || []).find((item: any) => item.objectId === candidate.mergeTarget);
+  return hasInference && !hasVerifiedMerge && (!candidate.mergeTarget || !target || target.reviewStatus !== "clear");
 }
 
 function planningBoundaryText(boundaryReason: any) {
@@ -238,7 +249,7 @@ function markIconSelected(value: any, candidateId: number) {
   return { ...value, iconCandidates, selectedIcon: iconCandidates.find((candidate: any) => candidate.selected) || value?.selectedIcon || null };
 }
 
-export function CatalogReviewWorkspace({ repository, onChanged, focusObject = null }: { repository: any; onChanged: () => Promise<any>; focusObject?: { objectType: string; objectId: string } | null }) {
+export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutomation, focusObject = null }: { repository: any; onChanged: () => Promise<any>; onContinueAutomation?: () => void; focusObject?: { objectType: string; objectId: string } | null }) {
   const queue = repository?.reviewQueue || [];
   const laterQueue = repository?.laterQueue || [];
   const objects = repository?.objects || [];
@@ -340,6 +351,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
   const relationItems = detail?.relationContext?.items || [];
   const relationSource = relationItems.find((item: any) => item.objectId === detail?.objectId) || null;
   const relationTarget = relationItems.find((item: any) => item.objectId === relationDraft.mergeTarget) || null;
+  const waitingForMoreClues = waitingForMergeObservation(detail);
   const relationSnapshot = useMemo(() => ({
     ...structuredClone(reviewCandidate),
     itemId: detail?.objectId,
@@ -350,7 +362,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
     () => snapshotDifferences(reviewCandidate, relationSnapshot, ["requiredCount", "mergeTarget"]),
     [relationSnapshot, reviewCandidate],
   );
-  const relationError = detail?.objectType === "merge-relation"
+  const relationError = detail?.objectType === "merge-relation" && !waitingForMoreClues
     ? relationValidationError(relationSource, relationTarget, relationDraft.requiredCount)
     : "";
   const relationDecision: "confirm" | "modify" = relationDifferences.length ? "modify" : "confirm";
@@ -641,7 +653,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
             <div className="merge-relation-form">
               <button className="relation-source-choice" aria-label={`来源物 ${relationItemLabel(relationSource)}`} onClick={() => relationSource && focusRelatedObject("item-identity", relationObjectKey(relationSource))}>{relationSource?.iconUrl ? <img src={relationSource.iconUrl} alt=""/> : <Image/>}<span><small>来源物</small><strong>{relationItemLabel(relationSource)}</strong></span></button>
               <label><span>所需数量</span><input aria-label="所需数量" type="number" min="2" max="2" step="1" value={relationDraft.requiredCount} onChange={(event) => setRelationDraft((current) => ({ ...current, requiredCount: event.target.value }))}/><small>同级物品固定为 2 个</small></label>
-              <div className="relation-target-choices"><span>结果物</span><div>{relationItems.map((item: any) => <button key={relationObjectKey(item)} className={relationObjectKey(item) === relationDraft.mergeTarget ? "selected" : ""} aria-label={`选择结果物 ${relationItemLabel(item)}`} onClick={() => { setRelationDraft((current) => ({ ...current, mergeTarget: relationObjectKey(item) })); setMessage(""); }}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{item.name}</strong><small>{item.level == null ? "等级未知" : `第 ${item.level} 级`}</small></button>)}</div></div>
+              {waitingForMoreClues
+                ? <label><span>结果物</span><input aria-label="结果物" value="等待真实观测" readOnly/><small>结果尚未真实出现，等待正常订单推进产生可归因观测。</small></label>
+                : <div className="relation-target-choices"><span>结果物</span><div>{relationItems.map((item: any) => <button key={relationObjectKey(item)} className={relationObjectKey(item) === relationDraft.mergeTarget ? "selected" : ""} aria-label={`选择结果物 ${relationItemLabel(item)}`} onClick={() => { setRelationDraft((current) => ({ ...current, mergeTarget: relationObjectKey(item) })); setMessage(""); }}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{item.name}</strong><small>{item.level == null ? "等级未知" : `第 ${item.level} 级`}</small></button>)}</div></div>}
             </div>
             {relationError && <p className="relation-validation-error" role="alert"><AlertTriangle size={15}/>{relationError}</p>}
             <div className="relation-chain-head"><div><strong>完整合成链</strong><span>当前焦点高亮；虚线节点表示未知等级或断点。</span></div><div><button aria-label="合成链向左浏览" onClick={() => relationChainRef.current?.scrollBy({ left: -280, behavior: "smooth" })}><ChevronLeft size={16}/></button><button aria-label="合成链向右浏览" onClick={() => relationChainRef.current?.scrollBy({ left: 280, behavior: "smooth" })}><ChevronRight size={16}/></button></div></div>
@@ -671,7 +685,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
             <h3>有意义的差异</h3>
             {visibleDifferences.length ? visibleDifferences.map((difference) => <p key={difference.field}><strong>{fieldLabel(difference.field)}</strong><span>{detail.objectType === "merge-relation" && difference.field === "mergeTarget" ? `${relationItemLabel(relationItems.find((item: any) => relationObjectKey(item) === difference.oldValue))} → ${relationItemLabel(relationItems.find((item: any) => relationObjectKey(item) === difference.newValue))}` : `${display(difference.oldValue)} → ${display(difference.newValue)}`}</span></p>) : <p>{detail.objectType === "item-identity" ? "身份字段与候选一致；未知值会原样保留。" : detail.objectType === "merge-relation" ? "合成关系与当前候选一致。" : "候选与当前生效的领域信息一致；本次只需确认语义审核原因。"}</p>}
           </div>
-          {selectedSummary?.actionStatus !== "以后再看" && <div className="ruling-editor object-review-editor">
+          {selectedSummary?.actionStatus !== "以后再看" && (waitingForMoreClues
+            ? <div className="waiting-review-state" role="status"><strong>等待更多线索</strong><p>结果尚未真实出现，普通审核动作暂时隐藏。返回自动化后，由正常订单推进继续收集。</p><button className="primary-action" onClick={onContinueAutomation}>返回自动化继续收集</button></div>
+            : <div className="ruling-editor object-review-editor">
             <div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div>
             <label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label>
             <label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label>
@@ -682,7 +698,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, focusObject = nu
               : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
             {message && <p className="review-message" role="status">{message}</p>}
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{detail.catalogAuditSummary.actor} 已{detail.catalogAuditSummary.action === "confirm" ? "确认完整候选" : "修改后确认"}“{detail.catalogAuditSummary.displayTitle}” · {detail.catalogAuditSummary.planningResult?.recovered ? "规划已恢复" : "规划尚未恢复"}</span></div>}
-          </div>}
+          </div>)}
           <details className="technical-review-details">
             <summary>只读技术详情</summary>
             <div className="technical-identity"><strong>内部对象标识</strong><code>{detail.objectType}/{detail.objectId}</code></div>

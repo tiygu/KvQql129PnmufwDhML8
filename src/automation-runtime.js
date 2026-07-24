@@ -26,6 +26,7 @@ const { buildCatalogEvidenceIndex, collectPassiveCatalogEvidence } = require("./
 const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN_SELECTION_EXPRESSION, buildActiveCatalogInspectExpression, buildRestoreCatalogSelectionExpression } = require("./catalog-scan");
 const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
 const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
+const { mergeRelationWaitingForObservation } = require("./catalog-review-state");
 
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -345,7 +346,14 @@ class AutomationRuntime {
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
-      repository.reviewQueue = this.database.getCatalogReviewQueue();
+      repository.reviewQueue = this.database.getCatalogReviewQueue().map((entry) => {
+        if (entry.objectType !== "merge-relation") return entry;
+        const relation = this.database.getCatalogObject(entry.objectType, entry.objectId);
+        const candidate = relation?.algorithmCandidate || relation?.effectiveValue || {};
+        const target = candidate.mergeTarget == null ? null : this.database.getCatalogObject("item-identity", candidate.mergeTarget);
+        const waiting = mergeRelationWaitingForObservation({ relationCandidate: candidate, relationEvidence: relation?.evidence || [], targetIdentity: target });
+        return waiting.waiting ? { ...entry, actionStatus: "等待更多线索", waitingForMoreClues: waiting } : entry;
+      });
       repository.laterQueue = this.database.getCatalogCompletenessQueue();
       repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
       repository.uncertainProductionActions = this.database.listUncertainProductionActions();

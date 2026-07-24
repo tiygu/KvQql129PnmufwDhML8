@@ -19,11 +19,11 @@ function listen(server) {
   });
 }
 
-function seedReviewCandidate(runtime, { objectId, name, level, type = null }) {
+function seedReviewCandidate(runtime, { objectId, name, level, type = null, chainId = "review-chain" }) {
   let object = runtime.database.observeCatalogObject({
     objectType: "item-identity",
     objectId,
-    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name, type },
+    payload: { itemId: objectId, chainId, level, baseUnits: 2 ** (level - 1), name, type },
     sourceType: "structural-inference",
     sourceRef: `${objectId}.json`,
     countDuplicate: false,
@@ -31,7 +31,7 @@ function seedReviewCandidate(runtime, { objectId, name, level, type = null }) {
   object = runtime.database.saveCatalogVersion({
     objectType: "item-identity",
     objectId,
-    payload: { itemId: objectId, chainId: "review-chain", level, baseUnits: 2 ** (level - 1), name, type },
+    payload: { itemId: objectId, chainId, level, baseUnits: 2 ** (level - 1), name, type },
     status: "provisional",
     origin: "inference-gate",
     expectedRevision: object.revision,
@@ -51,11 +51,11 @@ function seedActiveIdentity(runtime, { objectId, name, level, chainId }) {
   return runtime.catalogGate.evaluateObject("item-identity", objectId);
 }
 
-function seedRelation(runtime, { objectId, level, mergeTarget, sourceType = "runtime-capture" }) {
+function seedRelation(runtime, { objectId, level, mergeTarget, sourceType = "runtime-capture", chainId = "browser-flower-chain" }) {
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
     objectId,
-    payload: { itemId: objectId, chainId: "browser-flower-chain", level, requiredCount: 2, mergeTarget },
+    payload: { itemId: objectId, chainId, level, requiredCount: 2, mergeTarget },
     sourceType,
     sourceRef: `${objectId}-relation.json`,
     countDuplicate: false,
@@ -88,6 +88,27 @@ async function main() {
   });
   seedRelation(runtime, { objectId: "flower-3", level: 3, mergeTarget: null });
   seedRelation(runtime, { objectId: "flower-5", level: 5, mergeTarget: null });
+  seedActiveIdentity(runtime, { objectId: "waiting-source", name: "待结果花", level: 1, chainId: "waiting-chain" });
+  seedReviewCandidate(runtime, { objectId: "waiting-target", name: "未见花", level: 2, chainId: "waiting-chain" });
+  seedRelation(runtime, { objectId: "waiting-target", level: 2, mergeTarget: null, chainId: "waiting-chain" });
+  seedRelation(runtime, {
+    objectId: "waiting-source",
+    level: 1,
+    mergeTarget: "waiting-target",
+    sourceType: "structural-inference",
+    chainId: "waiting-chain",
+  });
+  seedActiveIdentity(runtime, { objectId: "conflict-source", name: "歧义花苞", level: 1, chainId: "conflict-chain" });
+  seedReviewCandidate(runtime, { objectId: "predicted-target", name: "推测花", level: 2, chainId: "conflict-chain" });
+  seedActiveIdentity(runtime, { objectId: "actual-target", name: "实见花", level: 2, chainId: "conflict-chain" });
+  seedRelation(runtime, { objectId: "actual-target", level: 2, mergeTarget: null, chainId: "conflict-chain" });
+  seedRelation(runtime, {
+    objectId: "conflict-source",
+    level: 1,
+    mergeTarget: "predicted-target",
+    sourceType: "structural-inference",
+    chainId: "conflict-chain",
+  });
   const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
@@ -211,7 +232,9 @@ async function main() {
   });
   const page = await browser.newPage();
   const completionRequests = [];
+  const postRequests = [];
   page.on("request", (request) => {
+    if (request.method() === "POST") postRequests.push(request.url());
     if (request.method() === "POST" && request.url().endsWith("/api/catalog/review/complete")) {
       completionRequests.push(request.postDataJSON());
     }
@@ -389,6 +412,59 @@ async function main() {
     });
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "flower-2" }).length, 1);
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "item-identity", objectId: "flower-3" }).length, 0);
+
+    const waitingEntry = page.getByRole("button", { name: /“待结果花”的合成关系.*等待更多线索/ });
+    await waitingEntry.click();
+    await page.getByRole("heading", { name: "合成关系独立审核" }).waitFor();
+    await page.getByText(/结果尚未真实出现.*正常订单推进/).first().waitFor();
+    const readOnlyTarget = page.getByRole("textbox", { name: "结果物" });
+    assert.equal(await readOnlyTarget.isEditable(), false);
+    assert.equal(await page.getByRole("button", { name: "确认无误" }).count(), 0);
+    assert.equal(await page.getByRole("button", { name: "修改后确认" }).count(), 0);
+    const postCountBeforeReturn = postRequests.length;
+    await page.getByRole("button", { name: "返回自动化继续收集" }).click();
+    await page.getByRole("heading", { name: /当前棋盘/ }).waitFor();
+    assert.equal(postRequests.length, postCountBeforeReturn);
+    const waitingBeforeObservation = runtime.getCatalogObject("merge-relation", "waiting-source");
+    assert.equal(waitingBeforeObservation.reviewStatus, "needs-review");
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "waiting-source" }).length, 0);
+
+    runtime.queuePassiveCatalogEvidence({
+      actionDiff: {
+        type: "merge",
+        itemId: "waiting-source",
+        actualTarget: "waiting-target",
+        verified: true,
+      },
+    });
+    await runtime.passiveCatalogDrainPromise;
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    assert.equal(await page.getByRole("button", { name: /“待结果花”的合成关系/ }).count(), 0);
+    const waitingAfterObservation = runtime.getCatalogObject("merge-relation", "waiting-source");
+    assert.equal(waitingAfterObservation.status, "active");
+    assert.equal(waitingAfterObservation.reviewStatus, "clear");
+    assert.equal(runtime.getCatalogObject("item-identity", "waiting-target").status, "active");
+    assert.equal(runtime.database.listCatalogAuditSummaries({ objectType: "merge-relation", objectId: "waiting-source" }).length, 0);
+
+    runtime.queuePassiveCatalogEvidence({
+      actionDiff: {
+        type: "merge",
+        itemId: "conflict-source",
+        actualTarget: "actual-target",
+        verified: true,
+      },
+    });
+    await runtime.passiveCatalogDrainPromise;
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    const conflictEntry = page.getByRole("button", { name: /“歧义花苞”的合成关系.*需要处理/ });
+    await conflictEntry.click();
+    await page.getByRole("heading", { name: "合成关系独立审核" }).waitFor();
+    await page.getByText(/不同来源.*含义.*核对/).waitFor();
+    assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).count(), 1);
+    assert.equal(runtime.getCatalogObject("merge-relation", "conflict-source").reviewStatus, "needs-review");
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectType: "merge-relation", objectId: "conflict-source" }).length, 0);
   } finally {
     await browser.close();
     await server.close();
