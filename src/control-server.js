@@ -238,6 +238,14 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         });
         return writeJson(res, 200, object);
       }
+      if (route === "POST /api/catalog/review/preview") {
+        const body = await readJson(req);
+        const snapshotValid = body.snapshot && typeof body.snapshot === "object" && !Array.isArray(body.snapshot);
+        if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !snapshotValid || !Number.isInteger(Number(body.expectedRevision))) {
+          return writeJson(res, 400, { ok: false, error: "invalid-catalog-review-preview-request" });
+        }
+        return writeJson(res, 200, runtime.previewCatalogReview({ ...body, expectedRevision: Number(body.expectedRevision) }));
+      }
       if (route === "POST /api/catalog/review/complete") {
         const body = await readJson(req);
         const snapshotValid = body.snapshot && typeof body.snapshot === "object" && !Array.isArray(body.snapshot);

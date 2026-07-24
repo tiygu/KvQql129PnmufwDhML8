@@ -723,6 +723,26 @@ class AutomationRuntime {
     return this.database.applyCatalogRuling(input);
   }
 
+  previewCatalogReview(input) {
+    const preview = this.database.previewCatalogReview(input);
+    const current = this.getCatalogObject(preview.objectType, preview.objectId);
+    const previewObject = {
+      ...current,
+      effectiveValue: structuredClone(preview.snapshot),
+      algorithmCandidate: structuredClone(preview.snapshot),
+    };
+    const planningImpact = buildCatalogPlanningImpact(this.database, this.lastState, previewObject);
+    return {
+      ...preview,
+      planningImpact: {
+        ...planningImpact,
+        summary: planningImpact.orders.length || planningImpact.relations.length
+          ? `该快照关联 ${planningImpact.orders.length} 个当前订单和 ${planningImpact.relations.length} 条合成关系；保存后会立即重新规划。`
+          : "当前没有直接关联的订单或合成关系；保存后仍会立即重新规划。",
+      },
+    };
+  }
+
   async completeCatalogReview(input) {
     const committed = this.database.completeCatalogReview(input);
     const priorPlanning = committed.reviewResolution?.planningResult;

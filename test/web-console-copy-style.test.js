@@ -113,6 +113,29 @@ test("图鉴审核默认只展示领域摘要，原始数据和完整历史收�
   assert.match(technicalDetail, /对象演变/);
 });
 
+test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验和二次确认后提交完整快照", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const api = read("web/src/control-api.ts");
+  const technicalDetail = source.slice(
+    source.indexOf('<details className="technical-review-details'),
+    source.indexOf('<details className="advanced-review-actions'),
+  );
+
+  assert.match(api, /previewCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/preview",\s*input\)/);
+  assert.match(technicalDetail, /完整对象 JSON[\s\S]*readOnly/);
+  assert.match(technicalDetail, /进入高级 JSON 编辑/);
+  assert.match(source, /高级 JSON 草稿/);
+  assert.match(source, /校验并预览影响/);
+  assert.match(source, /确认提交完整快照/);
+  assert.match(source, /advancedJsonDraft/);
+  assert.match(source, /controlApi\.previewCatalogReview/);
+  assert.match(source, /meaningfulDifferences/);
+  assert.match(source, /planningImpact/);
+  assert.match(source, /fieldPath/);
+  assert.match(source, /保留当前 JSON 草稿/);
+  assert.match(source, /completeReview\("modify",\s*advancedJsonPreview\.snapshot\)/);
+});
+
 test("图鉴审核展示以后再看集合，并从规划结果与版本基线生成人话解释", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   const reasonBody = source.slice(source.indexOf("function humanReadableReason"), source.indexOf("function parseObjectDraft"));

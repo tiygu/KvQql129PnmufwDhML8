@@ -52,9 +52,17 @@ function validateCatalogIdentity(objectType, objectId) {
   return { objectType: normalizedType, objectId: normalizedId };
 }
 
+function catalogSnapshotValidationError(message, fieldPath = "snapshot") {
+  const error = new TypeError(message);
+  error.code = "CATALOG_SNAPSHOT_VALIDATION";
+  error.statusCode = 400;
+  error.fieldPath = fieldPath;
+  return error;
+}
+
 function validateCatalogReviewPayload(identity, payload) {
   if (payload == null || typeof payload !== "object" || Array.isArray(payload) || Object.keys(payload).length === 0) {
-    throw new TypeError("catalog review payload must be a complete object");
+    throw catalogSnapshotValidationError("完整快照必须是包含领域字段的 JSON 对象。", "snapshot");
   }
   const value = structuredClone(payload);
   const payloadObjectId = identity.objectType === "production-profile"
@@ -63,7 +71,13 @@ function validateCatalogReviewPayload(identity, payload) {
       ? `${value.producerItemId ?? value.itemId ?? ""}:${value.modeId ?? ""}`
       : value.itemId ?? value.id;
   if (String(payloadObjectId ?? "") !== identity.objectId) {
-    throw new TypeError(`catalog review payload identity mismatch: ${identity.objectType}/${identity.objectId}`);
+    const fieldPath = identity.objectType === "production-profile" || identity.objectType === "production-mode"
+      ? "producerItemId"
+      : "itemId";
+    throw catalogSnapshotValidationError(
+      `对象标识不匹配：当前审核的是 ${identity.objectType}/${identity.objectId}，快照中的 ${fieldPath} 必须保持一致。`,
+      fieldPath,
+    );
   }
   return value;
 }
@@ -673,6 +687,109 @@ class AutomationDatabase {
     return this.saveCatalogVersion({ ...identity, payload: candidate.payload, status: "active", expectedRevision });
   }
 
+  _validateCatalogReviewSnapshot(identity, submittedSnapshot) {
+    const payload = validateCatalogReviewPayload(identity, submittedSnapshot);
+    if (identity.objectType === "item-identity") {
+      if (payload.level != null && (!Number.isInteger(Number(payload.level)) || Number(payload.level) <= 0)) {
+        throw catalogSnapshotValidationError("Item Identity 等级必须是正整数或未知（使用 null）。", "level");
+      }
+      if (payload.chainId != null && (typeof payload.chainId !== "string" || !payload.chainId.trim())) {
+        throw catalogSnapshotValidationError("合成链标识必须是非空文本，或使用 null 表示未知。", "chainId");
+      }
+      if (payload.baseUnits != null) {
+        const baseUnits = Number(payload.baseUnits);
+        if (!Number.isFinite(baseUnits) || baseUnits <= 0) {
+          throw catalogSnapshotValidationError("基础单位必须是大于 0 的数字。", "baseUnits");
+        }
+      }
+      return payload;
+    }
+    if (identity.objectType === "merge-relation") {
+      if (typeof payload.chainId !== "string" || !payload.chainId.trim()) {
+        throw catalogSnapshotValidationError("合成关系必须包含非空的合成链标识。", "chainId");
+      }
+      if (!Number.isInteger(Number(payload.level)) || Number(payload.level) <= 0) {
+        throw catalogSnapshotValidationError("合成关系等级必须是正整数。", "level");
+      }
+      this._validateMergeRelationSnapshot(identity, payload);
+      return payload;
+    }
+    if (identity.objectType === "production-profile") {
+      if (!this._catalogIdentityDescriptor(payload.producerItemId)) {
+        throw catalogSnapshotValidationError(`所属产出物“${payload.producerItemId}”尚无身份对象，不能建立引用。`, "producerItemId");
+      }
+      for (const fieldPath of ["candidateOutputs", "productionModes"]) {
+        if (!Array.isArray(payload[fieldPath])) {
+          throw catalogSnapshotValidationError(`${fieldPath === "candidateOutputs" ? "候选产物" : "产出档位"}必须是数组。`, fieldPath);
+        }
+      }
+      for (const itemId of payload.candidateOutputs) {
+        if (typeof itemId !== "string" || !itemId || !this._catalogIdentityDescriptor(itemId)) {
+          throw catalogSnapshotValidationError(`候选产物“${String(itemId)}”尚无身份对象，不能建立引用。`, "candidateOutputs");
+        }
+      }
+      for (const modeId of payload.productionModes) {
+        if (typeof modeId !== "string" || !modeId) {
+          throw catalogSnapshotValidationError("产出档位必须使用非空文本标识。", "productionModes");
+        }
+        if (!this._catalogObjectRow("production-mode", `${payload.producerItemId}:${modeId}`)) {
+          throw catalogSnapshotValidationError(`产出档位“${modeId}”尚无独立对象，不能建立引用。`, "productionModes");
+        }
+      }
+      return payload;
+    }
+    if (typeof payload.modeId !== "string" || !payload.modeId.trim()) {
+      throw catalogSnapshotValidationError("产出档位标识必须是非空文本。", "modeId");
+    }
+    if (!this._catalogIdentityDescriptor(payload.producerItemId)) {
+      throw catalogSnapshotValidationError(`所属产出物“${payload.producerItemId}”尚无身份对象，不能建立引用。`, "producerItemId");
+    }
+    if (!Number.isFinite(Number(payload.energyCost)) || Number(payload.energyCost) < 0) {
+      throw catalogSnapshotValidationError("单次体力必须是大于或等于 0 的数字。", "energyCost");
+    }
+    if (!Array.isArray(payload.outputs) || payload.outputs.length === 0) {
+      throw catalogSnapshotValidationError("产出档位至少需要一个产物。", "outputs");
+    }
+    payload.outputs.forEach((output, index) => {
+      const fieldPath = `outputs.${index}`;
+      if (!output || typeof output !== "object" || Array.isArray(output)) {
+        throw catalogSnapshotValidationError(`第 ${index + 1} 个产物必须是对象。`, fieldPath);
+      }
+      if (typeof output.itemId !== "string" || !output.itemId || !this._catalogIdentityDescriptor(output.itemId)) {
+        throw catalogSnapshotValidationError(`第 ${index + 1} 个产物“${String(output.itemId)}”尚无身份对象，不能建立引用。`, `${fieldPath}.itemId`);
+      }
+      if (!Number.isFinite(Number(output.count)) || Number(output.count) <= 0) {
+        throw catalogSnapshotValidationError(`第 ${index + 1} 个产物数量必须大于 0。`, `${fieldPath}.count`);
+      }
+      if (!Number.isFinite(Number(output.probability)) || Number(output.probability) <= 0 || Number(output.probability) > 1) {
+        throw catalogSnapshotValidationError(`第 ${index + 1} 个产物概率必须大于 0 且不超过 1。`, `${fieldPath}.probability`);
+      }
+    });
+    if (!payload.switchEntry || !["available", "unavailable"].includes(payload.switchEntry.status)) {
+      throw catalogSnapshotValidationError("档位切换状态必须是 available 或 unavailable。", "switchEntry.status");
+    }
+    return payload;
+  }
+
+  previewCatalogReview(input) {
+    const identity = validateCatalogIdentity(input.objectType, input.objectId);
+    const object = this._catalogObjectRow(identity.objectType, identity.objectId);
+    if (!object) throw new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`);
+    this._assertCatalogRevision(object, input.expectedRevision);
+    const payload = this._validateCatalogReviewSnapshot(identity, input.snapshot);
+    const algorithmCandidate = this._catalogAlgorithmCandidate(object);
+    const effectiveBefore = [...this._activeCatalogRulings(object.id).values()]
+      .reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
+    return {
+      valid: true,
+      objectType: identity.objectType,
+      objectId: identity.objectId,
+      revision: Number(object.revision),
+      snapshot: payload,
+      meaningfulDifferences: meaningfulCatalogDifferences(effectiveBefore, payload),
+    };
+  }
+
   completeCatalogReview(input) {
     const identity = validateCatalogIdentity(input.objectType, input.objectId);
     const decision = String(input.decision || "");
@@ -692,12 +809,7 @@ class AutomationDatabase {
       if (!before) throw new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`);
       const algorithmCandidate = this._catalogAlgorithmCandidate(before);
       const submittedSnapshot = input.snapshot ?? input.payload ?? (decision === "confirm" ? algorithmCandidate : null);
-      const payload = validateCatalogReviewPayload(identity, submittedSnapshot);
-      if (identity.objectType === "item-identity" && payload.level != null
-        && (!Number.isInteger(Number(payload.level)) || Number(payload.level) <= 0)) {
-        throw new TypeError("Item Identity 等级必须是正整数或未知");
-      }
-      if (identity.objectType === "merge-relation") this._validateMergeRelationSnapshot(identity, payload);
+      const payload = this._validateCatalogReviewSnapshot(identity, submittedSnapshot);
       const requestFingerprint = canonicalJson({
         objectType: identity.objectType,
         objectId: identity.objectId,

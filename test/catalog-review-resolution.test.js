@@ -148,6 +148,63 @@ test("修改后确认拒绝无效的 Item Identity 等级", () => withDatabase((
   assert.equal(database.getCatalogObject(identity.objectType, identity.objectId).revision, identity.revision);
 }));
 
+test("高级 JSON 快照预校验定位结构、引用和领域错误且不改变生效数据或草稿基线", () => withDatabase((database) => {
+  const identity = provisionalIdentity(database, "advanced-json-item");
+  const before = database.getCatalogObject(identity.objectType, identity.objectId);
+
+  assert.throws(() => database.previewCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    snapshot: { ...identity.algorithmCandidate, itemId: "wrong-item" },
+    expectedRevision: identity.revision,
+  }), (error) => {
+    assert.equal(error.code, "CATALOG_SNAPSHOT_VALIDATION");
+    assert.equal(error.statusCode, 400);
+    assert.equal(error.fieldPath, "itemId");
+    assert.match(error.message, /对象标识.*advanced-json-item/);
+    return true;
+  });
+
+  assert.throws(() => database.previewCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    snapshot: { ...identity.algorithmCandidate, level: 0 },
+    expectedRevision: identity.revision,
+  }), (error) => {
+    assert.equal(error.code, "CATALOG_SNAPSHOT_VALIDATION");
+    assert.equal(error.fieldPath, "level");
+    assert.match(error.message, /等级.*正整数.*未知/);
+    return true;
+  });
+
+  const snapshot = { ...identity.algorithmCandidate, name: "高级编辑后的园艺手套" };
+  const preview = database.previewCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    snapshot,
+    expectedRevision: identity.revision,
+  });
+  assert.deepEqual(preview, {
+    valid: true,
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    revision: identity.revision,
+    snapshot,
+    meaningfulDifferences: [{
+      fieldPath: "name",
+      oldValue: "园艺手套",
+      newValue: "高级编辑后的园艺手套",
+    }],
+  });
+
+  const after = database.getCatalogObject(identity.objectType, identity.objectId);
+  assert.equal(after.revision, before.revision);
+  assert.deepEqual(after.activeVersion, before.activeVersion);
+  assert.deepEqual(after.candidateVersion, before.candidateVersion);
+  assert.equal(database.listCatalogReviewResolutions({ objectId: identity.objectId }).length, 0);
+  assert.equal(database.listCatalogAuditSummaries({ objectId: identity.objectId }).length, 0);
+}));
+
 test("修改后确认保存完整 Item Identity 和稳定审计说明且不确认 Merge Relation", () => withDatabase((database) => {
   const identity = provisionalIdentity(database, "modified-identity");
   assert.equal(identity.algorithmCandidate.name, "园艺手套");

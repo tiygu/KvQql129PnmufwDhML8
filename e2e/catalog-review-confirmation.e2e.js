@@ -149,6 +149,11 @@ async function main() {
     },
   });
   const editable = seedReviewCandidate(runtime, { objectId: "browser-edit", name: "旧名称", level: 2 });
+  const advancedJsonEditable = seedReviewCandidate(runtime, {
+    objectId: "browser-json-edit",
+    name: "JSON 草稿对象",
+    level: 4,
+  });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
     objectId: editable.objectId,
@@ -218,7 +223,10 @@ async function main() {
   });
   runtime.lastState = {
     ...runtime.lastState,
-    orders: [{ slot: "pause-order", items: [{ itemId: "browser-next", complete: false }] }],
+    orders: [
+      { slot: "pause-order", items: [{ itemId: "browser-next", complete: false }] },
+      { slot: "json-order", items: [{ itemId: advancedJsonEditable.objectId, complete: false }] },
+    ],
   };
   let relatedConflictSeeded = false;
   runtime.catalogReviewReplanner = async ({ input }) => {
@@ -413,6 +421,51 @@ async function main() {
     const restored = runtime.getCatalogObject("item-identity", "browser-first");
     assert.equal(restored.reviewStatus, "clear");
     assert.deepEqual(restored.effectiveValue, confirmationRequest.snapshot);
+
+    const advancedJsonEntry = page.getByRole("button", { name: /疑似“JSON 草稿对象”/ });
+    await advancedJsonEntry.click();
+    await page.getByRole("heading", { name: "疑似“JSON 草稿对象”" }).waitFor();
+    await page.getByText("只读技术详情", { exact: true }).click();
+    const readOnlyJson = page.getByRole("textbox", { name: "完整对象 JSON" });
+    assert.equal(await readOnlyJson.isEditable(), false);
+    assert.equal(await page.getByRole("textbox", { name: "高级 JSON 草稿" }).count(), 0);
+    await page.getByRole("button", { name: "进入高级 JSON 编辑" }).click();
+    const advancedJsonDraft = page.getByRole("textbox", { name: "高级 JSON 草稿" });
+    const advancedBefore = runtime.getCatalogObject("item-identity", advancedJsonEditable.objectId);
+    await advancedJsonDraft.fill("{");
+    await page.getByRole("button", { name: "校验并预览影响" }).click();
+    await page.getByRole("alert").filter({ hasText: /定位：JSON.*保留当前 JSON 草稿/ }).waitFor();
+    assert.equal(await advancedJsonDraft.inputValue(), "{");
+    assert.equal(runtime.getCatalogObject("item-identity", advancedJsonEditable.objectId).revision, advancedBefore.revision);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: advancedJsonEditable.objectId }).length, 0);
+
+    const advancedSnapshot = {
+      ...advancedBefore.algorithmCandidate,
+      name: "JSON 完整快照",
+      type: "高级诊断样本",
+    };
+    await advancedJsonDraft.fill(JSON.stringify(advancedSnapshot, null, 2));
+    await page.getByRole("button", { name: "校验并预览影响" }).click();
+    const advancedDialog = page.getByRole("alertdialog", { name: "确认高级 JSON 快照" });
+    await advancedDialog.getByRole("heading", { name: "完整快照影响预览" }).waitFor();
+    await advancedDialog.getByText(/名称.*JSON 草稿对象.*JSON 完整快照/).waitFor();
+    await advancedDialog.getByText(/类型.*高级诊断样本/).waitFor();
+    await advancedDialog.getByText(/1 个当前订单和 0 条合成关系/).waitFor();
+    await advancedDialog.getByText(/订单 json-order/).waitFor();
+    assert.equal(runtime.getCatalogObject("item-identity", advancedJsonEditable.objectId).revision, advancedBefore.revision);
+    assert.equal(runtime.database.listCatalogAuditSummaries({ objectId: advancedJsonEditable.objectId }).length, 0);
+    await advancedDialog.getByRole("button", { name: "返回继续编辑" }).click();
+    assert.equal(await advancedJsonDraft.inputValue(), JSON.stringify(advancedSnapshot, null, 2));
+    await page.getByRole("button", { name: "校验并预览影响" }).click();
+    await page.getByRole("alertdialog", { name: "确认高级 JSON 快照" }).getByRole("button", { name: "确认提交完整快照" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    const advancedRequest = completionRequests.at(-1);
+    assert.equal(advancedRequest.decision, "modify");
+    assert.deepEqual(advancedRequest.snapshot, advancedSnapshot);
+    assert.deepEqual(runtime.getCatalogObject("item-identity", advancedJsonEditable.objectId).effectiveValue, advancedSnapshot);
+    const advancedAudit = runtime.database.listCatalogAuditSummaries({ objectId: advancedJsonEditable.objectId }).at(-1);
+    assert.deepEqual(advancedAudit.meaningfulDifferences.map((difference) => difference.fieldPath), ["name", "type"]);
+    assert.equal(advancedAudit.planningResult.recovered, true);
 
     const editableEntry = page.getByRole("button", { name: /疑似“旧名称”/ });
     await editableEntry.click();

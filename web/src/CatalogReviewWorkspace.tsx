@@ -326,6 +326,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const [pauseConfirmationOpen, setPauseConfirmationOpen] = useState(false);
   const [adoptedEvidencePayload, setAdoptedEvidencePayload] = useState<any>(null);
   const [pendingEvidenceRejection, setPendingEvidenceRejection] = useState<any>(null);
+  const [advancedJsonEditing, setAdvancedJsonEditing] = useState(false);
+  const [advancedJsonDraft, setAdvancedJsonDraft] = useState("{}");
+  const [advancedJsonPreview, setAdvancedJsonPreview] = useState<any>(null);
+  const [advancedJsonError, setAdvancedJsonError] = useState<{ fieldPath: string; message: string } | null>(null);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
@@ -380,6 +384,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   useEffect(() => {
     setAdoptedEvidencePayload(null);
     setPendingEvidenceRejection(null);
+    setAdvancedJsonEditing(false);
+    setAdvancedJsonPreview(null);
+    setAdvancedJsonError(null);
   }, [selectedKey]);
 
   const selectSummary = (entry: any) => {
@@ -478,7 +485,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     }
   };
 
-  const completeReview = async (decision: "confirm" | "modify") => {
+  const completeReview = async (decision: "confirm" | "modify", snapshotOverride: any = null) => {
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     if (detail.objectType === "item-identity" && !identityLevelValid) {
       setMessage("等级必须是正整数或留空表示未知");
@@ -490,14 +497,16 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     }
     setBusy(true);
     try {
-      const effectiveDecision = detail.objectType === "item-identity"
-        ? identityDecision
-        : detail.objectType === "merge-relation" ? relationDecision : decision;
-      const snapshot = detail.objectType === "item-identity"
+      const effectiveDecision = snapshotOverride
+        ? "modify"
+        : detail.objectType === "item-identity"
+          ? identityDecision
+          : detail.objectType === "merge-relation" ? relationDecision : decision;
+      const snapshot = snapshotOverride || (detail.objectType === "item-identity"
         ? identitySnapshot
         : detail.objectType === "merge-relation"
           ? relationSnapshot
-          : effectiveDecision === "confirm" ? structuredClone(reviewCandidate) : parseObjectDraft(objectDraft);
+          : effectiveDecision === "confirm" ? structuredClone(reviewCandidate) : parseObjectDraft(objectDraft));
       const requestKey = `${detail.objectType}:${detail.objectId}:${detail.revision}:${effectiveDecision}:${JSON.stringify(snapshot)}`;
       if (completionRequest.current?.key !== requestKey) {
         completionRequest.current = {
@@ -514,6 +523,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
       setAdoptedEvidencePayload(null);
+      setAdvancedJsonEditing(false);
+      setAdvancedJsonPreview(null);
+      setAdvancedJsonError(null);
       setObjectDraft(JSON.stringify(updated.candidateVersion?.payload || updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
       setIdentityDraft(identityDraftFromDetail(updated));
       if (updated.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(updated));
@@ -650,6 +662,49 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setPauseConfirmationOpen(false);
       setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新预览影响" : error.message);
     } finally { setBusy(false); }
+  };
+
+  const beginAdvancedJsonEdit = () => {
+    setAdvancedJsonDraft(objectDraft);
+    setAdvancedJsonEditing(true);
+    setAdvancedJsonPreview(null);
+    setAdvancedJsonError(null);
+    setMessage("已进入高级 JSON 编辑；该草稿与领域表单分离，校验前不会改变对象。");
+  };
+
+  const previewAdvancedJsonSnapshot = async () => {
+    if (!detail) return;
+    let snapshot;
+    try {
+      snapshot = parseObjectDraft(advancedJsonDraft);
+    } catch (error: any) {
+      setAdvancedJsonPreview(null);
+      setAdvancedJsonError({
+        fieldPath: "JSON",
+        message: `JSON 语法或结构错误：${error.message}；已保留当前 JSON 草稿。`,
+      });
+      return;
+    }
+    setBusy(true);
+    try {
+      const preview = await controlApi.previewCatalogReview({
+        objectType: detail.objectType,
+        objectId: detail.objectId,
+        snapshot,
+        expectedRevision: detail.revision,
+      });
+      setAdvancedJsonPreview(preview);
+      setAdvancedJsonError(null);
+      setMessage("快照校验通过；请核对人话差异和影响范围后再次确认。");
+    } catch (error: any) {
+      setAdvancedJsonPreview(null);
+      setAdvancedJsonError({
+        fieldPath: error.payload?.fieldPath || "snapshot",
+        message: `${error.message}；已保留当前 JSON 草稿。`,
+      });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const acquireIcon = async () => {
@@ -827,6 +882,26 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <summary>只读技术详情</summary>
             <div className="technical-identity"><strong>内部对象标识</strong><code>{detail.objectType}/{detail.objectId}</code></div>
             <label><span>完整对象 JSON</span><textarea value={objectDraft} readOnly spellCheck={false}/></label>
+            {!advancedJsonEditing
+              ? <button className="ghost-btn advanced-json-entry" disabled={busy} onClick={beginAdvancedJsonEdit}>进入高级 JSON 编辑</button>
+              : <div className="advanced-json-editor">
+                <div><h3>高级 JSON 快照编辑</h3><p>此草稿与上方领域表单分离。只有通过结构、引用和领域不变量校验并再次确认后，才会保存完整快照。</p></div>
+                <label><span>高级 JSON 草稿</span><textarea aria-label="高级 JSON 草稿" value={advancedJsonDraft} onChange={(event) => { setAdvancedJsonDraft(event.target.value); setAdvancedJsonPreview(null); setAdvancedJsonError(null); }} spellCheck={false}/></label>
+                {advancedJsonError && <div className="advanced-json-validation" role="alert"><strong>定位：{advancedJsonError.fieldPath}</strong><span>{advancedJsonError.message}</span></div>}
+                <div className="advanced-json-actions"><button disabled={busy} onClick={previewAdvancedJsonSnapshot}>校验并预览影响</button><button className="ghost-btn" disabled={busy} onClick={() => { setAdvancedJsonEditing(false); setAdvancedJsonPreview(null); setAdvancedJsonError(null); }}>退出高级编辑</button></div>
+                {advancedJsonPreview && <div className="advanced-json-confirmation" role="alertdialog" aria-label="确认高级 JSON 快照">
+                  <h4>完整快照影响预览</h4>
+                  <section><strong>人话差异</strong>{advancedJsonPreview.meaningfulDifferences?.length
+                    ? advancedJsonPreview.meaningfulDifferences.map((difference: any) => <span key={difference.fieldPath}>{fieldLabel(difference.fieldPath)}：{display(difference.oldValue)} → {display(difference.newValue)}</span>)
+                    : <span>领域值没有变化；仍会保存一份完整人工结论。</span>}</section>
+                  <section><strong>影响范围</strong><span>{advancedJsonPreview.planningImpact?.summary || "当前没有直接关联的订单或合成关系。"}</span>
+                    {(advancedJsonPreview.planningImpact?.orders || []).map((order: any) => <span key={order.slot}>订单 {order.slot} · {order.impactedItems.join("、")}</span>)}
+                    {(advancedJsonPreview.planningImpact?.relations || []).map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>)}
+                  </section>
+                  <p>再次确认将提交整个对象快照、生成 Catalog Audit Summary 并立即重新规划。</p>
+                  <div><button disabled={busy} onClick={() => completeReview("modify", advancedJsonPreview.snapshot)}>确认提交完整快照</button><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
+                </div>}
+              </div>}
             <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
             <div className="technical-history-grid">
               <div><h3>完整证据历史</h3>{detail.evidence?.map((evidence: any) => <p key={evidence.id}><strong>{valueLabel(evidence.sourceType)} · {valueLabel(evidence.disposition)}</strong><span>{valueLabel(evidence.sourceRef || "runtime")} · {evidence.observationCount} 次</span><code>{display(evidence.payload)}</code></p>)}</div>

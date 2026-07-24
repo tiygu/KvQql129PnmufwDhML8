@@ -357,6 +357,49 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
   }
 });
 
+test("高级 JSON 快照预校验 API 返回人话差异和影响且不广播对象变化", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-review-preview-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const runtime = createRuntime();
+  const previews = [];
+  runtime.previewCatalogReview = (input) => {
+    previews.push(input);
+    return {
+      valid: true,
+      objectType: input.objectType,
+      objectId: input.objectId,
+      revision: input.expectedRevision,
+      snapshot: input.snapshot,
+      meaningfulDifferences: [{ fieldPath: "name", oldValue: "旧名称", newValue: "新名称" }],
+      planningImpact: { summary: "影响 1 个订单、0 条合成关系", orders: [{ slot: "order-a", impactedItems: ["i"] }], relations: [] },
+    };
+  };
+  const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  try {
+    const input = {
+      objectType: "item-identity",
+      objectId: "i",
+      snapshot: { itemId: "i", chainId: "c", level: 1, baseUnits: 1, name: "新名称" },
+      expectedRevision: 3,
+    };
+    const response = await fetch(`http://127.0.0.1:${port}/api/catalog/review/preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    assert.equal(response.status, 200);
+    const preview = await response.json();
+    assert.deepEqual(preview.meaningfulDifferences, [{ fieldPath: "name", oldValue: "旧名称", newValue: "新名称" }]);
+    assert.equal(preview.planningImpact.orders[0].slot, "order-a");
+    assert.deepEqual(previews, [input]);
+  } finally {
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("证据处置 API 返回重评结果并向所有控制台广播审核变化", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-evidence-disposition-"));
   fs.mkdirSync(path.join(root, "public"));
