@@ -322,6 +322,7 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (error?.code) payload.code = error.code;
       if (error?.fieldPath) payload.fieldPath = error.fieldPath;
       if (error?.currentObject) payload.currentObject = error.currentObject;
+      if (error?.meaningfulDifferences) payload.meaningfulDifferences = error.meaningfulDifferences;
       writeJson(res, error?.statusCode || 500, payload);
     }
   });

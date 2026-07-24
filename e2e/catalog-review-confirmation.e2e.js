@@ -154,6 +154,11 @@ async function main() {
     name: "JSON 草稿对象",
     level: 4,
   });
+  const draftRecoveryEditable = seedReviewCandidate(runtime, {
+    objectId: "browser-draft-recovery",
+    name: "草稿恢复对象",
+    level: 2,
+  });
   runtime.database.observeCatalogObject({
     objectType: "merge-relation",
     objectId: editable.objectId,
@@ -350,7 +355,7 @@ async function main() {
     assert.deepEqual(pausedObject.rulingHistory, skippedBefore.rulingHistory);
     assert.deepEqual(pausedObject.versions, skippedBefore.versions);
     assert.equal(pausedObject.revision, skippedBefore.revision + 1);
-    await page.getByRole("button", { name: "恢复对象" }).click();
+    await page.getByRole("button", { name: "恢复对象", exact: true }).click();
     await page.getByRole("status").filter({ hasText: /对象已恢复/ }).waitFor();
     const resumedObject = runtime.getCatalogObject("item-identity", first.objectId);
     assert.equal(resumedObject.disposition, "enabled");
@@ -466,6 +471,91 @@ async function main() {
     const advancedAudit = runtime.database.listCatalogAuditSummaries({ objectId: advancedJsonEditable.objectId }).at(-1);
     assert.deepEqual(advancedAudit.meaningfulDifferences.map((difference) => difference.fieldPath), ["name", "type"]);
     assert.equal(advancedAudit.planningResult.recovered, true);
+
+    const draftRecoveryEntry = page.getByRole("button", { name: /疑似“草稿恢复对象”/ });
+    await draftRecoveryEntry.click();
+    await page.getByRole("heading", { name: "疑似“草稿恢复对象”" }).waitFor();
+    const draftName = page.getByRole("textbox", { name: "名称", exact: true });
+    await draftName.fill("第一次未提交草稿");
+    await page.waitForFunction((objectKey) => {
+      const drafts = JSON.parse(localStorage.getItem("catalog-review-local-drafts-v1") || "{}");
+      return drafts[objectKey]?.identityDraft?.name === "第一次未提交草稿";
+    }, `item-identity:${draftRecoveryEditable.objectId}`);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    await page.getByRole("heading", { name: "疑似“草稿恢复对象”" }).waitFor();
+    const firstRecoveryDialog = page.getByRole("alertdialog", { name: "恢复本地审核草稿" });
+    await firstRecoveryDialog.getByText(/草稿基于 revision.*最新对象 revision/).waitFor();
+    assert.equal(await page.getByRole("textbox", { name: "名称", exact: true }).inputValue(), "草稿恢复对象");
+    await firstRecoveryDialog.getByRole("button", { name: "放弃本地草稿" }).click();
+    assert.equal(await page.getByRole("textbox", { name: "名称", exact: true }).inputValue(), "草稿恢复对象");
+    assert.equal(await page.evaluate((objectKey) => {
+      const drafts = JSON.parse(localStorage.getItem("catalog-review-local-drafts-v1") || "{}");
+      return Object.hasOwn(drafts, objectKey);
+    }, `item-identity:${draftRecoveryEditable.objectId}`), false);
+
+    await page.getByRole("textbox", { name: "名称", exact: true }).fill("需要恢复的本地草稿");
+    await page.waitForFunction((objectKey) => {
+      const drafts = JSON.parse(localStorage.getItem("catalog-review-local-drafts-v1") || "{}");
+      return drafts[objectKey]?.identityDraft?.name === "需要恢复的本地草稿";
+    }, `item-identity:${draftRecoveryEditable.objectId}`);
+    let externallyChanged = runtime.database.applyCatalogRuling({
+      objectType: "item-identity",
+      objectId: draftRecoveryEditable.objectId,
+      fieldPath: "type",
+      decision: "modify",
+      value: "并发最新类型",
+      actor: "控制台甲",
+      note: "制造刷新后的草稿基线差异",
+      expectedRevision: runtime.getCatalogObject("item-identity", draftRecoveryEditable.objectId).revision,
+    });
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    await page.getByRole("heading", { name: "疑似“草稿恢复对象”" }).waitFor();
+    const staleRecoveryDialog = page.getByRole("alertdialog", { name: "恢复本地审核草稿" });
+    await staleRecoveryDialog.getByText(new RegExp(`草稿基于 revision.*最新对象 revision ${externallyChanged.revision}`)).waitFor();
+    await staleRecoveryDialog.getByRole("button", { name: "恢复本地草稿" }).click();
+    assert.equal(await page.getByRole("textbox", { name: "名称", exact: true }).inputValue(), "需要恢复的本地草稿");
+    const restoredConflict = page.getByRole("alertdialog", { name: "重新确认 revision 冲突" });
+    await restoredConflict.waitFor();
+    const restoredConflictText = await restoredConflict.textContent();
+    assert.match(restoredConflictText || "", /类型.*并发最新类型.*null/, `restored conflict=${restoredConflictText}`);
+    await restoredConflict.getByRole("button", { name: "按最新版本重新确认" }).click();
+
+    externallyChanged = runtime.database.applyCatalogRuling({
+      objectType: "item-identity",
+      objectId: draftRecoveryEditable.objectId,
+      fieldPath: "type",
+      decision: "modify",
+      value: "第二并发类型",
+      actor: "控制台乙",
+      note: "制造提交时 revision 冲突",
+      expectedRevision: externallyChanged.revision,
+    });
+    const detailScrollTop = await page.locator(".review-detail").evaluate((element) => {
+      element.scrollTop = 180;
+      return element.scrollTop;
+    });
+    const resolutionsBeforeConflict = runtime.database.listCatalogReviewResolutions({ objectId: draftRecoveryEditable.objectId }).length;
+    await page.getByRole("button", { name: "修改后确认" }).click();
+    const liveConflict = page.getByRole("alertdialog", { name: "重新确认 revision 冲突" });
+    await liveConflict.getByText(new RegExp(`最新对象 revision ${externallyChanged.revision}`)).waitFor();
+    await liveConflict.getByText(/名称.*草稿恢复对象.*需要恢复的本地草稿/).waitFor();
+    await liveConflict.getByText(/类型.*第二并发类型.*null/).waitFor();
+    assert.equal(await page.getByRole("textbox", { name: "名称", exact: true }).inputValue(), "需要恢复的本地草稿");
+    assert.equal(await page.locator(".review-detail").evaluate((element) => element.scrollTop), detailScrollTop);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: draftRecoveryEditable.objectId }).length, resolutionsBeforeConflict);
+    await liveConflict.getByRole("button", { name: "按最新版本重新确认" }).click();
+    await page.getByRole("button", { name: "修改后确认" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: draftRecoveryEditable.objectId }).length, resolutionsBeforeConflict + 1);
+    assert.equal(runtime.getCatalogObject("item-identity", draftRecoveryEditable.objectId).effectiveValue.name, "需要恢复的本地草稿");
+    assert.equal(await page.evaluate((objectKey) => {
+      const drafts = JSON.parse(localStorage.getItem("catalog-review-local-drafts-v1") || "{}");
+      return Object.hasOwn(drafts, objectKey);
+    }, `item-identity:${draftRecoveryEditable.objectId}`), false);
 
     const editableEntry = page.getByRole("button", { name: /疑似“旧名称”/ });
     await editableEntry.click();

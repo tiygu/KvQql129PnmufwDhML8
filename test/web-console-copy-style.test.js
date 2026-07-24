@@ -136,6 +136,26 @@ test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验�
   assert.match(source, /completeReview\("modify",\s*advancedJsonPreview\.snapshot\)/);
 });
 
+test("本地审核草稿跨刷新必须明确恢复或放弃，revision 冲突保留草稿并展示最新差异", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const server = read("src/control-server.js");
+  const runtime = read("src/automation-runtime.js");
+
+  assert.match(source, /catalog-review-local-drafts-v1/);
+  assert.match(source, /localStorage/);
+  assert.match(source, /发现本地未提交草稿/);
+  assert.match(source, /恢复本地草稿/);
+  assert.match(source, /放弃本地草稿/);
+  assert.match(source, /草稿基于 revision/);
+  assert.match(source, /最新对象 revision/);
+  assert.match(source, /按最新版本重新确认/);
+  assert.match(source, /meaningfulDifferences/);
+  assert.match(source, /保留当前对象、草稿与滚动位置/);
+  assert.match(source, /CATALOG_REVISION_CONFLICT/);
+  assert.match(server, /error\?\.meaningfulDifferences/);
+  assert.match(runtime, /error\.meaningfulDifferences/);
+});
+
 test("图鉴审核展示以后再看集合，并从规划结果与版本基线生成人话解释", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   const reasonBody = source.slice(source.indexOf("function humanReadableReason"), source.indexOf("function parseObjectDraft"));

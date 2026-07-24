@@ -27,6 +27,7 @@ const { ActiveCatalogScanner, MAX_ACTIVE_CATALOG_SCAN_TARGETS, READ_CATALOG_SCAN
 const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
 const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
 const { mergeRelationWaitingForObservation } = require("./catalog-review-state");
+const { canonicalJson } = require("./canonical-json");
 
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -227,6 +228,17 @@ function buildCatalogPlanningImpact(database, state, object) {
     relations,
     affectedItemIds: [...affectedItemIds],
   };
+}
+
+function meaningfulSnapshotDifferences(before, after) {
+  const fields = new Set([...Object.keys(before || {}), ...Object.keys(after || {})]);
+  return [...fields].sort().flatMap((fieldPath) => {
+    const oldValue = before?.[fieldPath] ?? null;
+    const newValue = after?.[fieldPath] ?? null;
+    return canonicalJson(oldValue) === canonicalJson(newValue)
+      ? []
+      : [{ fieldPath, oldValue, newValue }];
+  });
 }
 
 class AutomationRuntime {
@@ -744,7 +756,18 @@ class AutomationRuntime {
   }
 
   async completeCatalogReview(input) {
-    const committed = this.database.completeCatalogReview(input);
+    let committed;
+    try {
+      committed = this.database.completeCatalogReview(input);
+    } catch (error) {
+      if (error?.code === "CATALOG_REVISION_CONFLICT") {
+        const currentObject = this.getCatalogObject(input.objectType, input.objectId);
+        const currentSnapshot = currentObject?.effectiveValue || currentObject?.algorithmCandidate || {};
+        error.currentObject = currentObject;
+        error.meaningfulDifferences = meaningfulSnapshotDifferences(currentSnapshot, input.snapshot || {});
+      }
+      throw error;
+    }
     const priorPlanning = committed.reviewResolution?.planningResult;
     if (committed.idempotentReplay && priorPlanning?.status !== "pending") return committed;
     let planningResult;

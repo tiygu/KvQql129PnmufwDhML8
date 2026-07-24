@@ -207,6 +207,77 @@ test("控制台确认无误后保存 SQLite 审计、重规划、同步所有控
   }
 });
 
+test("并发提交冲突返回最新完整对象和本地快照差异且只保存首个结论", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-review-concurrent-conflict-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  const before = seedReviewCandidate(runtime, "concurrent-review", 2);
+  runtime.catalogReviewReplanner = async () => ({
+    status: "ready",
+    recovered: true,
+    boundaryReason: null,
+    recommendedOrderSlot: "order-a",
+  });
+  const server = createControlServer({
+    runtime,
+    publicRoot: path.join(__dirname, "..", "public"),
+    dataDir,
+  });
+  const port = await listen(server);
+  try {
+    const firstSnapshot = { ...before.algorithmCandidate, name: "控制台甲结论" };
+    const secondSnapshot = { ...before.algorithmCandidate, name: "控制台乙草稿" };
+    const first = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objectType: before.objectType,
+        objectId: before.objectId,
+        decision: "modify",
+        snapshot: firstSnapshot,
+        actor: "控制台甲",
+        requestId: "concurrent-review-a",
+        expectedRevision: before.revision,
+      }),
+    });
+    assert.equal(first.status, 200);
+    const committed = await first.json();
+
+    const stale = await fetch(`http://127.0.0.1:${port}/api/catalog/review/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objectType: before.objectType,
+        objectId: before.objectId,
+        decision: "modify",
+        snapshot: secondSnapshot,
+        actor: "控制台乙",
+        requestId: "concurrent-review-b",
+        expectedRevision: before.revision,
+      }),
+    });
+    assert.equal(stale.status, 409);
+    const conflict = await stale.json();
+    assert.equal(conflict.code, "CATALOG_REVISION_CONFLICT");
+    assert.equal(conflict.currentObject.revision, committed.revision);
+    assert.deepEqual(conflict.currentObject.effectiveValue, firstSnapshot);
+    assert.deepEqual(conflict.meaningfulDifferences, [{
+      fieldPath: "name",
+      oldValue: "控制台甲结论",
+      newValue: "控制台乙草稿",
+    }]);
+    assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: before.objectId }).length, 1);
+    assert.equal(runtime.database.listCatalogAuditSummaries({ objectId: before.objectId }).length, 1);
+  } finally {
+    await server.close();
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("暂停对象预览订单与关系、隔离规划并在恢复后向所有控制台广播同一 revision", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-object-pause-e2e-"));
   const runtime = new AutomationRuntime({

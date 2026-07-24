@@ -296,6 +296,40 @@ function parseObjectDraft(value: string) {
   return parsed;
 }
 
+const LOCAL_REVIEW_DRAFTS_KEY = "catalog-review-local-drafts-v1";
+const LOCAL_REVIEW_SELECTION_KEY = "catalog-review-selected-object-v1";
+
+function readLocalReviewDraft(objectKey: string) {
+  try {
+    const drafts = JSON.parse(globalThis.localStorage?.getItem(LOCAL_REVIEW_DRAFTS_KEY) || "{}");
+    return drafts?.[objectKey] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeLocalReviewDraft(objectKey: string, draft: any) {
+  try {
+    const drafts = JSON.parse(globalThis.localStorage?.getItem(LOCAL_REVIEW_DRAFTS_KEY) || "{}");
+    globalThis.localStorage?.setItem(LOCAL_REVIEW_DRAFTS_KEY, JSON.stringify({ ...drafts, [objectKey]: draft }));
+  } catch (_) {}
+}
+
+function removeLocalReviewDraft(objectKey: string) {
+  try {
+    const drafts = JSON.parse(globalThis.localStorage?.getItem(LOCAL_REVIEW_DRAFTS_KEY) || "{}");
+    delete drafts[objectKey];
+    globalThis.localStorage?.setItem(LOCAL_REVIEW_DRAFTS_KEY, JSON.stringify(drafts));
+  } catch (_) {}
+}
+
+function localDraftDifferences(before: any, after: any) {
+  const fields = new Set([...Object.keys(before || {}), ...Object.keys(after || {})]);
+  return [...fields].sort().flatMap((fieldPath) => display(before?.[fieldPath] ?? null) === display(after?.[fieldPath] ?? null)
+    ? []
+    : [{ fieldPath, oldValue: before?.[fieldPath] ?? null, newValue: after?.[fieldPath] ?? null }]);
+}
+
 function markIconSelected(value: any, candidateId: number) {
   const iconCandidates = (value?.iconCandidates || []).map((candidate: any) => ({
     ...candidate,
@@ -309,7 +343,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const queue = repository?.reviewQueue || [];
   const laterQueue = repository?.laterQueue || [];
   const objects = repository?.objects || [];
-  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [selectedKey, setSelectedKey] = useState<string | null>(() => {
+    try { return globalThis.localStorage?.getItem(LOCAL_REVIEW_SELECTION_KEY) || null; }
+    catch (_) { return null; }
+  });
   const [skippedKeys, setSkippedKeys] = useState<string[]>([]);
   const [detail, setDetail] = useState<any>(null);
   const [objectDraft, setObjectDraft] = useState("{}");
@@ -330,12 +367,27 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const [advancedJsonDraft, setAdvancedJsonDraft] = useState("{}");
   const [advancedJsonPreview, setAdvancedJsonPreview] = useState<any>(null);
   const [advancedJsonError, setAdvancedJsonError] = useState<{ fieldPath: string; message: string } | null>(null);
+  const [draftDirty, setDraftDirty] = useState(false);
+  const [draftBaseRevision, setDraftBaseRevision] = useState<number | null>(null);
+  const [recoverableDraft, setRecoverableDraft] = useState<any>(null);
+  const [revisionConflict, setRevisionConflict] = useState<any>(null);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
   const identityDraftKey = useRef<string | null>(null);
   const identityDraftDirty = useRef(false);
   const relationChainRef = useRef<HTMLDivElement>(null);
+  const detailScrollRef = useRef<HTMLDivElement>(null);
+  const draftDirtyRef = useRef(false);
+  const draftObjectKeyRef = useRef<string | null>(null);
+
+  const markDraftDirty = () => {
+    if (!detail) return;
+    draftDirtyRef.current = true;
+    draftObjectKeyRef.current = `${detail.objectType}:${detail.objectId}`;
+    setDraftDirty(true);
+    setDraftBaseRevision((current) => current ?? Number(detail.revision));
+  };
 
   const orderedQueue = useMemo(() => {
     const entriesByKey = new Map(queue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
@@ -362,6 +414,8 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       if (requestId !== detailRequestId.current) return;
       setDetail(value);
       const valueKey = `${value.objectType}:${value.objectId}`;
+      const preserveLocalDraft = draftDirtyRef.current && draftObjectKeyRef.current === valueKey;
+      if (preserveLocalDraft) return;
       const adoptedPayload = adoptedEvidencePayload?.objectKey === valueKey ? adoptedEvidencePayload.payload : null;
       setObjectDraft(JSON.stringify(adoptedPayload || value.candidateVersion?.payload || value.algorithmCandidate || value.effectiveValue || {}, null, 2));
       if (adoptedPayload || identityDraftKey.current !== valueKey || !identityDraftDirty.current) {
@@ -370,9 +424,13 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       }
       if (value.objectType === "merge-relation") setRelationDraft(adoptedPayload ? relationDraftFromPayload(adoptedPayload) : relationDraftFromDetail(value));
       identityDraftKey.current = valueKey;
+      draftObjectKeyRef.current = valueKey;
+      setDraftBaseRevision(Number(value.revision));
+      setRecoverableDraft(readLocalReviewDraft(valueKey));
+      setRevisionConflict(null);
     } catch (error: any) {
       if (requestId !== detailRequestId.current) return;
-      setLoadError(error.message || "审核对象加载失败");
+      setLoadError(`${error.message || "审核对象加载失败"}；已保留队列与选择，过期提交已禁用`);
     } finally {
       if (requestId === detailRequestId.current) setLoadingDetail(false);
     }
@@ -380,8 +438,20 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
 
   useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
   useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
+  useEffect(() => {
+    try {
+      if (selectedKey) globalThis.localStorage?.setItem(LOCAL_REVIEW_SELECTION_KEY, selectedKey);
+      else globalThis.localStorage?.removeItem(LOCAL_REVIEW_SELECTION_KEY);
+    } catch (_) {}
+  }, [selectedKey]);
   useEffect(() => { setPauseConfirmationOpen(false); }, [detail?.objectType, detail?.objectId, detail?.revision]);
   useEffect(() => {
+    draftDirtyRef.current = false;
+    draftObjectKeyRef.current = selectedKey;
+    setDraftDirty(false);
+    setDraftBaseRevision(null);
+    setRecoverableDraft(null);
+    setRevisionConflict(null);
     setAdoptedEvidencePayload(null);
     setPendingEvidenceRejection(null);
     setAdvancedJsonEditing(false);
@@ -444,6 +514,15 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     ? relationValidationError(relationSource, relationTarget, relationDraft.requiredCount)
     : "";
   const relationDecision: "confirm" | "modify" = relationDifferences.length ? "modify" : "confirm";
+  const localDraftSnapshot = useMemo(() => {
+    if (advancedJsonEditing) {
+      try { return parseObjectDraft(advancedJsonDraft); }
+      catch (_) { return null; }
+    }
+    if (detail?.objectType === "item-identity") return identitySnapshot;
+    if (detail?.objectType === "merge-relation") return relationSnapshot;
+    return reviewCandidate;
+  }, [advancedJsonDraft, advancedJsonEditing, detail?.objectType, identitySnapshot, relationSnapshot, reviewCandidate]);
   const visibleDifferences = useMemo(
     () => detail?.objectType === "item-identity"
       ? identityDifferences
@@ -452,6 +531,35 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         : meaningfulDifferences(detail, visibleFields),
     [detail, identityDifferences, relationDifferences, visibleFields],
   );
+  useEffect(() => {
+    if (!draftDirty || !detail || draftObjectKeyRef.current !== detailKey) return;
+    writeLocalReviewDraft(detailKey, {
+      objectType: detail.objectType,
+      objectId: detail.objectId,
+      baseRevision: draftBaseRevision ?? Number(detail.revision),
+      snapshot: localDraftSnapshot,
+      identityDraft,
+      relationDraft,
+      advancedJsonEditing,
+      advancedJsonDraft,
+      actor,
+      note,
+      scrollTop: detailScrollRef.current?.scrollTop || 0,
+      savedAt: new Date().toISOString(),
+    });
+  }, [
+    actor,
+    advancedJsonDraft,
+    advancedJsonEditing,
+    detail,
+    detailKey,
+    draftBaseRevision,
+    draftDirty,
+    identityDraft,
+    localDraftSnapshot,
+    note,
+    relationDraft,
+  ]);
   const relationChainNodes = useMemo(() => {
     if (!relationSource?.chainId) return [];
     const members = relationItems
@@ -470,6 +578,55 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     }
     return [...nodes, ...unknownLevelMembers];
   }, [relationItems, relationSource]);
+
+  const restoreLocalDraft = () => {
+    if (!detail || !recoverableDraft) return;
+    if (recoverableDraft.identityDraft) setIdentityDraft(recoverableDraft.identityDraft);
+    if (recoverableDraft.relationDraft) setRelationDraft(recoverableDraft.relationDraft);
+    setAdvancedJsonEditing(!!recoverableDraft.advancedJsonEditing);
+    if (recoverableDraft.advancedJsonDraft) setAdvancedJsonDraft(recoverableDraft.advancedJsonDraft);
+    if (recoverableDraft.actor) setActor(recoverableDraft.actor);
+    setNote(recoverableDraft.note || "");
+    identityDraftDirty.current = true;
+    draftDirtyRef.current = true;
+    draftObjectKeyRef.current = detailKey;
+    setDraftDirty(true);
+    setDraftBaseRevision(Number(recoverableDraft.baseRevision));
+    if (Number(recoverableDraft.baseRevision) !== Number(detail.revision)) {
+      const latestSnapshot = detail.effectiveValue || detail.algorithmCandidate || {};
+      setRevisionConflict({
+        localBaseRevision: Number(recoverableDraft.baseRevision),
+        currentRevision: Number(detail.revision),
+        meaningfulDifferences: localDraftDifferences(latestSnapshot, recoverableDraft.snapshot || {}),
+      });
+    }
+    const scrollTop = Number(recoverableDraft.scrollTop) || 0;
+    globalThis.requestAnimationFrame?.(() => {
+      if (detailScrollRef.current) detailScrollRef.current.scrollTop = scrollTop;
+    });
+    setRecoverableDraft(null);
+    setMessage("已恢复本地未提交草稿；请基于运行时最新对象重新核对后提交。");
+  };
+
+  const discardLocalDraft = () => {
+    if (!detail) return;
+    removeLocalReviewDraft(detailKey);
+    const candidate = reviewCandidateSnapshot(detail);
+    setObjectDraft(JSON.stringify(candidate, null, 2));
+    setIdentityDraft(identityDraftFromDetail(detail));
+    if (detail.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(detail));
+    setAdvancedJsonEditing(false);
+    setAdvancedJsonDraft(JSON.stringify(candidate, null, 2));
+    setAdvancedJsonPreview(null);
+    setAdvancedJsonError(null);
+    identityDraftDirty.current = false;
+    draftDirtyRef.current = false;
+    setDraftDirty(false);
+    setDraftBaseRevision(Number(detail.revision));
+    setRecoverableDraft(null);
+    setRevisionConflict(null);
+    setMessage("已放弃本地草稿，继续使用 Automation Runtime 的最新对象。");
+  };
 
   const skipCurrentReview = () => {
     if (!detail || orderedQueue.length === 0) return;
@@ -495,6 +652,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setMessage(relationError);
       return;
     }
+    const failureScrollTop = detailScrollRef.current?.scrollTop || 0;
     setBusy(true);
     try {
       const effectiveDecision = snapshotOverride
@@ -523,6 +681,12 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
       setAdoptedEvidencePayload(null);
+      removeLocalReviewDraft(detailKey);
+      draftDirtyRef.current = false;
+      setDraftDirty(false);
+      setDraftBaseRevision(Number(updated.revision));
+      setRecoverableDraft(null);
+      setRevisionConflict(null);
       setAdvancedJsonEditing(false);
       setAdvancedJsonPreview(null);
       setAdvancedJsonError(null);
@@ -564,15 +728,33 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setSelectedKey(nextReviewKey);
       if (nextReviewKey !== currentKey) setDetail(null);
     } catch (error: any) {
-      if (error.payload?.currentObject) {
+      if (error.payload?.code === "CATALOG_REVISION_CONFLICT" && error.payload?.currentObject) {
+        const currentObject = error.payload.currentObject;
+        setDetail(currentObject);
+        draftDirtyRef.current = true;
+        draftObjectKeyRef.current = `${currentObject.objectType}:${currentObject.objectId}`;
+        setDraftDirty(true);
+        setRevisionConflict({
+          localBaseRevision: draftBaseRevision ?? Number(detail.revision),
+          currentRevision: Number(currentObject.revision),
+          meaningfulDifferences: error.payload.meaningfulDifferences || [],
+        });
+        await onChanged().catch(() => null);
+        setMessage("revision 冲突：已加载最新对象并保留当前对象、草稿与滚动位置；请查看有意义差异后重新确认。");
+      } else if (error.payload?.currentObject) {
         setDetail(error.payload.currentObject);
         setObjectDraft(JSON.stringify(error.payload.currentObject.algorithmCandidate || error.payload.currentObject.effectiveValue || {}, null, 2));
         setIdentityDraft(identityDraftFromDetail(error.payload.currentObject));
         if (error.payload.currentObject.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(error.payload.currentObject));
         identityDraftKey.current = `${error.payload.currentObject.objectType}:${error.payload.currentObject.objectId}`;
         identityDraftDirty.current = false;
+        setMessage(error.message);
+      } else {
+        setMessage(`${error.message}；已保留当前对象、草稿与滚动位置，生效快照未改变。`);
       }
-      setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新核对完整对象" : error.message);
+      globalThis.requestAnimationFrame?.(() => {
+        if (detailScrollRef.current) detailScrollRef.current.scrollTop = failureScrollTop;
+      });
     } finally { setBusy(false); }
   };
 
@@ -623,6 +805,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         evidenceId,
         payload: structuredClone(selected.payload),
       });
+      markDraftDirty();
       setDetail(updated);
       setLatestAuditSummary(updated.catalogAuditSummary || null);
       setObjectDraft(JSON.stringify(selected.payload, null, 2));
@@ -774,13 +957,24 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           </button>) : <div className="empty-state compact"><Check/><span>当前没有待补对象</span></div>}</div>
         </details>
       </div>
-      <div className="panel review-detail">
+      <div className="panel review-detail" ref={detailScrollRef}>
         {latestAuditSummary && <div className="catalog-audit-summary latest-audit-receipt"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(latestAuditSummary)}</span></div>}
         {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
           <div className="panel-head">
             <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
             <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}{detail.disposition === "paused" ? <button className="ghost-btn" disabled={busy} onClick={togglePause}><Play size={15}/>恢复对象</button> : <span className="object-disposition-badge">规划中</span>}</div>
           </div>
+          {recoverableDraft && <div className="local-draft-recovery" role="alertdialog" aria-label="恢复本地审核草稿">
+            <div><strong>发现本地未提交草稿</strong><p>草稿基于 revision {recoverableDraft.baseRevision}，最新对象 revision {detail.revision}。系统没有自动套用，请明确恢复或放弃。</p></div>
+            <div><button onClick={restoreLocalDraft}>恢复本地草稿</button><button className="ghost-btn" onClick={discardLocalDraft}>放弃本地草稿</button></div>
+          </div>}
+          {revisionConflict && <div className="revision-conflict-review" role="alertdialog" aria-label="重新确认 revision 冲突">
+            <div><strong>最新对象与本地草稿需要重新确认</strong><p>草稿基于 revision {revisionConflict.localBaseRevision}；最新对象 revision {revisionConflict.currentRevision}。</p></div>
+            <section>{revisionConflict.meaningfulDifferences?.length
+              ? revisionConflict.meaningfulDifferences.map((difference: any) => <span key={difference.fieldPath}><b>{fieldLabel(difference.fieldPath)}</b>{display(difference.oldValue)} → {display(difference.newValue)}</span>)
+              : <span>没有领域字段差异，但对象 revision 已更新。</span>}</section>
+            <div><button onClick={() => { setRevisionConflict(null); setMessage("已确认以最新对象为基线；本地草稿仍保留，请再次提交。"); }}>按最新版本重新确认</button><button className="ghost-btn" onClick={discardLocalDraft}>放弃本地草稿</button></div>
+          </div>}
           <div className="human-review-reason"><AlertTriangle size={18}/><div><strong>{selectedSummary?.actionStatus === "以后再看" ? "为什么以后再看" : "为什么需要处理"}</strong><p>{humanReadableReason(detail)}</p></div></div>
           <div className="review-evidence-summary">
             <div><strong>证据摘要</strong><span>{detail.evidenceSummary?.evidenceCount || 0} 个来源记录 · {detail.evidenceSummary?.observationCount || 0} 次观测</span></div>
@@ -799,10 +993,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <p className="catalog-relationship-sentence">由 <button aria-label={`关系句来源物 ${relationItemLabel(relationSource)}`} onClick={() => relationSource && focusRelatedObject("item-identity", relationObjectKey(relationSource))}>{relationItemLabel(relationSource)}</button> × {relationDraft.requiredCount || "未知"} 合成为 <button aria-label={`关系句结果物 ${relationItemLabel(relationTarget)}`} disabled={!relationTarget} onClick={() => relationTarget && focusRelatedObject("item-identity", relationObjectKey(relationTarget))}>{relationItemLabel(relationTarget)}</button></p>
             <div className="merge-relation-form">
               <button className="relation-source-choice" aria-label={`来源物 ${relationItemLabel(relationSource)}`} onClick={() => relationSource && focusRelatedObject("item-identity", relationObjectKey(relationSource))}>{relationSource?.iconUrl ? <img src={relationSource.iconUrl} alt=""/> : <Image/>}<span><small>来源物</small><strong>{relationItemLabel(relationSource)}</strong></span></button>
-              <label><span>所需数量</span><input aria-label="所需数量" type="number" min="2" max="2" step="1" value={relationDraft.requiredCount} onChange={(event) => setRelationDraft((current) => ({ ...current, requiredCount: event.target.value }))}/><small>同级物品固定为 2 个</small></label>
+              <label><span>所需数量</span><input aria-label="所需数量" type="number" min="2" max="2" step="1" value={relationDraft.requiredCount} onChange={(event) => { markDraftDirty(); setRelationDraft((current) => ({ ...current, requiredCount: event.target.value })); }}/><small>同级物品固定为 2 个</small></label>
               {waitingForMoreClues
                 ? <label><span>结果物</span><input aria-label="结果物" value="等待真实观测" readOnly/><small>结果尚未真实出现，等待正常订单推进产生可归因观测。</small></label>
-                : <div className="relation-target-choices"><span>结果物</span><div>{relationItems.map((item: any) => <button key={relationObjectKey(item)} className={relationObjectKey(item) === relationDraft.mergeTarget ? "selected" : ""} aria-label={`选择结果物 ${relationItemLabel(item)}`} onClick={() => { setRelationDraft((current) => ({ ...current, mergeTarget: relationObjectKey(item) })); setMessage(""); }}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{item.name}</strong><small>{item.level == null ? "等级未知" : `第 ${item.level} 级`}</small></button>)}</div></div>}
+                : <div className="relation-target-choices"><span>结果物</span><div>{relationItems.map((item: any) => <button key={relationObjectKey(item)} className={relationObjectKey(item) === relationDraft.mergeTarget ? "selected" : ""} aria-label={`选择结果物 ${relationItemLabel(item)}`} onClick={() => { markDraftDirty(); setRelationDraft((current) => ({ ...current, mergeTarget: relationObjectKey(item) })); setMessage(""); }}>{item.iconUrl ? <img src={item.iconUrl} alt=""/> : <Image/>}<strong>{item.name}</strong><small>{item.level == null ? "等级未知" : `第 ${item.level} 级`}</small></button>)}</div></div>}
             </div>
             {relationError && <p className="relation-validation-error" role="alert"><AlertTriangle size={15}/>{relationError}</p>}
             <div className="relation-chain-head"><div><strong>完整合成链</strong><span>当前焦点高亮；虚线节点表示未知等级或断点。</span></div><div><button aria-label="合成链向左浏览" onClick={() => relationChainRef.current?.scrollBy({ left: -280, behavior: "smooth" })}><ChevronLeft size={16}/></button><button aria-label="合成链向右浏览" onClick={() => relationChainRef.current?.scrollBy({ left: 280, behavior: "smooth" })}><ChevronRight size={16}/></button></div></div>
@@ -853,9 +1047,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           <div className="candidate-snapshot">
             <h3>本次将确认的完整候选</h3>
             {detail.objectType === "item-identity" ? <div className="item-identity-form">
-              <label><span>名称</span><input aria-label="名称" value={identityDraft.name} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, name: event.target.value })); }} placeholder="留空表示未知"/></label>
-              <label><span>等级</span><input aria-label="等级" inputMode="numeric" value={identityDraft.level} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, level: event.target.value })); }} placeholder="留空表示未知"/></label>
-              <label><span>类型</span><input aria-label="类型" value={identityDraft.type} onChange={(event) => { identityDraftDirty.current = true; setIdentityDraft((current) => ({ ...current, type: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <label><span>名称</span><input aria-label="名称" value={identityDraft.name} onChange={(event) => { identityDraftDirty.current = true; markDraftDirty(); setIdentityDraft((current) => ({ ...current, name: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <label><span>等级</span><input aria-label="等级" inputMode="numeric" value={identityDraft.level} onChange={(event) => { identityDraftDirty.current = true; markDraftDirty(); setIdentityDraft((current) => ({ ...current, level: event.target.value })); }} placeholder="留空表示未知"/></label>
+              <label><span>类型</span><input aria-label="类型" value={identityDraft.type} onChange={(event) => { identityDraftDirty.current = true; markDraftDirty(); setIdentityDraft((current) => ({ ...current, type: event.target.value })); }} placeholder="留空表示未知"/></label>
               <div className="identity-icon-field"><span>展示图标</span><strong>{detail.selectedIcon ? `候选 ${detail.iconCandidates.findIndex((candidate: any) => candidate.id === detail.selectedIcon.id) + 1}` : "未知"}</strong><small>在上方真实图标候选中选择</small></div>
               {!identityLevelValid && <p className="identity-validation" role="alert">等级必须是正整数或留空表示未知</p>}
             </div> : detail.objectType === "merge-relation" ? <p className="relation-snapshot-note">{relationItemLabel(relationSource)} × {relationDraft.requiredCount || "未知"} → {relationItemLabel(relationTarget)}</p> : <div className="candidate-facts">{visibleFields.length ? visibleFields.map((field) => <div key={field}><span>{fieldLabel(field)}</span><strong>{display(reviewCandidate[field])}</strong></div>) : <p>当前候选没有需要操作者核对的领域字段。</p>}</div>}
@@ -868,8 +1062,8 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             ? <div className="waiting-review-state" role="status"><strong>等待更多线索</strong><p>结果尚未真实出现，普通审核动作暂时隐藏。返回自动化后，由正常订单推进继续收集。</p><button className="primary-action" onClick={onContinueAutomation}>返回自动化继续收集</button></div>
             : <div className="ruling-editor object-review-editor">
             <div className="wide review-resolution-help"><h3>完整对象审核</h3><p>“确认无误”会一次提交完整候选并自动生成审计摘要；普通确认无需填写备注。</p></div>
-            <label><span>操作者</span><input value={actor} onChange={(event) => setActor(event.target.value)}/></label>
-            <label><span>补充说明（选填）</span><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="确有需要时补充上下文"/></label>
+            <label><span>操作者</span><input value={actor} onChange={(event) => { markDraftDirty(); setActor(event.target.value); }}/></label>
+            <label><span>补充说明（选填）</span><input value={note} onChange={(event) => { markDraftDirty(); setNote(event.target.value); }} placeholder="确有需要时补充上下文"/></label>
             <div className="ruling-actions">{detail.objectType === "item-identity"
               ? <button disabled={busy || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
               : detail.objectType === "merge-relation"
@@ -886,7 +1080,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
               ? <button className="ghost-btn advanced-json-entry" disabled={busy} onClick={beginAdvancedJsonEdit}>进入高级 JSON 编辑</button>
               : <div className="advanced-json-editor">
                 <div><h3>高级 JSON 快照编辑</h3><p>此草稿与上方领域表单分离。只有通过结构、引用和领域不变量校验并再次确认后，才会保存完整快照。</p></div>
-                <label><span>高级 JSON 草稿</span><textarea aria-label="高级 JSON 草稿" value={advancedJsonDraft} onChange={(event) => { setAdvancedJsonDraft(event.target.value); setAdvancedJsonPreview(null); setAdvancedJsonError(null); }} spellCheck={false}/></label>
+                <label><span>高级 JSON 草稿</span><textarea aria-label="高级 JSON 草稿" value={advancedJsonDraft} onChange={(event) => { markDraftDirty(); setAdvancedJsonDraft(event.target.value); setAdvancedJsonPreview(null); setAdvancedJsonError(null); }} spellCheck={false}/></label>
                 {advancedJsonError && <div className="advanced-json-validation" role="alert"><strong>定位：{advancedJsonError.fieldPath}</strong><span>{advancedJsonError.message}</span></div>}
                 <div className="advanced-json-actions"><button disabled={busy} onClick={previewAdvancedJsonSnapshot}>校验并预览影响</button><button className="ghost-btn" disabled={busy} onClick={() => { setAdvancedJsonEditing(false); setAdvancedJsonPreview(null); setAdvancedJsonError(null); }}>退出高级编辑</button></div>
                 {advancedJsonPreview && <div className="advanced-json-confirmation" role="alertdialog" aria-label="确认高级 JSON 快照">
