@@ -201,7 +201,18 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/catalog/object/disposition") {
         const body = await readJson(req);
         if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !body.disposition || !body.reason || !Number.isInteger(Number(body.expectedRevision))) return writeJson(res, 400, { ok: false, error: "invalid-catalog-disposition-request" });
-        return writeJson(res, 200, runtime.setCatalogObjectDisposition(body.objectType, body.objectId, body.disposition, body.reason, Number(body.expectedRevision)));
+        const object = await runtime.setCatalogObjectDisposition(body.objectType, body.objectId, body.disposition, body.reason, Number(body.expectedRevision));
+        broadcast({
+          type: "catalog-review-updated",
+          objectType: object.objectType,
+          objectId: object.objectId,
+          revision: object.revision,
+          reviewStatus: object.reviewStatus,
+          disposition: object.disposition,
+          planningEligible: object.planningEligible,
+          planningResult: object.planningResult || null,
+        });
+        return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/evidence/disposition") {
         const body = await readJson(req);

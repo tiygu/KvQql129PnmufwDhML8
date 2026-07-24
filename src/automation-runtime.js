@@ -141,6 +141,94 @@ function reconcileBoardObservation(state, observed, action = null) {
   return next;
 }
 
+function buildCatalogPlanningImpact(database, state, object) {
+  const details = new Map();
+  const getDetail = (objectType, objectId) => {
+    const key = `${objectType}:${objectId}`;
+    if (!details.has(key)) details.set(key, database.getCatalogObject(objectType, String(objectId)));
+    return details.get(key);
+  };
+  const payloadOf = (entry) => entry?.effectiveValue || entry?.algorithmCandidate || {};
+  const objectPayload = payloadOf(object);
+  const affectedItemIds = new Set();
+  if (object.objectType === "item-identity") affectedItemIds.add(String(object.objectId));
+  if (object.objectType === "merge-relation") {
+    affectedItemIds.add(String(objectPayload.itemId || object.objectId));
+    if (objectPayload.mergeTarget != null && objectPayload.mergeTarget !== "") affectedItemIds.add(String(objectPayload.mergeTarget));
+  }
+  if (object.objectType === "production-profile") {
+    affectedItemIds.add(String(objectPayload.producerItemId || object.objectId));
+    for (const itemId of objectPayload.candidateOutputs || []) affectedItemIds.add(String(itemId));
+  }
+  if (object.objectType === "production-mode") {
+    if (objectPayload.producerItemId) affectedItemIds.add(String(objectPayload.producerItemId));
+    for (const output of objectPayload.outputs || []) if (output?.itemId) affectedItemIds.add(String(output.itemId));
+  }
+
+  const relationEntries = database.listCatalogObjects({ objectType: "merge-relation" }).map((summary) => {
+    const relation = getDetail(summary.objectType, summary.objectId);
+    const payload = payloadOf(relation);
+    return {
+      objectId: String(summary.objectId),
+      sourceItemId: String(payload.itemId || summary.objectId),
+      targetItemId: payload.mergeTarget == null || payload.mergeTarget === "" ? null : String(payload.mergeTarget),
+      disposition: relation?.disposition || summary.disposition,
+    };
+  });
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const relation of relationEntries) {
+      if (!affectedItemIds.has(relation.sourceItemId) && (!relation.targetItemId || !affectedItemIds.has(relation.targetItemId))) continue;
+      for (const itemId of [relation.sourceItemId, relation.targetItemId].filter(Boolean)) {
+        if (affectedItemIds.has(itemId)) continue;
+        affectedItemIds.add(itemId);
+        expanded = true;
+      }
+    }
+  }
+
+  const itemLabel = (itemId) => {
+    const value = payloadOf(getDetail("item-identity", itemId));
+    const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
+      .find((candidate) => String(candidate || "").trim());
+    const level = Number(value.level);
+    return `${String(name || itemId).trim()}${Number.isInteger(level) && level > 0 ? `（第 ${level} 级）` : ""}`;
+  };
+  const relations = relationEntries
+    .filter((relation) => affectedItemIds.has(relation.sourceItemId)
+      || (relation.targetItemId && affectedItemIds.has(relation.targetItemId)))
+    .map((relation) => ({
+      objectId: relation.objectId,
+      sourceItemId: relation.sourceItemId,
+      sourceLabel: itemLabel(relation.sourceItemId),
+      targetItemId: relation.targetItemId,
+      targetLabel: relation.targetItemId ? itemLabel(relation.targetItemId) : "最高等级或未观测结果",
+      disposition: relation.disposition,
+    }));
+  const orders = (state?.orders || []).map((order, index) => {
+    const requiredItemIds = [...new Set([
+      ...(order.requiredItemIds || []),
+      ...(order.items || []).map((item) => item.itemId),
+    ].filter(Boolean).map(String))];
+    const impactedItemIds = requiredItemIds.filter((itemId) => affectedItemIds.has(itemId));
+    if (!impactedItemIds.length) return null;
+    return {
+      slot: String(order.slot ?? index + 1),
+      impactedItemIds,
+      impactedItems: impactedItemIds.map(itemLabel),
+    };
+  }).filter(Boolean);
+  return {
+    summary: orders.length || relations.length
+      ? `暂停后，${orders.length} 个当前订单和 ${relations.length} 条合成关系将暂时失去该对象提供的规划路径。`
+      : "当前未发现直接受影响的订单或合成关系；暂停仍会让该对象立即退出规划。",
+    orders,
+    relations,
+    affectedItemIds: [...affectedItemIds],
+  };
+}
+
 class AutomationRuntime {
   constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true, runtimeControl = null } = {}) {
     this.rootDir = rootDir;
@@ -379,9 +467,13 @@ class AutomationRuntime {
   getCatalogObject(objectType, objectId) {
     const object = this.database.getCatalogObject(objectType, objectId);
     if (!object) return object;
+    const enrichedObject = {
+      ...object,
+      planningImpact: buildCatalogPlanningImpact(this.database, this.lastState, object),
+    };
     const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
     if (objectType === "item-identity") {
-      return { ...object, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
+      return { ...enrichedObject, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
     }
     if (objectType === "production-mode") {
       const mode = object.effectiveValue || object.algorithmCandidate || {};
@@ -408,7 +500,7 @@ class AutomationRuntime {
         }];
       }));
       return {
-        ...object,
+        ...enrichedObject,
         productionModeContext: {
           producerItemId,
           modeId,
@@ -448,7 +540,7 @@ class AutomationRuntime {
         };
       });
       return {
-        ...object,
+        ...enrichedObject,
         productionProfileContext: {
           producer: describeItem(profile.producerItemId || object.objectId),
           candidateOutputs: (profile.candidateOutputs || []).map(describeItem),
@@ -456,7 +548,7 @@ class AutomationRuntime {
         },
       };
     }
-    if (objectType !== "merge-relation") return object;
+    if (objectType !== "merge-relation") return enrichedObject;
     const items = this.database.listCatalogObjects({ objectType: "item-identity" }).map((summary) => {
       const identity = this.database.getCatalogObject(summary.objectType, summary.objectId);
       const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
@@ -484,7 +576,7 @@ class AutomationRuntime {
         reviewStatus: relation?.reviewStatus || "clear",
       };
     });
-    return { ...object, relationContext: { items, relations } };
+    return { ...enrichedObject, relationContext: { items, relations } };
   }
 
   getPlanningCatalog({ includeProvisional = false, executionMode = "assisted" } = {}) {
@@ -584,9 +676,28 @@ class AutomationRuntime {
     }
   }
 
-  setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {
-    const object = this.catalogGate.setObjectDisposition(objectType, objectId, disposition, reason, expectedRevision);
-    this.emit("catalog-state-updated", { object });
+  async setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {
+    const changed = this.catalogGate.setObjectDisposition(objectType, objectId, disposition, reason, expectedRevision);
+    let planningResult;
+    try {
+      planningResult = await this._replanAfterCatalogReview();
+    } catch (error) {
+      planningResult = {
+        status: "failed",
+        recovered: false,
+        boundaryReason: "catalog-disposition-replan-failed",
+        recommendedOrderSlot: null,
+        error: error.message,
+      };
+    }
+    const planningEligible = changed.disposition === "enabled"
+      && (changed.status === "active" || (changed.status === "provisional" && this.getSettings().mode === "observation"));
+    const object = {
+      ...this.getCatalogObject(objectType, objectId),
+      planningEligible,
+      planningResult,
+    };
+    this.emit("catalog-state-updated", { object, planningEligible, planningResult });
     return object;
   }
 

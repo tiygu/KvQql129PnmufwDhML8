@@ -163,6 +163,18 @@ test("产出档位分开显示三类分布、样本稳定性且普通路径没�
   assert.doesNotMatch(modePanel, /<input/);
 });
 
+test("对象暂停在高级诊断中先预览订单与关系并二次确认，恢复保持直接可用", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "web", "src", "CatalogReviewWorkspace.tsx"), "utf8");
+  const advanced = source.slice(source.indexOf("advanced-review-actions"));
+
+  for (const copy of ["对象规划资格", "预览暂停影响", "暂停影响预览", "受影响订单", "受影响合成关系", "确认暂停对象", "取消", "立即恢复对象"]) {
+    assert.match(advanced, new RegExp(copy));
+  }
+  assert.match(source, /pauseConfirmationOpen/);
+  assert.match(source, /detail\.planningImpact/);
+  assert.match(source, /detail\.disposition === "paused"[\s\S]*togglePause/);
+});
+
 test("图鉴证据风险入口直接定位第一个真实阻塞项", () => {
   const source = read("web/src/App.tsx");
   assert.match(source, /const evidenceReviewTarget = [\s\S]*blocker\.reviewTarget/);

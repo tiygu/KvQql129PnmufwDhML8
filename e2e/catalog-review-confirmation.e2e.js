@@ -200,6 +200,26 @@ async function main() {
     expectedRevision: first.revision,
   });
   assert.notDeepEqual(first.effectiveValue, first.algorithmCandidate);
+  let pausePreviewRelation = runtime.database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId: "browser-first",
+    payload: { itemId: "browser-first", chainId: "review-chain", level: 1, requiredCount: 2, mergeTarget: "browser-next" },
+    sourceType: "runtime-capture",
+    sourceRef: "browser-first-pause-preview.json",
+    countDuplicate: false,
+  });
+  pausePreviewRelation = runtime.database.saveCatalogVersion({
+    objectType: "merge-relation",
+    objectId: "browser-first",
+    payload: pausePreviewRelation.algorithmCandidate,
+    status: "active",
+    origin: "user",
+    expectedRevision: pausePreviewRelation.revision,
+  });
+  runtime.lastState = {
+    ...runtime.lastState,
+    orders: [{ slot: "pause-order", items: [{ itemId: "browser-next", complete: false }] }],
+  };
   let relatedConflictSeeded = false;
   runtime.catalogReviewReplanner = async ({ input }) => {
     if (input.objectId === editable.objectId) {
@@ -299,17 +319,56 @@ async function main() {
 
     const skippedBefore = runtime.getCatalogObject("item-identity", first.objectId);
     const planningBeforeSkip = runtime.getPlanningCatalog();
+    await page.getByText("高级诊断与证据处置").click();
+    const dispositionPostsBeforePreview = postRequests.filter((url) => url.endsWith("/api/catalog/object/disposition")).length;
+    await page.getByRole("button", { name: "预览暂停影响" }).click();
+    const pauseDialog = page.getByRole("alertdialog", { name: "确认暂停对象" });
+    await pauseDialog.getByRole("heading", { name: "暂停影响预览" }).waitFor();
+    await pauseDialog.getByText(/1 个当前订单和 [1-9]\d* 条合成关系/).waitFor();
+    await pauseDialog.getByText(/订单 pause-order/).waitFor();
+    await pauseDialog.getByText(/园艺手套.*下一候选/).waitFor();
+    assert.equal(postRequests.filter((url) => url.endsWith("/api/catalog/object/disposition")).length, dispositionPostsBeforePreview);
+    await pauseDialog.getByRole("button", { name: "取消" }).click();
+    assert.equal(await pauseDialog.count(), 0);
+    assert.equal(runtime.getCatalogObject("item-identity", first.objectId).disposition, "enabled");
+
+    await page.getByRole("button", { name: "预览暂停影响" }).click();
+    await pauseDialog.getByRole("button", { name: "确认暂停对象" }).click();
+    await page.getByRole("status").filter({ hasText: "对象已暂停并立即退出真实规划" }).waitFor();
+    const pausedObject = runtime.getCatalogObject("item-identity", first.objectId);
+    assert.equal(pausedObject.disposition, "paused");
+    assert.equal(pausedObject.reviewStatus, skippedBefore.reviewStatus);
+    assert.deepEqual(pausedObject.evidence, skippedBefore.evidence);
+    assert.deepEqual(pausedObject.rulingHistory, skippedBefore.rulingHistory);
+    assert.deepEqual(pausedObject.versions, skippedBefore.versions);
+    assert.equal(pausedObject.revision, skippedBefore.revision + 1);
+    await page.getByRole("button", { name: "恢复对象" }).click();
+    await page.getByRole("status").filter({ hasText: /对象已恢复/ }).waitFor();
+    const resumedObject = runtime.getCatalogObject("item-identity", first.objectId);
+    assert.equal(resumedObject.disposition, "enabled");
+    assert.equal(resumedObject.reviewStatus, skippedBefore.reviewStatus);
+    assert.deepEqual(resumedObject.evidence, skippedBefore.evidence);
+    assert.deepEqual(resumedObject.rulingHistory, skippedBefore.rulingHistory);
+    assert.deepEqual(resumedObject.versions, skippedBefore.versions);
+    assert.equal(resumedObject.revision, skippedBefore.revision + 2);
+
     await page.getByRole("button", { name: "暂时跳过" }).click();
     await page.getByRole("status").filter({ hasText: "已暂时跳过，本轮稍后再处理" }).waitFor();
     await page.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
     await page.getByRole("button", { name: /疑似“园艺手套”.*已跳过/ }).waitFor();
     const skippedAfter = runtime.getCatalogObject("item-identity", first.objectId);
-    assert.equal(skippedAfter.revision, skippedBefore.revision);
-    assert.deepEqual(skippedAfter.activeVersion, skippedBefore.activeVersion);
-    assert.deepEqual(skippedAfter.effectiveValue, skippedBefore.effectiveValue);
-    assert.deepEqual(skippedAfter.evidence, skippedBefore.evidence);
-    assert.deepEqual(skippedAfter.reviewReasons, skippedBefore.reviewReasons);
-    assert.deepEqual(runtime.getPlanningCatalog(), planningBeforeSkip);
+    assert.equal(skippedAfter.revision, resumedObject.revision);
+    assert.deepEqual(skippedAfter.activeVersion, resumedObject.activeVersion);
+    assert.deepEqual(skippedAfter.effectiveValue, resumedObject.effectiveValue);
+    assert.deepEqual(skippedAfter.evidence, resumedObject.evidence);
+    assert.deepEqual(skippedAfter.reviewReasons, resumedObject.reviewReasons);
+    const planningAfterSkip = runtime.getPlanningCatalog();
+    const withoutRepositoryRevision = (item) => {
+      const { repositoryRevision, ...domainItem } = item;
+      return domainItem;
+    };
+    assert.deepEqual(planningAfterSkip.items.map(withoutRepositoryRevision), planningBeforeSkip.items.map(withoutRepositoryRevision));
+    assert.deepEqual(planningAfterSkip.producers, planningBeforeSkip.producers);
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: first.objectId }).length, 0);
     assert.equal(runtime.database.listCatalogAuditSummaries({ objectId: first.objectId }).length, 0);
 
@@ -323,7 +382,7 @@ async function main() {
     await page.getByRole("heading", { name: "疑似“园艺手套”" }).waitFor();
     await page.getByRole("button", { name: "确认无误" }).click();
     await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
-    await page.getByText("Catalog Audit Summary").waitFor();
+    await page.getByText("Catalog Audit Summary").first().waitFor();
     await page.getByText("规划已恢复").waitFor();
     await page.getByRole("heading", { name: "疑似“后续候选”" }).waitFor();
 

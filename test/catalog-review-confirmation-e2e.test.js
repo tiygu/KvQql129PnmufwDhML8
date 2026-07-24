@@ -56,6 +56,28 @@ function seedReviewCandidate(runtime, objectId, level) {
   return runtime.catalogGate.evaluateObject("item-identity", objectId);
 }
 
+function seedActiveCatalogItem(runtime, objectId, level, mergeTarget = null) {
+  runtime.database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId,
+    payload: { itemId: objectId, chainId: "pause-chain", level, baseUnits: 2 ** (level - 1), name: `物品 ${level}` },
+    sourceType: "runtime-capture",
+    sourceRef: `${objectId}-identity.json`,
+    countDuplicate: false,
+  });
+  runtime.catalogGate.evaluateObject("item-identity", objectId);
+  runtime.database.observeCatalogObject({
+    objectType: "merge-relation",
+    objectId,
+    payload: { itemId: objectId, chainId: "pause-chain", level, requiredCount: 2, mergeTarget },
+    sourceType: "runtime-capture",
+    sourceRef: `${objectId}-relation.json`,
+    countDuplicate: false,
+  });
+  runtime.catalogGate.evaluateObject("merge-relation", objectId);
+  return runtime.database.getCatalogObject("item-identity", objectId);
+}
+
 test("真实重规划从证据阻塞中返回首个独立审核对象", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-review-production-replan-"));
   const runtime = new AutomationRuntime({
@@ -181,6 +203,142 @@ test("控制台确认无误后保存 SQLite 审计、重规划、同步所有控
     consoleB.close();
     await server.close();
     await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("暂停对象预览订单与关系、隔离规划并在恢复后向所有控制台广播同一 revision", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-object-pause-e2e-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  seedActiveCatalogItem(runtime, "pause-target", 2);
+  let source = seedActiveCatalogItem(runtime, "pause-source", 1, "pause-target");
+  source = runtime.database.applyCatalogRuling({
+    objectType: "item-identity",
+    objectId: "pause-source",
+    fieldPath: "name",
+    decision: "confirm",
+    value: "物品 1",
+    actor: "历史操作者",
+    note: "保留裁决历史",
+    expectedRevision: source.revision,
+  });
+  runtime.lastState = {
+    schemaVersion: 1,
+    scene: "board",
+    resources: { energy: 10 },
+    board: { signature: "pause-fixture", empty: 8, grids: [], mergeCandidates: [] },
+    orders: [{ slot: "pause-order", items: [{ itemId: "pause-target", complete: false }] }],
+  };
+  let replanCalls = 0;
+  runtime._replanAfterCatalogReview = async () => {
+    replanCalls += 1;
+    return {
+      status: "ready",
+      recovered: true,
+      boundaryReason: null,
+      recommendedOrderSlot: "pause-order",
+    };
+  };
+  const before = runtime.getCatalogObject("item-identity", "pause-source");
+  assert.equal(before.planningImpact.orders.length, 1);
+  assert.equal(before.planningImpact.relations.some((relation) => relation.objectId === "pause-source"), true);
+  const preserved = {
+    evidence: before.evidence,
+    versions: before.versions,
+    rulingHistory: before.rulingHistory,
+  };
+  assert.equal(runtime.getPlanningCatalog().items.some((item) => item.id === "pause-source"), true);
+
+  const server = createControlServer({
+    runtime,
+    publicRoot: path.join(__dirname, "..", "public"),
+    dataDir,
+  });
+  const port = await listen(server);
+  const socketUrl = `ws://127.0.0.1:${port}/ws`;
+  const [consoleA, consoleB] = await Promise.all([openSocket(socketUrl), openSocket(socketUrl)]);
+  try {
+    const pausedEventA = waitForEvent(consoleA, (event) => event.type === "catalog-review-updated" && event.disposition === "paused", "console A pause event");
+    const pausedEventB = waitForEvent(consoleB, (event) => event.type === "catalog-review-updated" && event.disposition === "paused", "console B pause event");
+    const pauseResponse = await fetch(`http://127.0.0.1:${port}/api/catalog/object/disposition`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objectType: "item-identity",
+        objectId: "pause-source",
+        disposition: "paused",
+        reason: "operator-confirmed-planning-impact",
+        expectedRevision: before.revision,
+      }),
+    });
+    assert.equal(pauseResponse.status, 200);
+    const paused = await pauseResponse.json();
+    assert.equal(paused.disposition, "paused");
+    assert.equal(paused.planningEligible, false);
+    assert.equal(paused.reviewStatus, before.reviewStatus);
+    assert.equal(paused.revision, before.revision + 1);
+    assert.deepEqual(paused.evidence, preserved.evidence);
+    assert.deepEqual(paused.versions, preserved.versions);
+    assert.deepEqual(paused.rulingHistory, preserved.rulingHistory);
+    assert.equal(runtime.getPlanningCatalog().items.some((item) => item.id === "pause-source"), false);
+    const [receivedPauseA, receivedPauseB] = await Promise.all([pausedEventA, pausedEventB]);
+    assert.deepEqual(receivedPauseA, receivedPauseB);
+    assert.equal(receivedPauseA.revision, paused.revision);
+    assert.equal(receivedPauseA.planningEligible, false);
+
+    const resumedEventA = waitForEvent(consoleA, (event) => event.type === "catalog-review-updated" && event.disposition === "enabled", "console A resume event");
+    const resumedEventB = waitForEvent(consoleB, (event) => event.type === "catalog-review-updated" && event.disposition === "enabled", "console B resume event");
+    const resumeResponse = await fetch(`http://127.0.0.1:${port}/api/catalog/object/disposition`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objectType: "item-identity",
+        objectId: "pause-source",
+        disposition: "enabled",
+        reason: "operator-resumed-review",
+        expectedRevision: paused.revision,
+      }),
+    });
+    assert.equal(resumeResponse.status, 200);
+    const resumed = await resumeResponse.json();
+    assert.equal(resumed.disposition, "enabled");
+    assert.equal(resumed.planningEligible, true);
+    assert.equal(resumed.revision, paused.revision + 1);
+    assert.deepEqual(resumed.evidence, preserved.evidence);
+    assert.deepEqual(resumed.versions, preserved.versions);
+    assert.deepEqual(resumed.rulingHistory, preserved.rulingHistory);
+    assert.equal(runtime.getPlanningCatalog().items.some((item) => item.id === "pause-source"), true);
+    const [receivedResumeA, receivedResumeB] = await Promise.all([resumedEventA, resumedEventB]);
+    assert.deepEqual(receivedResumeA, receivedResumeB);
+    assert.equal(receivedResumeA.revision, resumed.revision);
+    assert.equal(receivedResumeA.planningEligible, true);
+    assert.equal(replanCalls, 2);
+  } finally {
+    consoleA.close();
+    consoleB.close();
+    await server.close();
+    await runtime.close();
+  }
+
+  const restoredRuntime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  try {
+    const restored = restoredRuntime.getCatalogObject("item-identity", "pause-source");
+    assert.equal(restored.disposition, "enabled");
+    assert.deepEqual(restored.evidence, preserved.evidence);
+    assert.deepEqual(restored.versions, preserved.versions);
+    assert.deepEqual(restored.rulingHistory, preserved.rulingHistory);
+    assert.equal(restored.transitions.some((transition) => transition.toDisposition === "paused"), true);
+    assert.equal(restored.transitions.some((transition) => transition.toDisposition === "enabled"), true);
+  } finally {
+    await restoredRuntime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });

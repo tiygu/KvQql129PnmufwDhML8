@@ -299,6 +299,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const [loadError, setLoadError] = useState("");
   const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
   const [latestAuditSummary, setLatestAuditSummary] = useState<any>(null);
+  const [pauseConfirmationOpen, setPauseConfirmationOpen] = useState(false);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
@@ -348,6 +349,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
 
   useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
   useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
+  useEffect(() => { setPauseConfirmationOpen(false); }, [detail?.objectType, detail?.objectId, detail?.revision]);
 
   const selectSummary = (entry: any) => {
     const key = `${entry.objectType}:${entry.objectId}`;
@@ -579,16 +581,25 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
 
   const togglePause = async () => {
     if (!detail) return;
+    if (detail.disposition !== "paused" && !pauseConfirmationOpen) {
+      setPauseConfirmationOpen(true);
+      setMessage("");
+      return;
+    }
     setBusy(true);
     try {
       const disposition = detail.disposition === "paused" ? "enabled" : "paused";
       const updated = await controlApi.setCatalogObjectDisposition({ objectType: detail.objectType, objectId: detail.objectId, disposition, reason: disposition === "paused" ? "operator-paused-review" : "operator-resumed-review", expectedRevision: detail.revision });
       setDetail(updated);
-      setMessage(disposition === "paused" ? "对象已暂停并立即退出真实规划" : "对象已恢复参与规划资格判断");
-      onChanged();
+      setPauseConfirmationOpen(false);
+      setMessage(disposition === "paused"
+        ? "对象已暂停并立即退出真实规划"
+        : updated.planningEligible ? "对象已恢复并重新参与规划" : "对象已恢复，当前状态仍未取得规划资格");
+      await onChanged();
     } catch (error: any) {
       if (error.payload?.currentObject) setDetail(error.payload.currentObject);
-      setMessage(error.message);
+      setPauseConfirmationOpen(false);
+      setMessage(error.payload?.code === "CATALOG_REVISION_CONFLICT" ? "对象已被其他控制台修改；已加载最新版本，请重新预览影响" : error.message);
     } finally { setBusy(false); }
   };
 
@@ -664,7 +675,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
           <div className="panel-head">
             <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
-            <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}<button className="ghost-btn" disabled={busy} onClick={togglePause}>{detail.disposition === "paused" ? <><Play size={15}/>恢复对象</> : <><Pause size={15}/>暂停对象</>}</button></div>
+            <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}{detail.disposition === "paused" ? <button className="ghost-btn" disabled={busy} onClick={togglePause}><Play size={15}/>恢复对象</button> : <span className="object-disposition-badge">规划中</span>}</div>
           </div>
           <div className="human-review-reason"><AlertTriangle size={18}/><div><strong>{selectedSummary?.actionStatus === "以后再看" ? "为什么以后再看" : "为什么需要处理"}</strong><p>{humanReadableReason(detail)}</p></div></div>
           <div className="review-evidence-summary">
@@ -777,6 +788,23 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           </details>
           <details className="advanced-review-actions">
             <summary>高级诊断与证据处置</summary>
+            <div className="object-planning-control">
+              <div><h3>对象规划资格</h3><p>{detail.disposition === "paused" ? "当前对象已持久暂停；证据、候选、裁决与审计历史仍完整保留。" : "当前对象可按状态参与规划；暂停只改变规划资格，不会替代普通审核结论。"}</p></div>
+              {detail.disposition === "paused"
+                ? <button disabled={busy} onClick={togglePause}><Play size={14}/>立即恢复对象</button>
+                : !pauseConfirmationOpen
+                  ? <button className="danger" disabled={busy} onClick={togglePause}><Pause size={14}/>预览暂停影响</button>
+                  : <div className="pause-impact-confirmation" role="alertdialog" aria-label="确认暂停对象">
+                    <h4>暂停影响预览</h4>
+                    <p>{detail.planningImpact?.summary || "正在核对受影响的订单与关系。"}</p>
+                    <div className="pause-impact-grid">
+                      <section><strong>受影响订单</strong>{detail.planningImpact?.orders?.length ? detail.planningImpact.orders.map((order: any) => <span key={order.slot}>订单 {order.slot} · {order.impactedItems.join("、")}</span>) : <span>当前没有直接受影响的订单</span>}</section>
+                      <section><strong>受影响合成关系</strong>{detail.planningImpact?.relations?.length ? detail.planningImpact.relations.map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>) : <span>当前没有直接受影响的合成关系</span>}</section>
+                    </div>
+                    <p className="pause-impact-warning">再次确认后，对象会持久退出规划并立即重新规划；普通审核状态和全部历史保持不变。</p>
+                    <div className="pause-impact-actions"><button className="danger" disabled={busy} onClick={togglePause}>确认暂停对象</button><button className="ghost-btn" disabled={busy} onClick={() => setPauseConfirmationOpen(false)}>取消</button></div>
+                  </div>}
+            </div>
             <div className="review-evidence"><div><h3>证据采用与否决</h3>{detail.evidence?.map((evidence: any, index: number) => <p key={evidence.id}><strong>证据 {index + 1} · {valueLabel(evidence.sourceType)}</strong><span>{evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div></div>
           </details>
         </>}
