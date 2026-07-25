@@ -442,7 +442,12 @@ class AutomationRuntime {
     }
     const selectedIconHashes = this.database.getSelectedIconHashes();
     const iconUrls = Object.fromEntries(Object.entries(selectedIconHashes).map(([itemId, hash]) => [itemId, `/api/catalog/icon/${hash}`]));
-    const repository = { summary: this.database.getCatalogRepositorySummary() };
+    const repository = {
+      summary: this.database.getCatalogRepositorySummary(),
+      releaseControl: this.database.getCatalogReleaseControl(),
+      schemaStatus: this.database.getCatalogSchemaStatus(),
+      compatibilityMetrics: this.database.getCatalogCompatibilityMetrics(),
+    };
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
@@ -616,12 +621,47 @@ class AutomationRuntime {
 
   importCatalog(snapshot, options = {}) {
     if (snapshot?.source?.type === "sqlite-catalog-repository") return this.database.importCatalogSnapshot(snapshot, options);
-    const result = migrateLegacyCatalog(this.database, snapshot, {
+    const before = this.database.getCatalogRepositorySummary();
+    const existingObjects = new Set(this.database.listCatalogObjects().map((object) => `${object.objectType}:${object.objectId}`));
+    const touchedObjects = new Set([
+      ...(snapshot?.items || []).flatMap((item) => [
+        `item-identity:${String(item.id)}`,
+        `merge-relation:${String(item.id)}`,
+      ]),
+      ...(snapshot?.producers || []).map((producer) => `production-profile:${String(producer.itemId)}`),
+    ]);
+    const stats = this.database.importCatalog(snapshot, {
       sourceFile: options.sourceFile || "json-import",
-      historicActions: [],
-      recordSourceEvidence: true,
+      sourceType: "json-import",
     });
-    return { imported: result.migrated, preserved: 0, revision: this.database.getCatalogRevision(), repository: result.repository };
+    const repository = this.database.getCatalogRepositorySummary();
+    this.catalogViewCache.clear();
+    return {
+      ...stats,
+      mode: "evidence-only",
+      imported: Math.max(0, repository.objects - before.objects),
+      preserved: [...touchedObjects].filter((key) => existingObjects.has(key)).length,
+      revision: this.database.getCatalogRevision(),
+      repository,
+    };
+  }
+
+  getCatalogReleaseStatus() {
+    return {
+      releaseControl: this.database.getCatalogReleaseControl(),
+      schemaStatus: this.database.getCatalogSchemaStatus(),
+      compatibilityMetrics: this.database.getCatalogCompatibilityMetrics(),
+    };
+  }
+
+  setCatalogReleaseControl(input) {
+    const releaseControl = this.database.setCatalogReleaseControl(input);
+    this.catalogViewCache.clear();
+    return {
+      releaseControl,
+      schemaStatus: this.database.getCatalogSchemaStatus(),
+      compatibilityMetrics: this.database.getCatalogCompatibilityMetrics(),
+    };
   }
 
   acquireCatalogIcon(itemId) {
@@ -733,6 +773,21 @@ class AutomationRuntime {
 
   applyCatalogRuling(input) {
     return this.database.applyCatalogRuling(input);
+  }
+
+  async adaptLegacyCatalogRuling(input, options = {}) {
+    const committed = this.database.adaptLegacyCatalogRuling(input, options);
+    return this.completeCatalogReview({
+      objectType: committed.objectType,
+      objectId: committed.objectId,
+      decision: committed.reviewResolution.decision,
+      snapshot: committed.reviewResolution.snapshot,
+      actor: input.actor,
+      note: input.note,
+      requestId: committed.reviewResolution.requestId,
+      expectedRevision: Number(input.expectedRevision),
+      compatibilitySource: committed.reviewResolution.compatibilitySource,
+    });
   }
 
   previewCatalogReview(input) {

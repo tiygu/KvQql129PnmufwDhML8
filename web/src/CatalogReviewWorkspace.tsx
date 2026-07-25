@@ -343,6 +343,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const queue = repository?.reviewQueue || [];
   const laterQueue = repository?.laterQueue || [];
   const objects = repository?.objects || [];
+  const ordinaryReviewEnabled = repository?.releaseControl?.entryMode !== "legacy-advanced";
   const [selectedKey, setSelectedKey] = useState<string | null>(() => {
     try { return globalThis.localStorage?.getItem(LOCAL_REVIEW_SELECTION_KEY) || null; }
     catch (_) { return null; }
@@ -1044,6 +1045,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
               </article>
             </div> : <div className="empty-state compact"><History/><span>尚未取得带来源的理论配置，真实样本会暂存并在配置出现后重放。</span></div>}
           </section>}
+          {ordinaryReviewEnabled ? <>
           <div className="candidate-snapshot">
             <h3>本次将确认的完整候选</h3>
             {detail.objectType === "item-identity" ? <div className="item-identity-form">
@@ -1072,6 +1074,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             {message && <p className="review-message" role="status">{message}</p>}
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(detail.catalogAuditSummary)}</span></div>}
           </div>)}
+          </> : <div className="release-control-rollback" role="status"><strong>普通完整快照入口已由发布开关隐藏</strong><p>已提交领域事实保持生效；旧高级诊断入口仍可用于检查、证据处置与回退期间的兼容操作。</p></div>}
           <details className="technical-review-details">
             <summary>只读技术详情</summary>
             <div className="technical-identity"><strong>内部对象标识</strong><code>{detail.objectType}/{detail.objectId}</code></div>
@@ -1104,7 +1107,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
               {detail.objectType === "item-identity" && <div><h3>图标识别技术记录</h3>{detail.iconCandidates?.map((candidate: any) => <p key={candidate.id}><code>{display(candidate)}</code></p>)}{detail.iconSelectionHistory?.map((entry: any) => <p key={entry.id}><code>{display(entry)}</code></p>)}</div>}
             </div>
           </details>
-          <details className="advanced-review-actions">
+          <details className="advanced-review-actions" open={!ordinaryReviewEnabled}>
             <summary>高级诊断与证据处置</summary>
             <div className="object-planning-control">
               <div><h3>对象规划资格</h3><p>{detail.disposition === "paused" ? "当前对象已持久暂停；证据、候选、裁决与审计历史仍完整保留。" : "当前对象可按状态参与规划；暂停只改变规划资格，不会替代普通审核结论。"}</p></div>

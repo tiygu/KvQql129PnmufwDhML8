@@ -288,3 +288,12 @@ test("图标候选无需隐藏备注前置条件并在请求完成前立即显�
   assert.match(selectBody, /setDetail\(markIconSelected\(detail, candidateId\)\)/);
   assert.ok(selectBody.indexOf("setDetail(markIconSelected") < selectBody.indexOf("await controlApi.selectCatalogIcon"));
 });
+
+test("图鉴发布回退隐藏普通完整快照入口但保留旧高级诊断入口和已提交事实提示", () => {
+  const source = read("web/src/CatalogReviewWorkspace.tsx");
+
+  assert.match(source, /ordinaryReviewEnabled\s*=\s*repository\?\.releaseControl\?\.entryMode\s*!==\s*"legacy-advanced"/);
+  assert.match(source, /普通完整快照入口已由发布开关隐藏/);
+  assert.match(source, /已提交领域事实保持生效/);
+  assert.match(source, /advanced-review-actions" open=\{!ordinaryReviewEnabled\}/);
+});

@@ -13,6 +13,8 @@ const CATALOG_VERSION_ORIGINS = new Set(["user", "legacy-migration", "inference-
 const CATALOG_DISPOSITIONS = new Set(["enabled", "paused", "rejected"]);
 const CATALOG_EVIDENCE_DISPOSITIONS = new Set(["eligible", "paused", "rejected"]);
 const CATALOG_RULING_DECISIONS = new Set(["confirm", "modify", "revoke"]);
+const CATALOG_RELEASE_ENTRY_MODES = new Set(["full-snapshot", "legacy-advanced"]);
+const CURRENT_CATALOG_SCHEMA_VERSION = 2;
 const UNSAFE_FIELD_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 
 function parseJson(value) {
@@ -169,8 +171,16 @@ class AutomationDatabase {
   constructor(filePath = "data/automation.db") {
     this.filePath = path.resolve(String(filePath));
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    const existedBeforeOpen = fs.existsSync(this.filePath) && fs.statSync(this.filePath).size > 0;
     this.db = new DatabaseSync(this.filePath);
     this.transactionDepth = 0;
+    const backupPath = `${this.filePath}.pre-v${CURRENT_CATALOG_SCHEMA_VERSION}.bak`;
+    const priorVersion = Number(this.db.prepare("PRAGMA user_version").get().user_version);
+    if (existedBeforeOpen && priorVersion < CURRENT_CATALOG_SCHEMA_VERSION) {
+      this.db.exec("PRAGMA wal_checkpoint(FULL)");
+      if (!fs.existsSync(backupPath)) fs.copyFileSync(this.filePath, backupPath);
+    }
+    this.preMigrationBackupPath = fs.existsSync(backupPath) ? backupPath : null;
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate();
   }
@@ -310,8 +320,21 @@ class AutomationDatabase {
         optional_note TEXT,
         object_revision INTEGER NOT NULL,
         planning_result_json TEXT NOT NULL,
+        schema_version INTEGER NOT NULL DEFAULT 1,
+        compatibility_source TEXT NOT NULL DEFAULT 'legacy-default',
         created_at TEXT NOT NULL,
         FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS catalog_compatibility_calls (
+        operation TEXT PRIMARY KEY,
+        call_count INTEGER NOT NULL DEFAULT 0,
+        last_called_at TEXT NOT NULL,
+        details_json TEXT NOT NULL DEFAULT '{}'
       );
       CREATE TABLE IF NOT EXISTS catalog_audit_summaries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -446,7 +469,70 @@ class AutomationDatabase {
     if (!objectColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_objects ADD COLUMN disposition TEXT NOT NULL DEFAULT 'enabled'");
     const evidenceColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_evidence)").all().map((column) => column.name));
     if (!evidenceColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_evidence ADD COLUMN disposition TEXT NOT NULL DEFAULT 'eligible'");
+    const resolutionColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_review_resolutions)").all().map((column) => column.name));
+    if (!resolutionColumns.has("schema_version")) this.db.exec("ALTER TABLE catalog_review_resolutions ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1");
+    if (!resolutionColumns.has("compatibility_source")) this.db.exec("ALTER TABLE catalog_review_resolutions ADD COLUMN compatibility_source TEXT NOT NULL DEFAULT 'legacy-default'");
+    const migratedAt = new Date().toISOString();
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(1,'sqlite-catalog-repository',?)").run(migratedAt);
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(2,'full-snapshot-compatibility',?)").run(migratedAt);
+    this.db.exec(`PRAGMA user_version=${CURRENT_CATALOG_SCHEMA_VERSION}`);
     this.db.exec("UPDATE catalog_repository_objects SET candidate_version_id=NULL WHERE status='active' AND active_version_id IS NOT NULL AND candidate_version_id IS NOT NULL");
+  }
+
+  getCatalogSchemaStatus() {
+    return {
+      currentVersion: Number(this.db.prepare("PRAGMA user_version").get().user_version),
+      targetVersion: CURRENT_CATALOG_SCHEMA_VERSION,
+      preMigrationBackupPath: this.preMigrationBackupPath,
+      migrations: this.db.prepare("SELECT version,name,applied_at FROM schema_migrations ORDER BY version").all().map((row) => ({
+        version: Number(row.version),
+        name: row.name,
+        appliedAt: row.applied_at,
+      })),
+    };
+  }
+
+  recordCatalogCompatibilityCall(operation, details = {}) {
+    const normalizedOperation = String(operation || "").trim();
+    if (!normalizedOperation) throw new TypeError("catalog compatibility operation is required");
+    const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO catalog_compatibility_calls(operation,call_count,last_called_at,details_json)
+      VALUES(?,1,?,?) ON CONFLICT(operation) DO UPDATE SET
+      call_count=call_count+1,last_called_at=excluded.last_called_at,details_json=excluded.details_json`)
+      .run(normalizedOperation, now, canonicalJson(details || {}));
+    return this.getCatalogCompatibilityMetrics().find((entry) => entry.operation === normalizedOperation);
+  }
+
+  getCatalogCompatibilityMetrics() {
+    return this.db.prepare("SELECT operation,call_count,last_called_at,details_json FROM catalog_compatibility_calls ORDER BY operation").all()
+      .map((row) => ({
+        operation: row.operation,
+        callCount: Number(row.call_count),
+        lastCalledAt: row.last_called_at,
+        details: parseJson(row.details_json) || {},
+      }));
+  }
+
+  getCatalogReleaseControl() {
+    const stored = this.getSetting("catalog-review-release-control", null);
+    return {
+      entryMode: CATALOG_RELEASE_ENTRY_MODES.has(stored?.entryMode) ? stored.entryMode : "full-snapshot",
+      updatedAt: stored?.updatedAt || null,
+    };
+  }
+
+  setCatalogReleaseControl(input) {
+    const entryMode = String(input?.entryMode || "");
+    if (!CATALOG_RELEASE_ENTRY_MODES.has(entryMode)) {
+      const error = new TypeError(`unsupported catalog release entry mode: ${entryMode}`);
+      error.code = "CATALOG_RELEASE_CONTROL_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    const releaseControl = { entryMode, updatedAt: new Date().toISOString() };
+    this.setSetting("catalog-review-release-control", releaseControl);
+    this.recordCatalogCompatibilityCall("release-control-change", { entryMode });
+    return releaseControl;
   }
 
   _catalogObjectRow(objectType, objectId) {
@@ -803,6 +889,7 @@ class AutomationDatabase {
     const optionalNote = note || (decision === "modify" ? generatedRulingNote : null);
     const hasExplicitRequestId = String(input.requestId || "").trim().length > 0;
     const requestId = String(input.requestId || `legacy-review:${crypto.randomUUID()}`).trim();
+    const compatibilitySource = String(input.compatibilitySource || "native-full-snapshot").trim();
     if (!requestId) throw new TypeError("catalog review requestId is required");
     return this.transaction(() => {
       const before = this._catalogObjectRow(identity.objectType, identity.objectId);
@@ -817,6 +904,7 @@ class AutomationDatabase {
         snapshot: payload,
         actor,
         optionalNote,
+        compatibilitySource,
       });
       const existingResolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(requestId);
       if (existingResolution) {
@@ -870,8 +958,8 @@ class AutomationDatabase {
         ? { status: "pending", recovered: false }
         : { status: "not-requested", recovered: true };
       const insertedResolution = this.db.prepare(`INSERT INTO catalog_review_resolutions(
-        object_id,request_id,request_fingerprint,decision,snapshot_json,actor,optional_note,object_revision,planning_result_json,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+        object_id,request_id,request_fingerprint,decision,snapshot_json,actor,optional_note,object_revision,planning_result_json,schema_version,compatibility_source,created_at
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         before.id,
         requestId,
         requestFingerprint,
@@ -881,6 +969,8 @@ class AutomationDatabase {
         optionalNote,
         nextRevision,
         canonicalJson(planningResult),
+        CURRENT_CATALOG_SCHEMA_VERSION,
+        compatibilitySource,
         now,
       );
       const resolutionId = Number(insertedResolution.lastInsertRowid);
@@ -1018,6 +1108,8 @@ class AutomationDatabase {
         optionalNote: resolutionRow.optional_note || null,
         objectRevision: Number(resolutionRow.object_revision),
         planningResult,
+        schemaVersion: Number(resolutionRow.schema_version || 1),
+        compatibilitySource: resolutionRow.compatibility_source || "legacy-default",
         createdAt: resolutionRow.created_at,
       },
       catalogAuditSummary: auditRow
@@ -1046,6 +1138,8 @@ class AutomationDatabase {
       optionalNote: row.optional_note || null,
       objectRevision: Number(row.object_revision),
       planningResult: parseJson(row.planning_result_json),
+      schemaVersion: Number(row.schema_version || 1),
+      compatibilitySource: row.compatibility_source || "legacy-default",
       createdAt: row.created_at,
     }));
   }
@@ -1264,6 +1358,49 @@ class AutomationDatabase {
 
   revokeCatalogRuling(input) {
     return this._catalogRulingMutation({ ...input, decision: "revoke" }, true);
+  }
+
+  adaptLegacyCatalogRuling(input, { revoke = false } = {}) {
+    let identity;
+    let fieldPath;
+    try {
+      identity = validateCatalogIdentity(input?.objectType, input?.objectId);
+      fieldPath = String(input?.fieldPath || "").trim();
+      fieldSegments(fieldPath);
+      if (!String(input?.actor || "").trim() || !String(input?.note || "").trim()) throw new TypeError("catalog ruling actor and note are required");
+      if (!Number.isInteger(Number(input?.expectedRevision)) || Number(input.expectedRevision) < 1) throw new TypeError("catalog expectedRevision is required");
+      if (!revoke && !["confirm", "modify"].includes(String(input?.decision || ""))) throw new TypeError("catalog ruling decision is invalid");
+      if (!revoke && input.decision === "modify" && !Object.hasOwn(input, "value")) throw new TypeError("catalog ruling value is required");
+    } catch (cause) {
+      const error = new TypeError(cause.message);
+      error.code = "CATALOG_LEGACY_ACTION_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    const object = this.getCatalogObject(identity.objectType, identity.objectId);
+    if (!object) throw Object.assign(new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`), { statusCode: 404 });
+    const currentSnapshot = object.effectiveValue || object.algorithmCandidate || {};
+    const algorithmCandidate = object.algorithmCandidate || {};
+    const nextValue = revoke || input.decision === "confirm"
+      ? fieldValue(algorithmCandidate, fieldPath)
+      : input.value;
+    const snapshot = setFieldValue(currentSnapshot, fieldPath, nextValue);
+    this.recordCatalogCompatibilityCall(revoke ? "legacy-field-ruling-revoke" : "legacy-field-ruling", {
+      objectType: identity.objectType,
+      fieldPath,
+    });
+    return this.completeCatalogReview({
+      objectType: identity.objectType,
+      objectId: identity.objectId,
+      decision: revoke ? "modify" : input.decision,
+      snapshot,
+      actor: input.actor,
+      note: input.note,
+      requestId: input.requestId || `legacy-field:${crypto.randomUUID()}`,
+      expectedRevision: Number(input.expectedRevision),
+      createdAt: input.createdAt,
+      compatibilitySource: revoke ? "legacy-field-ruling-revoke" : "legacy-field-ruling",
+    });
   }
 
   getCatalogObject(objectType, objectId) {
@@ -1939,7 +2076,7 @@ class AutomationDatabase {
           this.db.prepare(`INSERT INTO catalog_repository_conflicts(object_type,object_id,conflict_type,fingerprint,details_json,status,occurrence_count,created_at,last_seen_at)
             VALUES(?,?,?,?,?,?,?,?,?)`).run(conflict.objectType, conflict.objectId, conflict.conflictType, fingerprint, detailsJson, conflict.status, Number(conflict.occurrenceCount || 1), conflict.createdAt, conflict.lastSeenAt);
         }
-        return { imported: snapshot.objects.length, preserved: 0, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
+        return { mode: "repository-restore", imported: snapshot.objects.length, preserved: 0, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
       }
       let imported = 0, preserved = 0;
       const importedObjects = new Set();
@@ -1985,7 +2122,8 @@ class AutomationDatabase {
         const restoredConflict = this.recordCatalogConflict({ objectType: conflict.objectType, objectId: conflict.objectId, conflictType: conflict.conflictType, details: conflict.details, countDuplicate: false });
         if (conflict.status === "resolved") this.resolveCatalogConflictFingerprint(conflict.objectType, conflict.objectId, conflict.conflictType, restoredConflict.fingerprint);
       }
-      return { imported, preserved, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
+      this.recordCatalogCompatibilityCall("json-evidence-import", { source: "repository-snapshot", imported, preserved });
+      return { mode: "evidence-only", imported, preserved, revision: this.getCatalogRevision(), repository: this.getCatalogRepositorySummary() };
     });
   }
 
@@ -2083,6 +2221,7 @@ class AutomationDatabase {
     return this.transaction(() => {
       this._importCatalogProjection(catalog, { sourceFile, observedAt });
       this._importCatalogRepositoryEvidence(catalog, { sourceFile, sourceType, observedAt });
+      this.recordCatalogCompatibilityCall("json-evidence-import", { source: sourceType });
       return this.getCatalogStats();
     });
   }

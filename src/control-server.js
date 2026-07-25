@@ -142,6 +142,16 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "GET /api/health") return writeJson(res, 200, { ok: true, wsPath: WS_PATH });
       if (route === "GET /api/dashboard") return writeJson(res, 200, await dashboard());
       if (route === "GET /api/catalog") return writeJson(res, 200, runtime.getCatalogView());
+      if (route === "GET /api/catalog/release-control") return writeJson(res, 200, runtime.getCatalogReleaseStatus());
+      if (route === "POST /api/catalog/release-control") {
+        const body = await readJson(req);
+        if (!["full-snapshot", "legacy-advanced"].includes(body.entryMode)) {
+          return writeJson(res, 400, { ok: false, error: "invalid-catalog-release-control-request" });
+        }
+        const result = runtime.setCatalogReleaseControl({ entryMode: body.entryMode });
+        broadcast({ type: "catalog-release-control-updated", releaseControl: result.releaseControl });
+        return writeJson(res, 200, result);
+      }
       if (route === "GET /api/catalog/export") {
         const snapshot = runtime.exportCatalog();
         const body = JSON.stringify(snapshot, null, 2) + "\n";
@@ -272,7 +282,10 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !body.fieldPath || !["confirm", "modify"].includes(body.decision) || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) {
           return writeJson(res, 400, { ok: false, error: "invalid-catalog-ruling-request" });
         }
-        const object = runtime.applyCatalogRuling({ ...body, expectedRevision: Number(body.expectedRevision) });
+        const input = { ...body, expectedRevision: Number(body.expectedRevision) };
+        const object = runtime.adaptLegacyCatalogRuling
+          ? await runtime.adaptLegacyCatalogRuling(input)
+          : runtime.applyCatalogRuling(input);
         broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
         return writeJson(res, 200, object);
       }
@@ -281,7 +294,10 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId || !body.fieldPath || !body.actor || !body.note || !Number.isInteger(Number(body.expectedRevision))) {
           return writeJson(res, 400, { ok: false, error: "invalid-catalog-ruling-revoke-request" });
         }
-        const object = runtime.revokeCatalogRuling({ ...body, expectedRevision: Number(body.expectedRevision) });
+        const input = { ...body, expectedRevision: Number(body.expectedRevision) };
+        const object = runtime.adaptLegacyCatalogRuling
+          ? await runtime.adaptLegacyCatalogRuling(input, { revoke: true })
+          : runtime.revokeCatalogRuling(input);
         broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
         return writeJson(res, 200, object);
       }
