@@ -164,6 +164,153 @@ test("运行时旧字段动作复用完整审核的重规划收尾路径", async
   assert.deepEqual(result.reviewResolution.planningResult, { status: "ready", recovered: true });
 });
 
+test("旧字段撤销恢复非人工候选并允许后续算法候选更新目标字段", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-release-"));
+  const database = new AutomationDatabase(path.join(dir, "catalog.db"));
+  const runtime = {
+    database,
+    catalogReviewReplanner: async () => ({ status: "ready", recovered: true }),
+    completeCatalogReview: AutomationRuntime.prototype.completeCatalogReview,
+  };
+  try {
+    const observed = observeIdentity(database, "item-1", "算法候选");
+    const modified = await AutomationRuntime.prototype.adaptLegacyCatalogRuling.call(runtime, {
+      objectType: "item-identity",
+      objectId: "item-1",
+      fieldPath: "name",
+      decision: "modify",
+      value: "人工命名",
+      actor: "operator",
+      note: "旧入口字段修改",
+      requestId: "legacy-field-modify",
+      expectedRevision: observed.revision,
+    });
+
+    const revoked = await AutomationRuntime.prototype.adaptLegacyCatalogRuling.call(runtime, {
+      objectType: "item-identity",
+      objectId: "item-1",
+      fieldPath: "name",
+      actor: "operator",
+      note: "旧入口撤销字段裁决",
+      requestId: "legacy-field-revoke",
+      expectedRevision: modified.revision,
+    }, { revoke: true });
+
+    assert.equal(revoked.effectiveValue.name, "算法候选");
+    assert.equal(Object.hasOwn(revoked.humanValues, "name"), false);
+    assert.equal(revoked.reviewResolution.compatibilitySource, "legacy-field-ruling-revoke");
+    assert.deepEqual(
+      (({ decision, fieldPath, oldValue, newValue }) => ({ decision, fieldPath, oldValue, newValue }))(
+        revoked.rulingHistory.at(-1),
+      ),
+      {
+        decision: "revoke",
+        fieldPath: "name",
+        oldValue: "人工命名",
+        newValue: "算法候选",
+      },
+    );
+
+    const inferred = database.saveCatalogVersion({
+      objectType: "item-identity",
+      objectId: "item-1",
+      payload: { id: "item-1", name: "更新后的算法候选", chainId: "chain-1", level: 1 },
+      status: "provisional",
+      origin: "inference-gate",
+      expectedRevision: revoked.revision,
+    });
+    assert.equal(inferred.effectiveValue.name, "更新后的算法候选");
+    assert.equal(Object.hasOwn(inferred.humanValues, "name"), false);
+  } finally {
+    database.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("旧字段撤销拒绝没有活动人工裁决的字段且不写入结论", () => withDirectory((dir) => {
+  const database = new AutomationDatabase(path.join(dir, "catalog.db"));
+  try {
+    const observed = observeIdentity(database, "item-1", "算法候选");
+
+    assert.throws(
+      () => database.adaptLegacyCatalogRuling({
+        objectType: "item-identity",
+        objectId: "item-1",
+        fieldPath: "name",
+        actor: "operator",
+        note: "撤销不存在的人工裁决",
+        requestId: "legacy-missing-revoke",
+        expectedRevision: observed.revision,
+      }, { revoke: true }),
+      (error) => error.code === "CATALOG_LEGACY_RULING_NOT_ACTIVE" && error.statusCode === 409,
+    );
+    assert.equal(database.getCatalogObject("item-identity", "item-1").revision, observed.revision);
+    assert.equal(database.listCatalogReviewResolutions({ objectId: "item-1" }).length, 0);
+    assert.equal(database.getCatalogCompatibilityMetrics().length, 0);
+  } finally {
+    database.close();
+  }
+}));
+
+test("旧字段撤销的幂等身份包含字段路径", () => withDirectory((dir) => {
+  const database = new AutomationDatabase(path.join(dir, "catalog.db"));
+  try {
+    const observed = observeIdentity(database, "item-1", "算法候选");
+    const modified = database.adaptLegacyCatalogRuling({
+      objectType: "item-identity",
+      objectId: "item-1",
+      fieldPath: "name",
+      decision: "modify",
+      value: "人工命名",
+      actor: "operator",
+      note: "建立完整人工快照",
+      requestId: "legacy-field-modify-before-collision",
+      expectedRevision: observed.revision,
+    });
+    const firstRevoke = database.adaptLegacyCatalogRuling({
+      objectType: "item-identity",
+      objectId: "item-1",
+      fieldPath: "name",
+      actor: "operator",
+      note: "撤销人工字段",
+      requestId: "legacy-shared-revoke",
+      expectedRevision: modified.revision,
+    }, { revoke: true });
+    const resolutionsAfterFirstRevoke = database.listCatalogReviewResolutions({ objectId: "item-1" }).length;
+    const rulingsAfterFirstRevoke = firstRevoke.rulingHistory.length;
+
+    const replay = database.adaptLegacyCatalogRuling({
+      objectType: "item-identity",
+      objectId: "item-1",
+      fieldPath: "name",
+      actor: "operator",
+      note: "撤销人工字段",
+      requestId: "legacy-shared-revoke",
+      expectedRevision: modified.revision,
+    }, { revoke: true });
+    assert.equal(replay.idempotentReplay, true);
+    assert.equal(replay.revision, firstRevoke.revision);
+    assert.equal(replay.rulingHistory.length, rulingsAfterFirstRevoke);
+    assert.equal(database.listCatalogReviewResolutions({ objectId: "item-1" }).length, resolutionsAfterFirstRevoke);
+
+    assert.throws(
+      () => database.adaptLegacyCatalogRuling({
+        objectType: "item-identity",
+        objectId: "item-1",
+        fieldPath: "chainId",
+        actor: "operator",
+        note: "撤销人工字段",
+        requestId: "legacy-shared-revoke",
+        expectedRevision: firstRevoke.revision,
+      }, { revoke: true }),
+      (error) => error.code === "CATALOG_IDEMPOTENCY_CONFLICT" && error.statusCode === 409,
+    );
+    assert.equal(Object.hasOwn(database.getCatalogObject("item-identity", "item-1").humanValues, "chainId"), true);
+  } finally {
+    database.close();
+  }
+}));
+
 test("JSON 导入只补充证据且发布回退不撤销已提交领域事实", () => withDirectory((dir) => {
   const database = new AutomationDatabase(path.join(dir, "catalog.db"));
   try {

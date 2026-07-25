@@ -608,6 +608,12 @@ class AutomationDatabase {
     return active;
   }
 
+  _prepareCatalogRulingInsert() {
+    return this.db.prepare(`INSERT INTO catalog_repository_rulings(
+      object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?)`);
+  }
+
   _catalogAlgorithmCandidate(row) {
     const version = this._catalogVersion(row.active_version_id) || this._catalogVersion(row.candidate_version_id)
       || this._catalogVersion(this.db.prepare("SELECT id FROM catalog_repository_versions WHERE object_id=? ORDER BY version DESC LIMIT 1").get(row.id)?.id);
@@ -897,7 +903,7 @@ class AutomationDatabase {
       const algorithmCandidate = this._catalogAlgorithmCandidate(before);
       const submittedSnapshot = input.snapshot ?? input.payload ?? (decision === "confirm" ? algorithmCandidate : null);
       const payload = this._validateCatalogReviewSnapshot(identity, submittedSnapshot);
-      const requestFingerprint = canonicalJson({
+      const fingerprintInput = {
         objectType: identity.objectType,
         objectId: identity.objectId,
         decision,
@@ -905,7 +911,9 @@ class AutomationDatabase {
         actor,
         optionalNote,
         compatibilitySource,
-      });
+      };
+      if (input.compatibilityAction) fingerprintInput.compatibilityAction = String(input.compatibilityAction);
+      const requestFingerprint = canonicalJson(fingerprintInput);
       const existingResolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(requestId);
       if (existingResolution) {
         if (existingResolution.request_fingerprint !== requestFingerprint) {
@@ -930,8 +938,7 @@ class AutomationDatabase {
       const now = input.createdAt || new Date().toISOString();
       const json = (value) => JSON.stringify(value === undefined ? null : value);
       const rulingNote = note || generatedRulingNote;
-      const insertRuling = this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)`);
+      const insertRuling = this._prepareCatalogRulingInsert();
       for (const ruling of activeRulings.values()) {
         insertRuling.run(before.id, ruling.fieldPath, "revoke", null, actor, `整对象审核替代旧裁决：${rulingNote}`, json(fieldValue(effectiveBefore, ruling.fieldPath)), json(fieldValue(algorithmCandidate, ruling.fieldPath)), nextRevision, now);
       }
@@ -1345,8 +1352,8 @@ class AutomationDatabase {
       const nextRevision = Number(before.revision) + 1;
       const now = input.createdAt || new Date().toISOString();
       const json = (candidate) => JSON.stringify(candidate === undefined ? null : candidate);
-      this.db.prepare(`INSERT INTO catalog_repository_rulings(object_id,field_path,decision,value_json,actor,note,old_value_json,new_value_json,object_revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)`).run(before.id, fieldPath, decision, revoke ? null : json(value), actor, note, json(oldValue), json(newValue), nextRevision, now);
+      this._prepareCatalogRulingInsert()
+        .run(before.id, fieldPath, decision, revoke ? null : json(value), actor, note, json(oldValue), json(newValue), nextRevision, now);
       this.db.prepare("UPDATE catalog_repository_objects SET revision=?,updated_at=? WHERE id=?").run(nextRevision, now, before.id);
       return this._catalogObjectResult(this._catalogObjectRow(identity.objectType, identity.objectId));
     });
@@ -1377,29 +1384,79 @@ class AutomationDatabase {
       error.statusCode = 400;
       throw error;
     }
-    const object = this.getCatalogObject(identity.objectType, identity.objectId);
-    if (!object) throw Object.assign(new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`), { statusCode: 404 });
-    const currentSnapshot = object.effectiveValue || object.algorithmCandidate || {};
-    const algorithmCandidate = object.algorithmCandidate || {};
-    const nextValue = revoke || input.decision === "confirm"
-      ? fieldValue(algorithmCandidate, fieldPath)
-      : input.value;
-    const snapshot = setFieldValue(currentSnapshot, fieldPath, nextValue);
-    this.recordCatalogCompatibilityCall(revoke ? "legacy-field-ruling-revoke" : "legacy-field-ruling", {
-      objectType: identity.objectType,
-      fieldPath,
-    });
-    return this.completeCatalogReview({
-      objectType: identity.objectType,
-      objectId: identity.objectId,
-      decision: revoke ? "modify" : input.decision,
-      snapshot,
-      actor: input.actor,
-      note: input.note,
-      requestId: input.requestId || `legacy-field:${crypto.randomUUID()}`,
-      expectedRevision: Number(input.expectedRevision),
-      createdAt: input.createdAt,
-      compatibilitySource: revoke ? "legacy-field-ruling-revoke" : "legacy-field-ruling",
+    const operation = revoke ? "legacy-field-ruling-revoke" : "legacy-field-ruling";
+    const compatibilityAction = `${operation}:${fieldPath}`;
+    const requestId = input.requestId || `legacy-field:${crypto.randomUUID()}`;
+    const decision = revoke ? "modify" : input.decision;
+    return this.transaction(() => {
+      const row = this._catalogObjectRow(identity.objectType, identity.objectId);
+      if (!row) throw Object.assign(new Error(`catalog object not found: ${identity.objectType}/${identity.objectId}`), { statusCode: 404 });
+      const object = this._catalogObjectResult(row);
+      const currentRuling = this._activeCatalogRulings(row.id).get(fieldPath) || null;
+      const existingResolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?").get(requestId);
+      if (!existingResolution && revoke && !currentRuling) {
+        const error = new Error(`active catalog ruling not found: ${fieldPath}`);
+        error.code = "CATALOG_LEGACY_RULING_NOT_ACTIVE";
+        error.statusCode = 409;
+        throw error;
+      }
+      this.recordCatalogCompatibilityCall(operation, {
+        objectType: identity.objectType,
+        fieldPath,
+      });
+      const completeReview = (snapshot) => ({
+        ...this.completeCatalogReview({
+          objectType: identity.objectType,
+          objectId: identity.objectId,
+          decision,
+          snapshot,
+          actor: input.actor,
+          note: input.note,
+          requestId,
+          expectedRevision: Number(input.expectedRevision),
+          createdAt: input.createdAt,
+          compatibilitySource: operation,
+          compatibilityAction,
+        }),
+        compatibilityAction,
+      });
+      if (existingResolution) return completeReview(parseJson(existingResolution.snapshot_json));
+      const currentSnapshot = object.effectiveValue || object.algorithmCandidate || {};
+      const nonHumanVersion = revoke
+        ? this.db.prepare(`SELECT payload_json FROM catalog_repository_versions
+          WHERE object_id=? AND origin!='user' ORDER BY version DESC LIMIT 1`).get(row.id)
+        : null;
+      const candidate = nonHumanVersion ? parseJson(nonHumanVersion.payload_json) : object.algorithmCandidate || {};
+      const candidateValue = fieldValue(candidate, fieldPath);
+      const nextValue = revoke || input.decision === "confirm"
+        ? candidateValue === undefined ? null : candidateValue
+        : input.value;
+      const snapshot = setFieldValue(currentSnapshot, fieldPath, nextValue);
+      const completed = completeReview(snapshot);
+      if (!revoke || completed.idempotentReplay) return completed;
+      const now = input.createdAt || new Date().toISOString();
+      this._prepareCatalogRulingInsert().run(
+        row.id,
+        fieldPath,
+        "revoke",
+        null,
+        input.actor,
+        input.note,
+        JSON.stringify(currentRuling.value === undefined ? null : currentRuling.value),
+        JSON.stringify(nextValue),
+        completed.revision,
+        now,
+      );
+      const resolution = this.db.prepare("SELECT * FROM catalog_review_resolutions WHERE request_id=?")
+        .get(completed.reviewResolution.requestId);
+      return {
+        ...this._catalogReviewCompletionResult(
+          this._catalogObjectRow(identity.objectType, identity.objectId),
+          resolution,
+          false,
+        ),
+        compatibilityAction,
+      };
     });
   }
 

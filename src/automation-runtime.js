@@ -852,6 +852,7 @@ class AutomationRuntime {
       requestId: committed.reviewResolution.requestId,
       expectedRevision: Number(input.expectedRevision),
       compatibilitySource: committed.reviewResolution.compatibilitySource,
+      compatibilityAction: committed.compatibilityAction,
     });
   }
 
