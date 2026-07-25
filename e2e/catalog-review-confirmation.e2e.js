@@ -548,14 +548,42 @@ async function main() {
     assert.equal(await page.locator(".review-detail").evaluate((element) => element.scrollTop), detailScrollTop);
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: draftRecoveryEditable.objectId }).length, resolutionsBeforeConflict);
     await liveConflict.getByRole("button", { name: "按最新版本重新确认" }).click();
+    let failPostCommitCatalogRefresh = true;
+    await page.route("**/api/catalog", async (route) => {
+      if (failPostCommitCatalogRefresh && route.request().method() === "GET") {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ error: "浏览器夹具目录刷新失败" }),
+        });
+        return;
+      }
+      await route.continue();
+    });
     await page.getByRole("button", { name: "修改后确认" }).click();
-    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    await page.getByRole("status").filter({ hasText: /审核结论已保存，规划已经恢复.*工作台刷新失败/ }).waitFor();
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: draftRecoveryEditable.objectId }).length, resolutionsBeforeConflict + 1);
     assert.equal(runtime.getCatalogObject("item-identity", draftRecoveryEditable.objectId).effectiveValue.name, "需要恢复的本地草稿");
     assert.equal(await page.evaluate((objectKey) => {
       const drafts = JSON.parse(localStorage.getItem("catalog-review-local-drafts-v1") || "{}");
       return Object.hasOwn(drafts, objectKey);
     }, `item-identity:${draftRecoveryEditable.objectId}`), false);
+    assert.equal(await page.getByRole("status").filter({ hasText: "生效快照未改变" }).count(), 0);
+    assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).first().isDisabled(), true);
+    await page.getByText("高级诊断与证据处置").click();
+    await page.getByRole("button", { name: "预览暂停影响" }).click();
+    await page.getByRole("button", { name: "重试刷新工作台" }).waitFor();
+    await page.getByRole("alertdialog", { name: "确认暂停对象" }).getByRole("button", { name: "取消" }).click();
+    await page.getByText("只读技术详情", { exact: true }).click();
+    await page.getByRole("button", { name: "进入高级 JSON 编辑" }).click();
+    await page.getByRole("button", { name: "校验并预览影响" }).click();
+    const staleAdvancedDialog = page.getByRole("alertdialog", { name: "确认高级 JSON 快照" });
+    assert.equal(await staleAdvancedDialog.getByRole("button", { name: "确认提交完整快照" }).isDisabled(), true);
+    await staleAdvancedDialog.getByRole("button", { name: "返回继续编辑" }).click();
+    failPostCommitCatalogRefresh = false;
+    await page.getByRole("button", { name: "重试刷新工作台" }).click();
+    await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();
+    await page.unroute("**/api/catalog");
 
     const editableEntry = page.getByRole("button", { name: /疑似“旧名称”/ });
     await editableEntry.click();

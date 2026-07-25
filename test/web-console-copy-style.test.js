@@ -82,7 +82,7 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, /const\s+refreshedCatalog\s*=\s*await\s+onChanged\(\)/);
   assert.match(source, /refreshedCatalog\?\.repository\?\.reviewQueue/);
   assert.match(source, /planningResult\.blockingReviewTarget/);
-  assert.match(source, /updated\.reviewStatus\s*===\s*"needs-review"\s*\|\|\s*!planningRecovered/);
+  assert.match(source, /committedReview\.reviewStatus\s*===\s*"needs-review"\s*\|\|\s*!planningRecovered/);
   assert.match(source, /const\s+nextReviewKey\s*=[\s\S]{0,500}\?[\s\S]{0,300}:\s*null/);
   assert.match(source, /setSelectedKey\(nextReviewKey\)/);
   assert.match(source, />暂时跳过</);

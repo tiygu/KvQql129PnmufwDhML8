@@ -372,6 +372,11 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const [draftBaseRevision, setDraftBaseRevision] = useState<number | null>(null);
   const [recoverableDraft, setRecoverableDraft] = useState<any>(null);
   const [revisionConflict, setRevisionConflict] = useState<any>(null);
+  const [pendingPostCommitRefresh, setPendingPostCommitRefresh] = useState<{
+    committedReview: any;
+    planningResult: any;
+    planningRecovered: boolean;
+  } | null>(null);
   const iconUploadRef = useRef<HTMLInputElement>(null);
   const detailRequestId = useRef(0);
   const completionRequest = useRef<{ key: string; requestId: string } | null>(null);
@@ -629,6 +634,66 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     setMessage("已放弃本地草稿，继续使用 Automation Runtime 的最新对象。");
   };
 
+  const finishPostCommitRefresh = (refreshedCatalog: any, committedReview: any, planningResult: any, planningRecovered: boolean) => {
+    const refreshedQueue = refreshedCatalog?.repository?.reviewQueue || queue;
+    const refreshedEntriesByKey = new Map(refreshedQueue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
+    const refreshedSkipped = skippedKeys.flatMap((key) => refreshedEntriesByKey.has(key) ? [refreshedEntriesByKey.get(key)] : []);
+    const refreshedSkippedSet = new Set(skippedKeys);
+    const refreshedOrderedQueue = [
+      ...refreshedQueue.filter((entry: any) => !refreshedSkippedSet.has(`${entry.objectType}:${entry.objectId}`)),
+      ...refreshedSkipped,
+    ];
+    setSkippedKeys((current) => current.filter((key) => refreshedEntriesByKey.has(key)));
+    const currentKey = `${committedReview.objectType}:${committedReview.objectId}`;
+    const blockingTarget = planningResult.blockingReviewTarget;
+    const relatedEntry = !planningRecovered && blockingTarget
+      ? refreshedQueue.find((entry: any) => entry.objectType === blockingTarget.objectType && entry.objectId === blockingTarget.objectId)
+      : null;
+    const nextEntry = refreshedOrderedQueue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
+    const nextReviewKey = relatedEntry && `${relatedEntry.objectType}:${relatedEntry.objectId}` !== currentKey
+      ? `${relatedEntry.objectType}:${relatedEntry.objectId}`
+      : committedReview.reviewStatus === "needs-review" || !planningRecovered
+        ? currentKey
+        : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
+    setPendingPostCommitRefresh(null);
+    setMessage(planningRecovered
+      ? "审核结论已保存，规划已经恢复"
+      : relatedEntry && nextReviewKey !== currentKey
+        ? `裁决已保存、规划尚未恢复：阻塞已转移到关联对象“${relatedEntry.displayTitle || "未命名物品"}”，正在切换到该对象独立审核。`
+        : `裁决已保存、规划尚未恢复：${planningBoundaryText(planningResult.boundaryReason)}；已保留当前诊断上下文。`);
+    setSelectedKey(nextReviewKey);
+    if (nextReviewKey !== currentKey) setDetail(null);
+  };
+
+  const postCommitRefreshFailureMessage = (planningResult: any, planningRecovered: boolean, error: any) => {
+    const savedState = planningRecovered
+      ? "审核结论已保存，规划已经恢复"
+      : `裁决已保存、规划尚未恢复：${planningBoundaryText(planningResult.boundaryReason)}`;
+    return `${savedState}；工作台刷新失败：${error?.message || "暂时无法读取最新队列"}。已禁用过期提交，请重试刷新。`;
+  };
+
+  const retryPostCommitRefresh = async () => {
+    if (!pendingPostCommitRefresh) return;
+    setBusy(true);
+    try {
+      const refreshedCatalog = await onChanged();
+      finishPostCommitRefresh(
+        refreshedCatalog,
+        pendingPostCommitRefresh.committedReview,
+        pendingPostCommitRefresh.planningResult,
+        pendingPostCommitRefresh.planningRecovered,
+      );
+    } catch (error: any) {
+      setMessage(postCommitRefreshFailureMessage(
+        pendingPostCommitRefresh.planningResult,
+        pendingPostCommitRefresh.planningRecovered,
+        error,
+      ));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const skipCurrentReview = () => {
     if (!detail || orderedQueue.length === 0) return;
     const currentKey = `${detail.objectType}:${detail.objectId}`;
@@ -644,6 +709,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const completeReview = async (decision: "confirm" | "modify", snapshotOverride: any = null) => {
+    if (pendingPostCommitRefresh) {
+      setMessage("审核结论已经保存；请先重试刷新工作台，再提交新的完整快照。");
+      return;
+    }
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     if (detail.objectType === "item-identity" && !identityLevelValid) {
       setMessage("等级必须是正整数或留空表示未知");
@@ -673,61 +742,40 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           requestId: globalThis.crypto?.randomUUID?.() || `catalog-review-${Date.now()}-${Math.random().toString(16).slice(2)}`,
         };
       }
-      const updated = await controlApi.completeCatalogReview({
+      const committedReview = await controlApi.completeCatalogReview({
         objectType: detail.objectType, objectId: detail.objectId, decision: effectiveDecision,
         snapshot, actor: actor.trim(), ...(note.trim() ? { note: note.trim() } : {}),
         requestId: completionRequest.current.requestId,
         expectedRevision: detail.revision,
       });
-      setDetail(updated);
-      setLatestAuditSummary(updated.catalogAuditSummary || null);
+      setDetail(committedReview);
+      setLatestAuditSummary(committedReview.catalogAuditSummary || null);
       setAdoptedEvidencePayload(null);
       removeLocalReviewDraft(detailKey);
       draftDirtyRef.current = false;
       setDraftDirty(false);
-      setDraftBaseRevision(Number(updated.revision));
+      setDraftBaseRevision(Number(committedReview.revision));
       setRecoverableDraft(null);
       setRevisionConflict(null);
       setAdvancedJsonEditing(false);
       setAdvancedJsonPreview(null);
       setAdvancedJsonError(null);
-      setObjectDraft(JSON.stringify(updated.candidateVersion?.payload || updated.algorithmCandidate || updated.effectiveValue || {}, null, 2));
-      setIdentityDraft(identityDraftFromDetail(updated));
-      if (updated.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(updated));
-      identityDraftKey.current = `${updated.objectType}:${updated.objectId}`;
+      setObjectDraft(JSON.stringify(committedReview.candidateVersion?.payload || committedReview.algorithmCandidate || committedReview.effectiveValue || {}, null, 2));
+      setIdentityDraft(identityDraftFromDetail(committedReview));
+      if (committedReview.objectType === "merge-relation") setRelationDraft(relationDraftFromDetail(committedReview));
+      identityDraftKey.current = `${committedReview.objectType}:${committedReview.objectId}`;
       identityDraftDirty.current = false;
       setNote("");
       completionRequest.current = null;
-      const planningResult = updated.reviewResolution?.planningResult || {};
+      const planningResult = committedReview.reviewResolution?.planningResult || {};
       const planningRecovered = planningResult.recovered === true;
-      const refreshedCatalog = await onChanged();
-      const refreshedQueue = refreshedCatalog?.repository?.reviewQueue || queue;
-      const refreshedEntriesByKey = new Map(refreshedQueue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
-      const refreshedSkipped = skippedKeys.flatMap((key) => refreshedEntriesByKey.has(key) ? [refreshedEntriesByKey.get(key)] : []);
-      const refreshedSkippedSet = new Set(skippedKeys);
-      const refreshedOrderedQueue = [
-        ...refreshedQueue.filter((entry: any) => !refreshedSkippedSet.has(`${entry.objectType}:${entry.objectId}`)),
-        ...refreshedSkipped,
-      ];
-      setSkippedKeys((current) => current.filter((key) => refreshedEntriesByKey.has(key)));
-      const currentKey = `${updated.objectType}:${updated.objectId}`;
-      const blockingTarget = planningResult.blockingReviewTarget;
-      const relatedEntry = !planningRecovered && blockingTarget
-        ? refreshedQueue.find((entry: any) => entry.objectType === blockingTarget.objectType && entry.objectId === blockingTarget.objectId)
-        : null;
-      const nextEntry = refreshedOrderedQueue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
-      const nextReviewKey = relatedEntry && `${relatedEntry.objectType}:${relatedEntry.objectId}` !== currentKey
-        ? `${relatedEntry.objectType}:${relatedEntry.objectId}`
-        : updated.reviewStatus === "needs-review" || !planningRecovered
-          ? currentKey
-          : nextEntry ? `${nextEntry.objectType}:${nextEntry.objectId}` : null;
-      setMessage(planningRecovered
-        ? "审核结论已保存，规划已经恢复"
-        : relatedEntry && nextReviewKey !== currentKey
-          ? `裁决已保存、规划尚未恢复：阻塞已转移到关联对象“${relatedEntry.displayTitle || "未命名物品"}”，正在切换到该对象独立审核。`
-          : `裁决已保存、规划尚未恢复：${planningBoundaryText(planningResult.boundaryReason)}；已保留当前诊断上下文。`);
-      setSelectedKey(nextReviewKey);
-      if (nextReviewKey !== currentKey) setDetail(null);
+      try {
+        const refreshedCatalog = await onChanged();
+        finishPostCommitRefresh(refreshedCatalog, committedReview, planningResult, planningRecovered);
+      } catch (refreshError: any) {
+        setPendingPostCommitRefresh({ committedReview, planningResult, planningRecovered });
+        setMessage(postCommitRefreshFailureMessage(planningResult, planningRecovered, refreshError));
+      }
     } catch (error: any) {
       if (error.payload?.code === "CATALOG_REVISION_CONFLICT" && error.payload?.currentObject) {
         const currentObject = error.payload.currentObject;
@@ -965,6 +1013,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
             <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}{detail.disposition === "paused" ? <button className="ghost-btn" disabled={busy} onClick={togglePause}><Play size={15}/>恢复对象</button> : <span className="object-disposition-badge">规划中</span>}</div>
           </div>
+          {(message || pendingPostCommitRefresh) && <p className="review-message" role="status">{message || "审核结论已经保存；工作台队列仍需刷新。"}{pendingPostCommitRefresh && <button className="ghost-btn" disabled={busy} onClick={retryPostCommitRefresh}>重试刷新工作台</button>}</p>}
           {recoverableDraft && <div className="local-draft-recovery" role="alertdialog" aria-label="恢复本地审核草稿">
             <div><strong>发现本地未提交草稿</strong><p>草稿基于 revision {recoverableDraft.baseRevision}，最新对象 revision {detail.revision}。系统没有自动套用，请明确恢复或放弃。</p></div>
             <div><button onClick={restoreLocalDraft}>恢复本地草稿</button><button className="ghost-btn" onClick={discardLocalDraft}>放弃本地草稿</button></div>
@@ -1067,11 +1116,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <label><span>操作者</span><input value={actor} onChange={(event) => { markDraftDirty(); setActor(event.target.value); }}/></label>
             <label><span>补充说明（选填）</span><input value={note} onChange={(event) => { markDraftDirty(); setNote(event.target.value); }} placeholder="确有需要时补充上下文"/></label>
             <div className="ruling-actions">{detail.objectType === "item-identity"
-              ? <button disabled={busy || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
+              ? <button disabled={busy || !!pendingPostCommitRefresh || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
               : detail.objectType === "merge-relation"
-                ? <button disabled={busy || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
-              : <><button disabled={busy} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
-            {message && <p className="review-message" role="status">{message}</p>}
+                ? <button disabled={busy || !!pendingPostCommitRefresh || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
+              : <><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy || !!pendingPostCommitRefresh} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(detail.catalogAuditSummary)}</span></div>}
           </div>)}
           </> : <div className="release-control-rollback" role="status"><strong>普通完整快照入口已由发布开关隐藏</strong><p>已提交领域事实保持生效；旧高级诊断入口仍可用于检查、证据处置与回退期间的兼容操作。</p></div>}
@@ -1096,7 +1144,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                     {(advancedJsonPreview.planningImpact?.relations || []).map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>)}
                   </section>
                   <p>再次确认将提交整个对象快照、生成 Catalog Audit Summary 并立即重新规划。</p>
-                  <div><button disabled={busy} onClick={() => completeReview("modify", advancedJsonPreview.snapshot)}>确认提交完整快照</button><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
+                  <div><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("modify", advancedJsonPreview.snapshot)}>确认提交完整快照</button><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
                 </div>}
               </div>}
             <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
