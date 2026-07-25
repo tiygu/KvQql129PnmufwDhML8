@@ -357,6 +357,52 @@ test("完整候选确认与整项修改会完成审核、校验 revision 并广�
   }
 });
 
+test("暂时跳过 API 返回 Runtime 队列并向其他控制台广播会话变化", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-review-skip-"));
+  fs.mkdirSync(path.join(root, "public"));
+  fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
+  const runtime = createRuntime();
+  const calls = [];
+  runtime.skipCatalogReview = (input) => {
+    calls.push(input);
+    return {
+      ok: true,
+      reviewQueue: [
+        { objectType: "item-identity", objectId: "next", actionStatus: "需要处理" },
+        { objectType: "item-identity", objectId: input.objectId, actionStatus: "已跳过" },
+      ],
+      reviewSession: { revision: 1, commandRevision: 1, skippedObjectKeys: [`${input.objectType}:${input.objectId}`], resumeObjectKey: "item-identity:next" },
+      nextReviewTarget: { objectType: "item-identity", objectId: "next", actionStatus: "需要处理" },
+    };
+  };
+  const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
+  const port = await listen(server);
+  const client = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  try {
+    await new Promise((resolve, reject) => { client.once("open", resolve); client.once("error", reject); });
+    const update = waitForEvent(client, (event) => event.type === "catalog-review-session-updated");
+    const response = await fetch(`http://127.0.0.1:${port}/api/catalog/review/skip`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objectType: "item-identity", objectId: "skipped" }),
+    });
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [{ objectType: "item-identity", objectId: "skipped" }]);
+    assert.equal(result.reviewQueue.at(-1).actionStatus, "已跳过");
+    assert.deepEqual(await update.promise, {
+      type: "catalog-review-session-updated",
+      reviewQueue: result.reviewQueue,
+      reviewSession: result.reviewSession,
+    });
+  } finally {
+    client.close();
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("高级 JSON 快照预校验 API 返回人话差异和影响且不广播对象变化", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-review-preview-"));
   fs.mkdirSync(path.join(root, "public"));

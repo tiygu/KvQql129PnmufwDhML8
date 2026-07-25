@@ -256,6 +256,19 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         }
         return writeJson(res, 200, runtime.previewCatalogReview({ ...body, expectedRevision: Number(body.expectedRevision) }));
       }
+      if (route === "POST /api/catalog/review/skip") {
+        const body = await readJson(req);
+        if (!CATALOG_OBJECT_TYPES.has(body.objectType) || !body.objectId) {
+          return writeJson(res, 400, { ok: false, error: "invalid-catalog-review-skip-request" });
+        }
+        const result = runtime.skipCatalogReview({ objectType: body.objectType, objectId: String(body.objectId) });
+        broadcast({
+          type: "catalog-review-session-updated",
+          reviewQueue: result.reviewQueue,
+          reviewSession: result.reviewSession,
+        });
+        return writeJson(res, 200, result);
+      }
       if (route === "POST /api/catalog/review/complete") {
         const body = await readJson(req);
         const snapshotValid = body.snapshot && typeof body.snapshot === "object" && !Array.isArray(body.snapshot);

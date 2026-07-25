@@ -384,6 +384,25 @@ async function main() {
     assert.deepEqual(planningAfterSkip.producers, planningBeforeSkip.producers);
     assert.equal(runtime.database.listCatalogReviewResolutions({ objectId: first.objectId }).length, 0);
     assert.equal(runtime.database.listCatalogAuditSummaries({ objectId: first.objectId }).length, 0);
+    assert.equal(postRequests.some((url) => url.endsWith("/api/catalog/review/skip")), true);
+    const runtimeQueueAfterSkip = runtime.getCatalogView().repository.reviewQueue;
+    assert.equal(runtimeQueueAfterSkip.at(-1).objectId, first.objectId);
+    assert.equal(runtimeQueueAfterSkip.at(-1).actionStatus, "已跳过");
+
+    const freshConsole = await browser.newPage();
+    try {
+      await freshConsole.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+      await freshConsole.getByRole("button", { name: "图鉴" }).click();
+      await freshConsole.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
+      await freshConsole.getByRole("button", { name: /疑似“园艺手套”.*已跳过/ }).waitFor();
+    } finally {
+      await freshConsole.close();
+    }
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+    await page.getByRole("heading", { name: "疑似“下一候选”" }).waitFor();
+    await page.getByRole("button", { name: /疑似“园艺手套”.*已跳过/ }).waitFor();
 
     await page.getByRole("button", { name: "确认无误" }).click();
     await page.getByRole("status").filter({ hasText: "审核结论已保存，规划已经恢复" }).waitFor();

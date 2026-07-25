@@ -259,6 +259,7 @@ class AutomationRuntime {
     this.planningCatalogCache = new Map();
     this.catalogProjectionCache = new Map();
     this.catalogViewCache = new Map();
+    this.catalogReviewSession = { revision: 0, commandRevision: 0, skippedObjectKeys: [], resumeObjectKey: null };
     this.iconEvidenceRetryAt = new Map();
     this.running = false;
     this.abortController = null;
@@ -429,7 +430,7 @@ class AutomationRuntime {
   getCatalogView({ includeRepositoryObjects = true } = {}) {
     const executionMode = this.getSettings().mode;
     const revision = includeRepositoryObjects ? this.database.getCatalogUiRevision() : this.database.getCatalogPresentationRevision();
-    const cacheKey = `${revision}:${executionMode}:${includeRepositoryObjects ? "full" : "summary"}`;
+    const cacheKey = `${revision}:${executionMode}:${includeRepositoryObjects ? `full:${this.catalogReviewSession.revision}` : "summary"}`;
     const cached = this.catalogViewCache.get(cacheKey);
     if (cached) return cached;
     const semanticRevision = this.database.getCatalogSemanticRevision();
@@ -451,7 +452,7 @@ class AutomationRuntime {
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
-      repository.reviewQueue = this.database.getCatalogReviewQueue().map((entry) => {
+      const reviewQueue = this.database.getCatalogReviewQueue().map((entry) => {
         if (entry.objectType !== "merge-relation") return entry;
         const relation = this.database.getCatalogObject(entry.objectType, entry.objectId);
         const candidate = relation?.algorithmCandidate || relation?.effectiveValue || {};
@@ -459,6 +460,13 @@ class AutomationRuntime {
         const waiting = mergeRelationWaitingForObservation({ relationCandidate: candidate, relationEvidence: relation?.evidence || [], targetIdentity: target });
         return waiting.waiting ? { ...entry, actionStatus: "等待更多线索", waitingForMoreClues: waiting } : entry;
       });
+      repository.reviewQueue = this.projectCatalogReviewQueue(reviewQueue);
+      repository.reviewSession = {
+        revision: this.catalogReviewSession.revision,
+        commandRevision: this.catalogReviewSession.commandRevision,
+        skippedObjectKeys: [...this.catalogReviewSession.skippedObjectKeys],
+        resumeObjectKey: this.catalogReviewSession.resumeObjectKey,
+      };
       repository.laterQueue = this.database.getCatalogCompletenessQueue();
       repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
       repository.uncertainProductionActions = this.database.listUncertainProductionActions();
@@ -477,8 +485,65 @@ class AutomationRuntime {
       repository,
     };
     for (const key of this.catalogViewCache.keys()) if (!key.startsWith(`${revision}:`)) this.catalogViewCache.delete(key);
-    this.catalogViewCache.set(cacheKey, result);
+    const resolvedCacheKey = includeRepositoryObjects
+      ? `${revision}:${executionMode}:full:${this.catalogReviewSession.revision}`
+      : cacheKey;
+    this.catalogViewCache.set(resolvedCacheKey, result);
     return result;
+  }
+
+  projectCatalogReviewQueue(reviewQueue) {
+    const entriesByKey = new Map(reviewQueue.map((entry) => [`${entry.objectType}:${entry.objectId}`, entry]));
+    const skippedObjectKeys = this.catalogReviewSession.skippedObjectKeys.filter((key) => entriesByKey.has(key));
+    if (skippedObjectKeys.length !== this.catalogReviewSession.skippedObjectKeys.length) {
+      const resumeObjectKey = entriesByKey.has(this.catalogReviewSession.resumeObjectKey)
+        ? this.catalogReviewSession.resumeObjectKey
+        : reviewQueue[0] ? `${reviewQueue[0].objectType}:${reviewQueue[0].objectId}` : null;
+      this.catalogReviewSession = {
+        revision: this.catalogReviewSession.revision + 1,
+        commandRevision: this.catalogReviewSession.commandRevision,
+        skippedObjectKeys,
+        resumeObjectKey,
+      };
+    }
+    const skippedSet = new Set(skippedObjectKeys);
+    return [
+      ...reviewQueue.filter((entry) => !skippedSet.has(`${entry.objectType}:${entry.objectId}`)),
+      ...skippedObjectKeys.map((key) => ({ ...entriesByKey.get(key), actionStatus: "已跳过" })),
+    ];
+  }
+
+  skipCatalogReview({ objectType, objectId }) {
+    const key = `${objectType}:${objectId}`;
+    const currentQueue = this.getCatalogView({ includeRepositoryObjects: true }).repository.reviewQueue;
+    const currentIndex = currentQueue.findIndex((entry) => `${entry.objectType}:${entry.objectId}` === key);
+    if (currentIndex < 0) {
+      throw Object.assign(new Error(`catalog review target not found: ${objectType}/${objectId}`), {
+        code: "CATALOG_REVIEW_TARGET_NOT_FOUND",
+        statusCode: 404,
+      });
+    }
+    const nextObjectKey = currentQueue.length > 1
+      ? `${currentQueue[(currentIndex + 1) % currentQueue.length].objectType}:${currentQueue[(currentIndex + 1) % currentQueue.length].objectId}`
+      : null;
+    this.catalogReviewSession = {
+      revision: this.catalogReviewSession.revision + 1,
+      commandRevision: this.catalogReviewSession.commandRevision + 1,
+      skippedObjectKeys: [
+        ...this.catalogReviewSession.skippedObjectKeys.filter((candidate) => candidate !== key),
+        key,
+      ],
+      resumeObjectKey: nextObjectKey,
+    };
+    this.catalogViewCache.clear();
+    const repository = this.getCatalogView({ includeRepositoryObjects: true }).repository;
+    const nextReviewTarget = repository.reviewQueue.find((entry) => `${entry.objectType}:${entry.objectId}` === nextObjectKey) || null;
+    return {
+      ok: true,
+      reviewQueue: repository.reviewQueue,
+      reviewSession: repository.reviewSession,
+      nextReviewTarget,
+    };
   }
 
   getCatalogObject(objectType, objectId) {

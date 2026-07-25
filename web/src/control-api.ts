@@ -80,6 +80,7 @@ export const controlApi = {
   getCatalog: () => request("/api/catalog"),
   getCatalogObject: (objectType: string, objectId: string) => request(`/api/catalog/object?type=${encodeURIComponent(objectType)}&id=${encodeURIComponent(objectId)}`),
   previewCatalogReview: (input: any) => post("/api/catalog/review/preview", input),
+  skipCatalogReview: (input: any) => post("/api/catalog/review/skip", input),
   completeCatalogReview: (input: any) => post("/api/catalog/review/complete", input),
   applyCatalogRuling: (input: any) => post("/api/catalog/ruling", input),
   revokeCatalogRuling: (input: any) => post("/api/catalog/ruling/revoke", input),

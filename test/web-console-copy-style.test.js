@@ -87,7 +87,9 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, /setSelectedKey\(nextReviewKey\)/);
   assert.match(source, />暂时跳过</);
   const skipReview = source.slice(source.indexOf("const skipCurrentReview"), source.indexOf("const completeReview"));
-  assert.doesNotMatch(skipReview, /controlApi|onChanged/);
+  assert.match(api, /skipCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/skip",\s*input\)/);
+  assert.match(skipReview, /controlApi\.skipCatalogReview/);
+  assert.match(skipReview, /await onChanged\(\)/);
 });
 
 test("图鉴审核默认只展示领域摘要，原始数据和完整历史收进只读技术详情", () => {

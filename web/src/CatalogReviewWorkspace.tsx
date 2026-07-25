@@ -298,6 +298,7 @@ function parseObjectDraft(value: string) {
 
 const LOCAL_REVIEW_DRAFTS_KEY = "catalog-review-local-drafts-v1";
 const LOCAL_REVIEW_SELECTION_KEY = "catalog-review-selected-object-v1";
+const RUNTIME_REVIEW_COMMAND_REVISION_KEY = "catalog-review-runtime-command-revision-v1";
 
 function readLocalReviewDraft(objectKey: string) {
   try {
@@ -348,7 +349,6 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     try { return globalThis.localStorage?.getItem(LOCAL_REVIEW_SELECTION_KEY) || null; }
     catch (_) { return null; }
   });
-  const [skippedKeys, setSkippedKeys] = useState<string[]>([]);
   const [detail, setDetail] = useState<any>(null);
   const [objectDraft, setObjectDraft] = useState("{}");
   const [identityDraft, setIdentityDraft] = useState({ name: "", level: "", type: "" });
@@ -395,12 +395,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     setDraftBaseRevision((current) => current ?? Number(detail.revision));
   };
 
-  const orderedQueue = useMemo(() => {
-    const entriesByKey = new Map(queue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
-    const skipped = skippedKeys.flatMap((key) => entriesByKey.has(key) ? [entriesByKey.get(key)] : []);
-    const skippedSet = new Set(skippedKeys);
-    return [...queue.filter((entry: any) => !skippedSet.has(`${entry.objectType}:${entry.objectId}`)), ...skipped];
-  }, [queue, skippedKeys]);
+  const orderedQueue = queue;
 
   const selectedSummary = useMemo(() => {
     const queuedKeys = new Set([...orderedQueue, ...laterQueue].map((item: any) => `${item.objectType}:${item.objectId}`));
@@ -445,6 +440,17 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
   useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
   useEffect(() => {
+    const commandRevision = Number(repository?.reviewSession?.commandRevision) || 0;
+    let appliedRevision = 0;
+    try { appliedRevision = Number(globalThis.sessionStorage?.getItem(RUNTIME_REVIEW_COMMAND_REVISION_KEY)) || 0; }
+    catch (_) {}
+    if (commandRevision <= appliedRevision) return;
+    const resumeObjectKey = repository?.reviewSession?.resumeObjectKey;
+    if (resumeObjectKey) setSelectedKey(resumeObjectKey);
+    try { globalThis.sessionStorage?.setItem(RUNTIME_REVIEW_COMMAND_REVISION_KEY, String(commandRevision)); }
+    catch (_) {}
+  }, [repository?.reviewSession?.commandRevision]);
+  useEffect(() => {
     try {
       if (selectedKey) globalThis.localStorage?.setItem(LOCAL_REVIEW_SELECTION_KEY, selectedKey);
       else globalThis.localStorage?.removeItem(LOCAL_REVIEW_SELECTION_KEY);
@@ -467,7 +473,6 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
 
   const selectSummary = (entry: any) => {
     const key = `${entry.objectType}:${entry.objectId}`;
-    setSkippedKeys((current) => current.filter((candidate) => candidate !== key));
     if (selectedKey === key) loadDetail(entry);
     else setSelectedKey(key);
   };
@@ -636,20 +641,12 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
 
   const finishPostCommitRefresh = (refreshedCatalog: any, committedReview: any, planningResult: any, planningRecovered: boolean) => {
     const refreshedQueue = refreshedCatalog?.repository?.reviewQueue || queue;
-    const refreshedEntriesByKey = new Map(refreshedQueue.map((entry: any) => [`${entry.objectType}:${entry.objectId}`, entry]));
-    const refreshedSkipped = skippedKeys.flatMap((key) => refreshedEntriesByKey.has(key) ? [refreshedEntriesByKey.get(key)] : []);
-    const refreshedSkippedSet = new Set(skippedKeys);
-    const refreshedOrderedQueue = [
-      ...refreshedQueue.filter((entry: any) => !refreshedSkippedSet.has(`${entry.objectType}:${entry.objectId}`)),
-      ...refreshedSkipped,
-    ];
-    setSkippedKeys((current) => current.filter((key) => refreshedEntriesByKey.has(key)));
     const currentKey = `${committedReview.objectType}:${committedReview.objectId}`;
     const blockingTarget = planningResult.blockingReviewTarget;
     const relatedEntry = !planningRecovered && blockingTarget
       ? refreshedQueue.find((entry: any) => entry.objectType === blockingTarget.objectType && entry.objectId === blockingTarget.objectId)
       : null;
-    const nextEntry = refreshedOrderedQueue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
+    const nextEntry = refreshedQueue.find((entry: any) => `${entry.objectType}:${entry.objectId}` !== currentKey);
     const nextReviewKey = relatedEntry && `${relatedEntry.objectType}:${relatedEntry.objectId}` !== currentKey
       ? `${relatedEntry.objectType}:${relatedEntry.objectId}`
       : committedReview.reviewStatus === "needs-review" || !planningRecovered
@@ -694,17 +691,24 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     }
   };
 
-  const skipCurrentReview = () => {
+  const skipCurrentReview = async () => {
     if (!detail || orderedQueue.length === 0) return;
     const currentKey = `${detail.objectType}:${detail.objectId}`;
-    const currentIndex = orderedQueue.findIndex((entry: any) => `${entry.objectType}:${entry.objectId}` === currentKey);
-    if (currentIndex < 0) return;
-    const nextEntry = orderedQueue.length > 1 ? orderedQueue[(currentIndex + 1) % orderedQueue.length] : null;
-    setSkippedKeys((current) => [...current.filter((key) => key !== currentKey), currentKey]);
-    setMessage("已暂时跳过，本轮稍后再处理；对象事实与规划资格均未改变。");
-    if (nextEntry) {
-      setSelectedKey(`${nextEntry.objectType}:${nextEntry.objectId}`);
-      setDetail(null);
+    if (!orderedQueue.some((entry: any) => `${entry.objectType}:${entry.objectId}` === currentKey)) return;
+    setBusy(true);
+    try {
+      const result = await controlApi.skipCatalogReview({ objectType: detail.objectType, objectId: detail.objectId });
+      const nextEntry = result.nextReviewTarget;
+      setMessage("已暂时跳过，本轮稍后再处理；对象事实与规划资格均未改变。");
+      if (nextEntry) {
+        setSelectedKey(`${nextEntry.objectType}:${nextEntry.objectId}`);
+        setDetail(null);
+      }
+      await onChanged();
+    } catch (error: any) {
+      setMessage(error.message);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -993,7 +997,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         <div className="review-queue-list">{orderedQueue.length ? orderedQueue.map((entry: any) => {
           const entryKey = `${entry.objectType}:${entry.objectId}`;
           return <button key={entryKey} className={`${selectedKey === entryKey ? "active" : ""}`} onClick={() => selectSummary(entry)}>
-          <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {skippedKeys.includes(entryKey) ? "已跳过" : entry.actionStatus || "需要处理"}</small></span>
+          <span><strong>{entry.displayTitle || "未命名物品"}</strong><small>{valueLabel(entry.objectType)} · {entry.actionStatus || "需要处理"}</small></span>
           <span className="reason-chips">{entry.reasons.map((reason: any, index: number) => <i className={reason.type} key={`${reason.type}-${index}`}>{reviewReasonMetadata[reason.type]?.label || reason.type}</i>)}</span>
         </button>;
         }) : <div className="empty-state compact"><Check/><span>当前没有待裁定对象</span></div>}</div>
