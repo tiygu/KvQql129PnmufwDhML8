@@ -6,6 +6,9 @@ reports/
 # Local runtime state and generated captures
 captures/
 data*/
+
+# Keep the platform-specific WMPF route local
+wmpf/
 release*/
 target-*.json
 *.db
