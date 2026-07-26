@@ -386,6 +386,13 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   const detailScrollRef = useRef<HTMLDivElement>(null);
   const draftDirtyRef = useRef(false);
   const draftObjectKeyRef = useRef<string | null>(null);
+  const objectMutationsBlocked = pendingPostCommitRefresh !== null;
+
+  const rejectBlockedObjectMutation = () => {
+    if (!objectMutationsBlocked) return false;
+    setMessage("审核结论已经保存；请先重试刷新工作台，再执行依赖当前对象的变更操作。");
+    return true;
+  };
 
   const markDraftDirty = () => {
     if (!detail) return;
@@ -666,7 +673,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     const savedState = planningRecovered
       ? "审核结论已保存，规划已经恢复"
       : `裁决已保存、规划尚未恢复：${planningBoundaryText(planningResult.boundaryReason)}`;
-    return `${savedState}；工作台刷新失败：${error?.message || "暂时无法读取最新队列"}。已禁用过期提交，请重试刷新。`;
+    return `${savedState}；工作台刷新失败：${error?.message || "暂时无法读取最新队列"}。已禁用全部依赖过期对象的变更操作，请重试刷新。`;
   };
 
   const retryPostCommitRefresh = async () => {
@@ -692,6 +699,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const skipCurrentReview = async () => {
+    if (rejectBlockedObjectMutation()) return;
     if (!detail || orderedQueue.length === 0) return;
     const currentKey = `${detail.objectType}:${detail.objectId}`;
     if (!orderedQueue.some((entry: any) => `${entry.objectType}:${entry.objectId}` === currentKey)) return;
@@ -713,10 +721,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const completeReview = async (decision: "confirm" | "modify", snapshotOverride: any = null) => {
-    if (pendingPostCommitRefresh) {
-      setMessage("审核结论已经保存；请先重试刷新工作台，再提交新的完整快照。");
-      return;
-    }
+    if (rejectBlockedObjectMutation()) return;
     if (!detail || !actor.trim()) { setMessage("请填写操作者"); return; }
     if (detail.objectType === "item-identity" && !identityLevelValid) {
       setMessage("等级必须是正整数或留空表示未知");
@@ -812,6 +817,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const setEvidenceDisposition = async (evidenceId: number, disposition: "eligible" | "paused" | "rejected", action?: string) => {
+    if (rejectBlockedObjectMutation()) return null;
     if (!detail || !note.trim() || !actor.trim()) { setMessage("处置证据前请填写操作者和审核备注"); return null; }
     const updated = await controlApi.setCatalogEvidenceDisposition({
       objectType: detail.objectType, objectId: detail.objectId, evidenceId, disposition,
@@ -883,6 +889,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
       setMessage("");
       return;
     }
+    if (rejectBlockedObjectMutation()) return;
     setBusy(true);
     try {
       const disposition = detail.disposition === "paused" ? "enabled" : "paused";
@@ -944,6 +951,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const acquireIcon = async () => {
+    if (rejectBlockedObjectMutation()) return;
     if (!detail || detail.objectType !== "item-identity") return;
     setBusy(true);
     try {
@@ -954,6 +962,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const selectIcon = async (candidateId: number) => {
+    if (rejectBlockedObjectMutation()) return;
     if (!detail || !actor.trim()) { setMessage("选择图标前请填写操作员"); return; }
     const previousDetail = detail;
     const auditNote = note.trim() || "手动选择图标候选";
@@ -967,6 +976,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const revokeIcon = async () => {
+    if (rejectBlockedObjectMutation()) return;
     if (!detail?.selectedIcon || !actor.trim() || !note.trim()) { setMessage("撤销图标前请填写操作员和备注"); return; }
     setBusy(true);
     try {
@@ -977,6 +987,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   const uploadIcon = async (file?: File) => {
+    if (rejectBlockedObjectMutation()) return;
     if (!detail || !file) return;
     if (!actor.trim() || !note.trim()) { setMessage("上传替代图标前请填写操作员和备注"); return; }
     setBusy(true);
@@ -1015,7 +1026,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
         {loadingDetail ? <div className="empty-state"><History className="spin"/><strong>正在加载审核对象…</strong><span>正在读取证据、版本和裁决记录</span></div> : !detail ? <div className="empty-state"><History/><strong>{loadError ? "审核对象加载失败" : "从审核队列选择对象"}</strong>{loadError && <><span>{loadError}</span><button className="ghost-btn" onClick={() => loadDetail()}>重试</button></>}</div> : <>
           <div className="panel-head">
             <div><span className="eyebrow">对象详情</span><h2>{catalogObjectTitle(detail, selectedSummary)}</h2><small>{valueLabel(detail.objectType)} · {selectedSummary?.actionStatus || (detail.reviewStatus === "needs-review" ? "需要处理" : "已确认")}</small></div>
-            <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}{detail.disposition === "paused" ? <button className="ghost-btn" disabled={busy} onClick={togglePause}><Play size={15}/>恢复对象</button> : <span className="object-disposition-badge">规划中</span>}</div>
+            <div className="review-head-actions">{detail.objectType === "item-identity" && <button className="ghost-btn" disabled={busy || objectMutationsBlocked} onClick={acquireIcon}><Image size={15}/>采集真实图标</button>}{detail.disposition === "paused" ? <button className="ghost-btn" disabled={busy || objectMutationsBlocked} onClick={togglePause}><Play size={15}/>恢复对象</button> : <span className="object-disposition-badge">规划中</span>}</div>
           </div>
           {(message || pendingPostCommitRefresh) && <p className="review-message" role="status">{message || "审核结论已经保存；工作台队列仍需刷新。"}{pendingPostCommitRefresh && <button className="ghost-btn" disabled={busy} onClick={retryPostCommitRefresh}>重试刷新工作台</button>}</p>}
           {recoverableDraft && <div className="local-draft-recovery" role="alertdialog" aria-label="恢复本地审核草稿">
@@ -1036,8 +1047,8 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           </div>
           {detail.objectType === "item-identity" && <div className={`selected-icon-preview ${detail.selectedIcon ? "available" : "missing"}`}>{detail.selectedIcon ? <img src={detail.selectedIcon.url} alt="物品展示图标" onClick={() => setLightboxSrc(detail.selectedIcon.url)}/> : <Image/>}<div><strong>{detail.selectedIcon ? "已取得真实图标" : "图标待采集"}</strong><span>{detail.selectedIcon ? `${detail.selectedIcon.width}×${detail.selectedIcon.height}，可用于区分同名对象` : "缺失仅影响视觉核对，不影响已生效字段参与规划"}</span></div></div>}
           {detail.objectType === "item-identity" && <div className="icon-candidate-review">
-            <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>通过真实图标区分同名对象；识别评分和资源标识收在只读技术详情中。</p></div><div><button className="ghost-btn" disabled={busy} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
-            <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any, index: number) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${index + 1}`} onClick={() => setLightboxSrc(candidate.url)}/><div><strong>候选 {index + 1} · {valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} · {new Date(candidate.createdAt).toLocaleString()}</span></div><button disabled={busy || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
+            <div className="icon-candidate-head"><div><h3>图标候选对比</h3><p>通过真实图标区分同名对象；识别评分和资源标识收在只读技术详情中。</p></div><div><button className="ghost-btn" disabled={busy || objectMutationsBlocked} onClick={() => iconUploadRef.current?.click()}><Upload size={14}/>上传替代图标</button><input ref={iconUploadRef} hidden disabled={objectMutationsBlocked} type="file" accept="image/png,image/jpeg" onChange={(event) => uploadIcon(event.target.files?.[0])}/><button className="ghost-btn danger" disabled={busy || objectMutationsBlocked || !detail.selectedIcon} onClick={revokeIcon}><X size={14}/>撤销选择</button></div></div>
+            <div className="icon-candidate-grid">{detail.iconCandidates?.length ? detail.iconCandidates.map((candidate: any, index: number) => <article className={candidate.selected ? "selected" : ""} key={candidate.id}><img src={candidate.url} alt={`候选图标 ${index + 1}`} onClick={() => setLightboxSrc(candidate.url)}/><div><strong>候选 {index + 1} · {valueLabel(candidate.sourceType)}</strong><span>{candidate.width} × {candidate.height} · {new Date(candidate.createdAt).toLocaleString()}</span></div><button disabled={busy || objectMutationsBlocked || candidate.selected} onClick={() => selectIcon(candidate.id)}>{candidate.selected ? `当前选择 / ${valueLabel(candidate.selectionOrigin || "automatic")}` : "选择候选"}</button></article>) : <div className="empty-state compact"><Image/><span>暂无图标候选</span></div>}</div>
           </div>}
           {detail.reviewReasons?.length > 0 && <div className="review-alerts">{detail.reviewReasons.map((reason: any, index: number) => <span key={`${reason.type}-${index}`}><AlertTriangle size={14}/>{reviewReasonMetadata[reason.type]?.label || reason.type}{reason.fieldPath && visibleFields.includes(reason.fieldPath) ? ` · ${fieldLabel(reason.fieldPath)}` : ""}</span>)}</div>}
           {detail.completenessGaps?.length > 0 && <div className="completeness-gaps"><Image size={15}/><div><strong>以后再看：物品图标</strong><span>这属于完整性缺口，不进入主阻塞队列，不影响本次语义审核或当前规划。</span></div></div>}
@@ -1120,10 +1131,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <label><span>操作者</span><input value={actor} onChange={(event) => { markDraftDirty(); setActor(event.target.value); }}/></label>
             <label><span>补充说明（选填）</span><input value={note} onChange={(event) => { markDraftDirty(); setNote(event.target.value); }} placeholder="确有需要时补充上下文"/></label>
             <div className="ruling-actions">{detail.objectType === "item-identity"
-              ? <button disabled={busy || !!pendingPostCommitRefresh || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
+              ? <button disabled={busy || objectMutationsBlocked || !identityLevelValid} onClick={() => completeReview(identityDecision)}>{identityDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {identityDecision === "modify" ? "修改后确认" : "确认无误"}</button>
               : detail.objectType === "merge-relation"
-                ? <button disabled={busy || !!pendingPostCommitRefresh || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
-              : <><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy || !!pendingPostCommitRefresh} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
+                ? <button disabled={busy || objectMutationsBlocked || !!relationError} onClick={() => completeReview(relationDecision)}>{relationDecision === "modify" ? <Save size={15}/> : <Check size={15}/>} {relationDecision === "modify" ? "修改后确认" : "确认无误"}</button>
+              : <><button disabled={busy || objectMutationsBlocked} onClick={() => completeReview("confirm")}><Check size={15}/>确认无误</button><button disabled={busy || objectMutationsBlocked} onClick={() => completeReview("modify")}><Save size={15}/>修改后确认</button></>}<button className="skip-review-action" disabled={busy || objectMutationsBlocked} onClick={skipCurrentReview}><SkipForward size={15}/>暂时跳过</button></div>
             {detail.catalogAuditSummary && <div className="catalog-audit-summary wide"><strong>Catalog Audit Summary</strong><span>{catalogAuditSummarySentence(detail.catalogAuditSummary)}</span></div>}
           </div>)}
           </> : <div className="release-control-rollback" role="status"><strong>普通完整快照入口已由发布开关隐藏</strong><p>已提交领域事实保持生效；旧高级诊断入口仍可用于检查、证据处置与回退期间的兼容操作。</p></div>}
@@ -1148,7 +1159,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                     {(advancedJsonPreview.planningImpact?.relations || []).map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>)}
                   </section>
                   <p>再次确认将提交整个对象快照、生成 Catalog Audit Summary 并立即重新规划。</p>
-                  <div><button disabled={busy || !!pendingPostCommitRefresh} onClick={() => completeReview("modify", advancedJsonPreview.snapshot)}>确认提交完整快照</button><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
+                  <div><button disabled={busy || objectMutationsBlocked} onClick={() => completeReview("modify", advancedJsonPreview.snapshot)}>确认提交完整快照</button><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
                 </div>}
               </div>}
             <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
@@ -1164,7 +1175,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
             <div className="object-planning-control">
               <div><h3>对象规划资格</h3><p>{detail.disposition === "paused" ? "当前对象已持久暂停；证据、候选、裁决与审计历史仍完整保留。" : "当前对象可按状态参与规划；暂停只改变规划资格，不会替代普通审核结论。"}</p></div>
               {detail.disposition === "paused"
-                ? <button disabled={busy} onClick={togglePause}><Play size={14}/>立即恢复对象</button>
+                ? <button disabled={busy || objectMutationsBlocked} onClick={togglePause}><Play size={14}/>立即恢复对象</button>
                 : !pauseConfirmationOpen
                   ? <button className="danger" disabled={busy} onClick={togglePause}><Pause size={14}/>预览暂停影响</button>
                   : <div className="pause-impact-confirmation" role="alertdialog" aria-label="确认暂停对象">
@@ -1175,7 +1186,7 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                       <section><strong>受影响合成关系</strong>{detail.planningImpact?.relations?.length ? detail.planningImpact.relations.map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>) : <span>当前没有直接受影响的合成关系</span>}</section>
                     </div>
                     <p className="pause-impact-warning">再次确认后，对象会持久退出规划并立即重新规划；普通审核状态和全部历史保持不变。</p>
-                    <div className="pause-impact-actions"><button className="danger" disabled={busy} onClick={togglePause}>确认暂停对象</button><button className="ghost-btn" disabled={busy} onClick={() => setPauseConfirmationOpen(false)}>取消</button></div>
+                    <div className="pause-impact-actions"><button className="danger" disabled={busy || objectMutationsBlocked} onClick={togglePause}>确认暂停对象</button><button className="ghost-btn" disabled={busy} onClick={() => setPauseConfirmationOpen(false)}>取消</button></div>
                   </div>}
             </div>
             {pendingEvidenceRejection && <div className="evidence-rejection-confirmation" role="alertdialog" aria-label="确认否决证据">
@@ -1184,9 +1195,9 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
               <code>{display(pendingEvidenceRejection.payload)}</code>
               <p>{detail.planningImpact?.summary || "当前没有直接关联的订单或关系。"}</p>
               <p className="evidence-rejection-warning">确认后原始证据和来源仍保留审计，但它会从后续自动推断及规划融合中排除。</p>
-              <div><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(pendingEvidenceRejection.id, "rejected")}>确认否决证据</button><button className="ghost-btn" disabled={busy} onClick={() => setPendingEvidenceRejection(null)}>取消</button></div>
+              <div><button className="danger" disabled={busy || objectMutationsBlocked} onClick={() => updateEvidenceDisposition(pendingEvidenceRejection.id, "rejected")}>确认否决证据</button><button className="ghost-btn" disabled={busy} onClick={() => setPendingEvidenceRejection(null)}>取消</button></div>
             </div>}
-            <div className="review-evidence"><div><h3>证据采用与否决</h3>{detail.evidence?.map((evidence: any, index: number) => <p key={evidence.id}><strong>证据 {index + 1} · {valueLabel(evidence.sourceType)}</strong><span>{evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span className="evidence-actions"><button disabled={busy} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div></div>
+            <div className="review-evidence"><div><h3>证据采用与否决</h3>{detail.evidence?.map((evidence: any, index: number) => <p key={evidence.id}><strong>证据 {index + 1} · {valueLabel(evidence.sourceType)}</strong><span>{evidence.observationCount} 次 · {valueLabel(evidence.disposition)}</span><span className="evidence-actions"><button disabled={busy || objectMutationsBlocked} onClick={() => acceptEvidence(evidence.id)}>采用证据</button>{evidence.disposition === "eligible" ? <><button disabled={busy || objectMutationsBlocked} onClick={() => updateEvidenceDisposition(evidence.id, "paused")}>暂停证据</button><button className="danger" disabled={busy || objectMutationsBlocked} onClick={() => updateEvidenceDisposition(evidence.id, "rejected")}>否决证据</button></> : <button disabled={busy || objectMutationsBlocked} onClick={() => updateEvidenceDisposition(evidence.id, "eligible")}><RotateCcw size={13}/>恢复证据</button>}</span></p>)}</div></div>
           </details>
         </>}
       </div>

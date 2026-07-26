@@ -589,10 +589,22 @@ async function main() {
     }, `item-identity:${draftRecoveryEditable.objectId}`), false);
     assert.equal(await page.getByRole("status").filter({ hasText: "生效快照未改变" }).count(), 0);
     assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).first().isDisabled(), true);
+    for (const mutationButton of [
+      page.getByRole("button", { name: "暂时跳过" }),
+      page.getByRole("button", { name: "采集真实图标" }),
+      page.getByRole("button", { name: "上传替代图标" }),
+    ]) assert.equal(await mutationButton.isDisabled(), true);
     await page.getByText("高级诊断与证据处置").click();
+    for (const mutationButton of [
+      page.getByRole("button", { name: "采用证据" }).first(),
+      page.getByRole("button", { name: "暂停证据" }).first(),
+      page.getByRole("button", { name: "否决证据" }).first(),
+    ]) assert.equal(await mutationButton.isDisabled(), true);
     await page.getByRole("button", { name: "预览暂停影响" }).click();
     await page.getByRole("button", { name: "重试刷新工作台" }).waitFor();
-    await page.getByRole("alertdialog", { name: "确认暂停对象" }).getByRole("button", { name: "取消" }).click();
+    const stalePauseDialog = page.getByRole("alertdialog", { name: "确认暂停对象" });
+    assert.equal(await stalePauseDialog.getByRole("button", { name: "确认暂停对象" }).isDisabled(), true);
+    await stalePauseDialog.getByRole("button", { name: "取消" }).click();
     await page.getByText("只读技术详情", { exact: true }).click();
     await page.getByRole("button", { name: "进入高级 JSON 编辑" }).click();
     await page.getByRole("button", { name: "校验并预览影响" }).click();
