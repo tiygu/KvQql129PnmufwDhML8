@@ -303,14 +303,26 @@ test("运行时重启会清除与资源提示冲突的通用自动图标并保�
   backend.database.selectIconCandidate("i2", manualCandidate.id, {
     actor: "operator",
     note: "verified",
-    expectedRevision: backend.getCatalogObject("item-identity", "i2").revision,
+    expectedDisplayIconRevision: backend.getCatalogObject("item-identity", "i2").displayIcon.revision,
   });
   backend.database.close();
 
-  backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  const events = [];
+  backend = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+    onEvent: (event) => events.push(event),
+  });
   try {
     assert.equal(backend.getCatalogObject("item-identity", "i1").selectedIcon, null);
     assert.equal(backend.getCatalogObject("item-identity", "i2").selectedIcon.id, manualCandidate.id);
+    assert.deepEqual(events.filter((event) => event.type === "catalog-display-icon-updated")
+      .map(({ type, at, ...event }) => event), [{
+      objectType: "item-identity",
+      objectId: "i1",
+      displayIconRevision: 3,
+    }]);
     const queued = backend.queueVisibleBoardIconEvidence({
       board: { grids: [{ itemId: "i1" }, { itemId: "i2" }] },
     });

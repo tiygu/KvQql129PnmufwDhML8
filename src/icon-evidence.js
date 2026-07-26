@@ -266,13 +266,20 @@ class IconEvidenceService {
     const cacheKey = crypto.createHash("sha256").update(canonicalJson({ reconstructionVersion: ICON_RECONSTRUCTION_VERSION, resourceUrl: metadata.resourceUrl, textureUuid: metadata.textureUuid || null, crop })).digest("hex");
     const cached = this.database.findIconAcquisition(cacheKey);
     if (cached && fs.existsSync(cached.filePath)) {
-      const candidate = this.database.saveIconCandidate({
+      const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
         itemId: task.itemId, cacheKey, sourceType: cached.sourceType, resourceUrl: cached.resourceUrl,
         runtimeIdentifier: metadata.runtimeIdentifier || cached.runtimeIdentifier, textureUuid: metadata.textureUuid || cached.textureUuid, crop,
         rankScore: cached.rankScore ?? 1,
         asset: { hash: cached.assetHash, mimeType: cached.mimeType, width: cached.width, height: cached.height, byteSize: cached.byteSize, filePath: cached.filePath },
       });
-      this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: true });
+      this.onEvent?.({
+        type: "icon-acquisition-complete",
+        itemId: task.itemId,
+        taskId: task.id,
+        candidate,
+        cached: true,
+        displayIconRevision: decisionChange?.revision ?? null,
+      });
       return { candidate, cached: true };
     }
     let resource;
@@ -285,12 +292,19 @@ class IconEvidenceService {
       throw error;
     }
     const asset = await this.processImage({ resourceBody: resource.body, metadata: { ...metadata, mimeType: resource.mimeType || metadata.mimeType }, cacheDir: this.cacheDir });
-    const candidate = this.database.saveIconCandidate({
+    const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
       itemId: task.itemId, cacheKey, sourceType: "cocos-runtime-resource", resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
       runtimeIdentifier: metadata.runtimeIdentifier || null, textureUuid: metadata.textureUuid || null, crop,
       rankScore: 1, asset,
     });
-    this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: false });
+    this.onEvent?.({
+      type: "icon-acquisition-complete",
+      itemId: task.itemId,
+      taskId: task.id,
+      candidate,
+      cached: false,
+      displayIconRevision: decisionChange?.revision ?? null,
+    });
     return { candidate, cached: false };
   }
 
@@ -323,11 +337,20 @@ class IconEvidenceService {
     if (processed.crop.backgroundRemoval?.applied !== true) qualityReasons.push("background-not-isolated");
     if (targets.some((target) => target.captureEligibility === "transformed-board-item")) qualityReasons.push("transformed-board-item");
     const qualityGate = { status: qualityReasons.length ? "rejected" : "eligible", reasons: qualityReasons, stability };
-    const candidate = this.database.saveIconCandidate({
+    const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
       itemId: task.itemId, cacheKey, sourceType: "screenshot-runtime", runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds", crop,
       similarity: { ...processed.similarity, qualityGate }, rankScore: 0.5 + stability * 0.3, autoSelect: qualityGate.status === "eligible", asset: processed.asset,
     });
-    this.onEvent?.({ type: "icon-acquisition-complete", itemId: task.itemId, taskId: task.id, candidate, cached: false, provider: "screenshot-runtime", exactProviderError: exactError.message });
+    this.onEvent?.({
+      type: "icon-acquisition-complete",
+      itemId: task.itemId,
+      taskId: task.id,
+      candidate,
+      cached: false,
+      provider: "screenshot-runtime",
+      exactProviderError: exactError.message,
+      displayIconRevision: decisionChange?.revision ?? null,
+    });
     return { candidate, cached: false, provider: "screenshot-runtime", exactProviderError: exactError.message };
   }
 

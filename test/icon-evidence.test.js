@@ -276,6 +276,12 @@ test("Automation Runtime acquires icons in the background without changing Activ
     assert.equal(reads, 1);
     assert.deepEqual(runtime.getPlanningCatalog().items.map((item) => item.id), planningBefore);
     assert.match(runtime.getCatalogObject("item-identity", "i1").selectedIcon.url, /^\/api\/catalog\/icon\//);
+    assert.deepEqual(events.filter((event) => event.type === "catalog-display-icon-updated")
+      .map(({ type, at, ...event }) => event), [{
+      objectType: "item-identity",
+      objectId: "i1",
+      displayIconRevision: 2,
+    }]);
     assert.equal(runtime.getCatalogView().items.find((item) => item.id === "i1").iconUrl != null, true);
     runtime.database.observeCatalogObject({ objectType: "item-identity", objectId: "board-only", payload: { itemId: "board-only", level: 5 }, sourceType: "passive-runtime", sourceRef: "board-state", countDuplicate: false });
     runtime.queueVisibleBoardIconEvidence({ board: { grids: [{ itemId: "board-only", level: 5 }] } });

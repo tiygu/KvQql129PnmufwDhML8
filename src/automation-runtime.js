@@ -335,7 +335,7 @@ class AutomationRuntime {
     for (const conflict of this.database.listCatalogConflicts()) {
       this.catalogGate.evaluateObject(conflict.objectType, conflict.objectId);
     }
-    this.database.invalidateAutomaticIconSelections((candidate) => {
+    const invalidatedDisplayIcons = this.database.invalidateAutomaticIconSelections((candidate) => {
       if (candidate.sourceType === "screenshot-runtime") {
         return candidate.crop?.backgroundRemoval?.applied === true
           && candidate.similarity?.qualityGate?.status === "eligible";
@@ -348,6 +348,9 @@ class AutomationRuntime {
       const resourceName = String(resourceIdentifier || "").split(/[\\/]/).filter(Boolean).at(-1);
       return !resourceName || /^(?:icon|item[_-]?icon)$/i.test(resourceName);
     }, { reason: "automatic-icon-quality-gate" });
+    for (const invalidated of invalidatedDisplayIcons) {
+      this._emitDisplayIconUpdated(invalidated.itemId, invalidated.displayIconRevision);
+    }
     this.iconService = new IconEvidenceService({
       database: this.database,
       cacheDir: path.join(this.dataDir, "icon-cache"),
@@ -375,6 +378,9 @@ class AutomationRuntime {
           const rejected = event.candidate?.sourceType === "screenshot-runtime" && event.candidate?.similarity?.qualityGate?.status === "rejected";
           if (rejected) this.iconEvidenceRetryAt.set(itemId, Date.now() + 300_000);
           else this.iconEvidenceRetryAt.delete(itemId);
+          if (Number.isInteger(event.displayIconRevision)) {
+            this._emitDisplayIconUpdated(itemId, event.displayIconRevision);
+          }
         } else if (event.type === "icon-acquisition-error") {
           this.iconEvidenceRetryAt.set(itemId, Date.now() + 60_000);
         }
@@ -384,6 +390,14 @@ class AutomationRuntime {
   }
 
   emit(type, payload = {}) { this.onEvent?.({ type, at: new Date().toISOString(), ...payload }); }
+
+  _emitDisplayIconUpdated(objectId, displayIconRevision) {
+    this.emit("catalog-display-icon-updated", {
+      objectType: "item-identity",
+      objectId: String(objectId),
+      displayIconRevision: Number(displayIconRevision),
+    });
+  }
 
   ensureRuntimeControl() {
     if (this.runtimeControl) return this.runtimeControl;
@@ -562,7 +576,18 @@ class AutomationRuntime {
     };
     const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
     if (objectType === "item-identity") {
-      return { ...enrichedObject, iconCandidates: (object.iconCandidates || []).map(iconUrl), selectedIcon: iconUrl(object.selectedIcon) };
+      const displayIcon = {
+        ...object.displayIcon,
+        candidates: (object.displayIcon?.candidates || []).map(iconUrl),
+        selectedIcon: iconUrl(object.displayIcon?.selectedIcon),
+      };
+      return {
+        ...enrichedObject,
+        displayIcon,
+        iconCandidates: displayIcon.candidates,
+        selectedIcon: displayIcon.selectedIcon,
+        iconSelectionHistory: displayIcon.history,
+      };
     }
     if (objectType === "production-mode") {
       const mode = object.effectiveValue || object.algorithmCandidate || {};
@@ -766,35 +791,52 @@ class AutomationRuntime {
   }
 
   selectCatalogIcon(itemId, candidateId, input) {
-    const object = this.database.selectIconCandidate(String(itemId), Number(candidateId), input);
-    this.emit("catalog-review-updated", { objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
-    return this.getCatalogObject("item-identity", String(itemId));
+    this.database.selectIconCandidate(String(itemId), Number(candidateId), input);
+    const result = this.getCatalogObject("item-identity", String(itemId));
+    this._emitDisplayIconUpdated(result.objectId, result.displayIcon.revision);
+    return result;
   }
 
   revokeCatalogIconSelection(itemId, input) {
-    const object = this.database.revokeIconSelection(String(itemId), input);
-    this.emit("catalog-review-updated", { objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
-    return this.getCatalogObject("item-identity", String(itemId));
+    this.database.revokeIconSelection(String(itemId), input);
+    const result = this.getCatalogObject("item-identity", String(itemId));
+    this._emitDisplayIconUpdated(result.objectId, result.displayIcon.revision);
+    return result;
   }
 
-  async uploadCatalogIcon(itemId, { dataBase64, mimeType, actor, note, expectedRevision }) {
+  async uploadCatalogIcon(itemId, {
+    dataBase64,
+    mimeType,
+    actor,
+    note,
+    expectedDisplayIconRevision,
+  }) {
     if (this.running || this.actionBoundaryPending) throw Object.assign(new Error("icon upload requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
     this.actionBoundaryPending = true;
     try {
       const object = this.database.getCatalogObject("item-identity", String(itemId));
       if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
       if (!String(actor || "").trim() || !String(note || "").trim()) throw Object.assign(new Error("icon upload actor and note are required"), { statusCode: 400 });
-      this.database.assertCatalogObjectRevision("item-identity", String(itemId), expectedRevision);
       if (!/^image\/(png|jpeg)$/i.test(String(mimeType || ""))) throw Object.assign(new Error("uploaded icon must be PNG or JPEG"), { statusCode: 415 });
       const body = Buffer.from(String(dataBase64 || "").replace(/^data:[^,]+,/, ""), "base64");
       if (!body.length || body.length > 8 * 1024 * 1024) throw Object.assign(new Error("uploaded icon is empty or too large"), { statusCode: 413 });
       const asset = await this.iconService.processImage({ resourceBody: body, metadata: { mimeType }, cacheDir: this.iconService.cacheDir });
-      this.database.assertCatalogObjectRevision("item-identity", String(itemId), expectedRevision);
       const cacheKey = crypto.createHash("sha256").update(`user-upload:${asset.hash}`).digest("hex");
-      const candidate = this.database.saveIconCandidate({ itemId: String(itemId), cacheKey, sourceType: "user-upload", crop: { provider: "user-upload" }, rankScore: 0, autoSelect: false, asset });
-      const selected = this.database.selectIconCandidate(String(itemId), candidate.id, { actor, note, expectedRevision: this.database.getCatalogObject("item-identity", String(itemId)).revision });
-      this.emit("catalog-review-updated", { objectType: selected.objectType, objectId: selected.objectId, revision: selected.revision, reviewStatus: selected.reviewStatus });
-      return this.getCatalogObject("item-identity", String(itemId));
+      const { object: selected } = this.database.saveAndSelectIconCandidate({
+        itemId: String(itemId),
+        cacheKey,
+        sourceType: "user-upload",
+        crop: { provider: "user-upload" },
+        rankScore: 0,
+        asset,
+      }, {
+        actor,
+        note,
+        expectedDisplayIconRevision,
+      });
+      const result = this.getCatalogObject("item-identity", String(itemId));
+      this._emitDisplayIconUpdated(selected.objectId, result.displayIcon.revision);
+      return result;
     } finally {
       this.actionBoundaryPending = false;
     }

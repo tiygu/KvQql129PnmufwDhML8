@@ -25,25 +25,25 @@ function observeIdentity(database, objectId = "item-1", name = "候选物品") {
   });
 }
 
-test("图鉴 Schema v2 迁移会先备份且重复启动保持幂等", () => withDirectory((dir) => {
+test("图鉴 Schema v3 迁移会先备份且重复启动保持幂等", () => withDirectory((dir) => {
   const filePath = path.join(dir, "catalog.db");
   let database = new AutomationDatabase(filePath);
-  database.db.exec("PRAGMA user_version=1; DELETE FROM schema_migrations WHERE version=2;");
+  database.db.exec("PRAGMA user_version=2; DELETE FROM schema_migrations WHERE version=3;");
   database.close();
 
   database = new AutomationDatabase(filePath);
   const status = database.getCatalogSchemaStatus();
-  const backupPath = `${filePath}.pre-v2.bak`;
+  const backupPath = `${filePath}.pre-v3.bak`;
 
-  assert.equal(status.currentVersion, 2);
-  assert.deepEqual(status.migrations.map((migration) => migration.version), [1, 2]);
+  assert.equal(status.currentVersion, 3);
+  assert.deepEqual(status.migrations.map((migration) => migration.version), [1, 2, 3]);
   assert.equal(status.preMigrationBackupPath, backupPath);
   assert.equal(fs.existsSync(backupPath), true);
   const backupStat = fs.statSync(backupPath);
   database.close();
 
   database = new AutomationDatabase(filePath);
-  assert.equal(database.getCatalogSchemaStatus().currentVersion, 2);
+  assert.equal(database.getCatalogSchemaStatus().currentVersion, 3);
   assert.equal(fs.statSync(backupPath).mtimeMs, backupStat.mtimeMs);
   database.close();
 }));
@@ -85,6 +85,50 @@ test("旧裁决按兼容默认值读取且首个新裁决写入完整快照 Sche
     });
     assert.equal(completed.reviewResolution.schemaVersion, 2);
     assert.equal(completed.reviewResolution.compatibilitySource, "native-full-snapshot");
+  } finally {
+    database.close();
+  }
+}));
+
+test("历史裁决保留展示字段而语义版本投影过滤展示字段", () => withDirectory((dir) => {
+  const database = new AutomationDatabase(path.join(dir, "catalog.db"));
+  try {
+    const observed = observeIdentity(database, "legacy-display-item");
+    const legacySnapshot = {
+      ...observed.algorithmCandidate,
+      displayIcon: { candidateId: 17, assetHash: "legacy-display-hash" },
+    };
+    const active = database.saveCatalogVersion({
+      objectType: "item-identity",
+      objectId: "legacy-display-item",
+      payload: legacySnapshot,
+      status: "active",
+      origin: "legacy-migration",
+      expectedRevision: observed.revision,
+    });
+    const objectRow = database.db.prepare(
+      "SELECT id FROM catalog_repository_objects WHERE object_type='item-identity' AND object_id='legacy-display-item'",
+    ).get();
+    database.db.prepare(`INSERT INTO catalog_review_resolutions(
+      object_id,request_id,request_fingerprint,decision,snapshot_json,actor,optional_note,
+      object_revision,planning_result_json,schema_version,compatibility_source,created_at
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      objectRow.id,
+      "legacy-display-resolution",
+      "legacy-display-fingerprint",
+      "modify",
+      JSON.stringify(legacySnapshot),
+      "legacy-operator",
+      null,
+      active.revision,
+      JSON.stringify({ status: "not-requested" }),
+      1,
+      "legacy-default",
+      "2026-07-01T00:00:00.000Z",
+    );
+
+    assert.equal(Object.hasOwn(database.getCatalogObject("item-identity", "legacy-display-item").activeVersion.payload, "displayIcon"), false);
+    assert.deepEqual(database.listCatalogReviewResolutions({ objectId: "legacy-display-item" }).at(-1).snapshot.displayIcon, legacySnapshot.displayIcon);
   } finally {
     database.close();
   }

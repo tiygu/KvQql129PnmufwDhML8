@@ -298,13 +298,18 @@ test("manual icon selection outranks later automatic candidates and revoke retai
   try {
     const first = save("1".repeat(64), "first");
     const second = save("2".repeat(64), "second");
-    database.selectIconCandidate("i1", first.id, { actor: "operator", note: "preferred", expectedRevision: database.getCatalogObject("item-identity", "i1").revision });
+    database.selectIconCandidate("i1", first.id, { actor: "operator", note: "preferred", expectedDisplayIconRevision: database.getCatalogObject("item-identity", "i1").displayIcon.revision });
     save("3".repeat(64), "third");
     assert.equal(database.getSelectedIconCandidate("i1").id, first.id);
-    database.revokeIconSelection("i1", { actor: "operator", note: "recheck", expectedRevision: database.getCatalogObject("item-identity", "i1").revision });
+    database.revokeIconSelection("i1", { actor: "operator", note: "recheck", expectedDisplayIconRevision: database.getCatalogObject("item-identity", "i1").displayIcon.revision });
     assert.equal(database.getSelectedIconCandidate("i1"), null);
     const object = database.getCatalogObject("item-identity", "i1");
-    assert.deepEqual(object.iconSelectionHistory.map((entry) => entry.action), ["manual-select", "manual-revoke"]);
+    assert.deepEqual(object.iconSelectionHistory.map((entry) => entry.action), [
+      "automatic-select",
+      "automatic-select",
+      "manual-select",
+      "manual-revoke",
+    ]);
     assert.equal(object.iconCandidates.length, 3);
     assert.equal(second.selected, true);
   } finally {
@@ -323,7 +328,7 @@ test("startup quality cleanup invalidates stale automatic screenshots but preser
     for (const itemId of ["automatic", "manual"]) database.observeCatalogObject({ objectType: "item-identity", objectId: itemId, payload: { itemId }, sourceType: "runtime" });
     database.saveIconCandidate({ itemId: "automatic", cacheKey: "bad-auto", sourceType: "screenshot-runtime", crop: { backgroundRemoval: { applied: false } }, similarity: {}, asset: asset("a".repeat(64)) });
     const manualCandidate = database.saveIconCandidate({ itemId: "manual", cacheKey: "bad-manual", sourceType: "screenshot-runtime", crop: { backgroundRemoval: { applied: false } }, similarity: {}, asset: asset("b".repeat(64)) });
-    database.selectIconCandidate("manual", manualCandidate.id, { actor: "operator", note: "verified by eye", expectedRevision: database.getCatalogObject("item-identity", "manual").revision });
+    database.selectIconCandidate("manual", manualCandidate.id, { actor: "operator", note: "verified by eye", expectedDisplayIconRevision: database.getCatalogObject("item-identity", "manual").displayIcon.revision });
 
     const invalidated = database.invalidateAutomaticIconSelections((candidate) => candidate.sourceType !== "screenshot-runtime"
       || (candidate.crop?.backgroundRemoval?.applied === true && candidate.similarity?.qualityGate?.status === "eligible"));
@@ -435,14 +440,25 @@ test("uploaded replacement is normalized, manually selected, and leaves planning
     chains: [{ id: "c", complete: true, minLevel: 1, maxLevel: 2, itemIds: ["i1", "i2"] }],
     items: [{ id: "i1", chainId: "c", level: 1, baseUnits: 1, mergeTarget: "i2" }, { id: "i2", chainId: "c", level: 2, baseUnits: 2, mergeTarget: null }], producers: [],
   }));
-  const runtime = new AutomationRuntime({ rootDir: root, dataDir: path.join(root, "data"), manageConnectionRoute: false });
+  const events = [];
+  const runtime = new AutomationRuntime({
+    rootDir: root,
+    dataDir: path.join(root, "data"),
+    manageConnectionRoute: false,
+    onEvent: (event) => events.push(event),
+  });
   try {
     const before = runtime.getPlanningCatalog().items.map((item) => item.id);
     const object = runtime.getCatalogObject("item-identity", "i1");
-    const uploaded = await runtime.uploadCatalogIcon("i1", { dataBase64: image(3, 2, () => [90, 30, 200, 255]).toString("base64"), mimeType: "image/png", actor: "operator", note: "clean replacement", expectedRevision: object.revision });
+    const uploaded = await runtime.uploadCatalogIcon("i1", { dataBase64: image(3, 2, () => [90, 30, 200, 255]).toString("base64"), mimeType: "image/png", actor: "operator", note: "clean replacement", expectedDisplayIconRevision: object.displayIcon.revision });
     assert.equal(uploaded.selectedIcon.sourceType, "user-upload");
     assert.equal(uploaded.selectedIcon.selectionOrigin, "manual");
     assert.equal(uploaded.iconSelectionHistory.at(-1).action, "manual-select");
+    assert.equal(uploaded.revision, object.revision);
+    assert.equal(uploaded.displayIcon.revision, object.displayIcon.revision + 1);
+    assert.deepEqual(events.filter((event) => event.type === "catalog-display-icon-updated").map(({ type, at, ...event }) => event), [
+      { objectType: "item-identity", objectId: "i1", displayIconRevision: uploaded.displayIcon.revision },
+    ]);
     assert.deepEqual(runtime.getPlanningCatalog().items.map((item) => item.id), before);
   } finally {
     await runtime.close();

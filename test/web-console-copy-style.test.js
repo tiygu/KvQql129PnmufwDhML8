@@ -286,7 +286,7 @@ test("图标候选无需隐藏备注前置条件并在请求完成前立即显�
   const selectBody = source.slice(source.indexOf("const selectIcon = async"), source.indexOf("const revokeIcon = async"));
 
   assert.doesNotMatch(selectBody, /!note\.trim\(\)/);
-  assert.match(selectBody, /const auditNote = note\.trim\(\) \|\| "手动选择图标候选"/);
+  assert.match(selectBody, /const auditNote = note\.trim\(\) \|\| "手动更新展示图标选择"/);
   assert.match(selectBody, /setDetail\(markIconSelected\(detail, candidateId\)\)/);
   assert.ok(selectBody.indexOf("setDetail(markIconSelected") < selectBody.indexOf("await controlApi.selectCatalogIcon"));
 });

@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const { DatabaseSync } = require("node:sqlite");
 const { canonicalJson } = require("./canonical-json");
 const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
+const { DisplayIconDecision } = require("./display-icon-decision");
 const { createDistributionState, updateDistributionState, replaceTheory, projectPlanningDistribution } = require("./production-distributions");
 
 const CATALOG_VERSION_STATES = new Set(["observed", "provisional", "active"]);
@@ -14,8 +15,15 @@ const CATALOG_DISPOSITIONS = new Set(["enabled", "paused", "rejected"]);
 const CATALOG_EVIDENCE_DISPOSITIONS = new Set(["eligible", "paused", "rejected"]);
 const CATALOG_RULING_DECISIONS = new Set(["confirm", "modify", "revoke"]);
 const CATALOG_RELEASE_ENTRY_MODES = new Set(["full-snapshot", "legacy-advanced"]);
-const CURRENT_CATALOG_SCHEMA_VERSION = 2;
+const CURRENT_CATALOG_SCHEMA_VERSION = 3;
+const CURRENT_CATALOG_REVIEW_SCHEMA_VERSION = 2;
 const UNSAFE_FIELD_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+const ITEM_IDENTITY_PRESENTATION_FIELDS = new Set([
+  "displayIcon",
+  "selectedIcon",
+  "iconCandidates",
+  "iconSelectionHistory",
+]);
 
 function parseJson(value) {
   return value == null ? null : JSON.parse(value);
@@ -67,6 +75,15 @@ function validateCatalogReviewPayload(identity, payload) {
     throw catalogSnapshotValidationError("完整快照必须是包含领域字段的 JSON 对象。", "snapshot");
   }
   const value = structuredClone(payload);
+  if (identity.objectType === "item-identity") {
+    const presentationField = [...ITEM_IDENTITY_PRESENTATION_FIELDS].find((field) => Object.hasOwn(value, field));
+    if (presentationField) {
+      throw catalogSnapshotValidationError(
+        `完整图鉴语义快照不包含展示字段：${presentationField}。`,
+        presentationField,
+      );
+    }
+  }
   const payloadObjectId = identity.objectType === "production-profile"
     ? value.producerItemId ?? value.itemId
     : identity.objectType === "production-mode"
@@ -82,6 +99,19 @@ function validateCatalogReviewPayload(identity, payload) {
     );
   }
   return value;
+}
+
+function catalogSemanticSnapshot(objectType, payload) {
+  const value = structuredClone(payload || {});
+  if (objectType === "item-identity") {
+    for (const field of ITEM_IDENTITY_PRESENTATION_FIELDS) delete value[field];
+  }
+  return value;
+}
+
+function isCatalogPresentationField(objectType, fieldPath) {
+  return objectType === "item-identity"
+    && ITEM_IDENTITY_PRESENTATION_FIELDS.has(String(fieldPath).split(".")[0]);
 }
 
 function catalogDisplayTitle(payload) {
@@ -183,6 +213,11 @@ class AutomationDatabase {
     this.preMigrationBackupPath = fs.existsSync(backupPath) ? backupPath : null;
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
     this.migrate();
+    this.displayIconDecision = new DisplayIconDecision({
+      db: this.db,
+      transaction: (work) => this.transaction(work),
+      objectResult: (row) => this._catalogObjectResult(row),
+    });
   }
 
   transaction(work) {
@@ -392,10 +427,20 @@ class AutomationDatabase {
         actor TEXT NOT NULL,
         note TEXT NOT NULL,
         object_revision INTEGER NOT NULL,
+        decision_revision INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
         FOREIGN KEY(candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT,
         FOREIGN KEY(previous_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS catalog_icon_decisions (
+        object_id INTEGER PRIMARY KEY,
+        selected_candidate_id INTEGER,
+        revision INTEGER NOT NULL DEFAULT 1,
+        selection_origin TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
+        FOREIGN KEY(selected_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
       );
       CREATE TABLE IF NOT EXISTS automation_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, started_at TEXT NOT NULL,
@@ -465,6 +510,14 @@ class AutomationDatabase {
     if (!iconCandidateColumns.has("similarity_json")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN similarity_json TEXT NOT NULL DEFAULT '{}'");
     if (!iconCandidateColumns.has("rank_score")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN rank_score REAL NOT NULL DEFAULT 1");
     if (!iconCandidateColumns.has("selection_origin")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN selection_origin TEXT");
+    const iconHistoryColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_icon_selection_history)").all().map((column) => column.name));
+    if (!iconHistoryColumns.has("decision_revision")) {
+      this.db.exec("ALTER TABLE catalog_icon_selection_history ADD COLUMN decision_revision INTEGER NOT NULL DEFAULT 1");
+      this.db.exec(`UPDATE catalog_icon_selection_history AS history SET decision_revision=1+(
+        SELECT COUNT(*) FROM catalog_icon_selection_history AS prior
+        WHERE prior.object_id=history.object_id AND prior.id<=history.id
+      )`);
+    }
     const objectColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_objects)").all().map((column) => column.name));
     if (!objectColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_objects ADD COLUMN disposition TEXT NOT NULL DEFAULT 'enabled'");
     const evidenceColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_evidence)").all().map((column) => column.name));
@@ -475,6 +528,20 @@ class AutomationDatabase {
     const migratedAt = new Date().toISOString();
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(1,'sqlite-catalog-repository',?)").run(migratedAt);
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(2,'full-snapshot-compatibility',?)").run(migratedAt);
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(3,'independent-display-icon-decision',?)").run(migratedAt);
+    this.db.exec(`INSERT OR IGNORE INTO catalog_icon_decisions(
+      object_id,selected_candidate_id,revision,selection_origin,updated_at
+    )
+    SELECT object.id,selected.id,
+      1+MAX(
+        CASE WHEN selected.id IS NULL THEN 0 ELSE 1 END,
+        (SELECT COUNT(*) FROM catalog_icon_selection_history history WHERE history.object_id=object.id)
+      ),
+      selected.selection_origin,object.updated_at
+    FROM catalog_repository_objects object
+    LEFT JOIN catalog_icon_candidates selected
+      ON selected.object_id=object.id AND selected.selected=1
+    WHERE object.object_type='item-identity'`);
     this.db.exec(`PRAGMA user_version=${CURRENT_CATALOG_SCHEMA_VERSION}`);
     this.db.exec("UPDATE catalog_repository_objects SET candidate_version_id=NULL WHERE status='active' AND active_version_id IS NOT NULL AND candidate_version_id IS NOT NULL");
   }
@@ -567,10 +634,16 @@ class AutomationDatabase {
 
   _catalogVersion(versionId) {
     if (versionId == null) return null;
-    const row = this.db.prepare("SELECT * FROM catalog_repository_versions WHERE id=?").get(versionId);
+    const row = this.db.prepare(`SELECT version.*,object.object_type
+      FROM catalog_repository_versions version
+      JOIN catalog_repository_objects object ON object.id=version.object_id
+      WHERE version.id=?`).get(versionId);
     return row ? {
       id: Number(row.id), version: Number(row.version), status: row.status,
-      origin: row.origin, payload: parseJson(row.payload_json), evidenceSummary: parseJson(row.evidence_summary_json), createdAt: row.created_at,
+      origin: row.origin,
+      payload: catalogSemanticSnapshot(row.object_type, parseJson(row.payload_json)),
+      evidenceSummary: parseJson(row.evidence_summary_json),
+      createdAt: row.created_at,
     } : null;
   }
 
@@ -606,6 +679,11 @@ class AutomationDatabase {
       else active.set(ruling.fieldPath, ruling);
     }
     return active;
+  }
+
+  _semanticCatalogRulings(row) {
+    return new Map([...this._activeCatalogRulings(row.id)]
+      .filter(([fieldPath]) => !isCatalogPresentationField(row.object_type, fieldPath)));
   }
 
   _prepareCatalogRulingInsert() {
@@ -675,24 +753,20 @@ class AutomationDatabase {
     }));
     result.versions = this.db.prepare("SELECT * FROM catalog_repository_versions WHERE object_id=? ORDER BY version").all(row.id).map((version) => ({
       id: Number(version.id), version: Number(version.version), status: version.status,
-      origin: version.origin, payload: parseJson(version.payload_json), evidenceSummary: parseJson(version.evidence_summary_json), createdAt: version.created_at,
+      origin: version.origin,
+      payload: catalogSemanticSnapshot(row.object_type, parseJson(version.payload_json)),
+      evidenceSummary: parseJson(version.evidence_summary_json),
+      createdAt: version.created_at,
     }));
     result.transitions = this.db.prepare("SELECT * FROM catalog_repository_transitions WHERE object_id=? ORDER BY id").all(row.id).map((transition) => this._catalogTransition(transition));
     if (row.object_type === "item-identity") {
-      result.iconCandidates = this._iconCandidates(row.id);
-      result.selectedIcon = this._selectedIconCandidate(row.id);
-      result.iconSelectionHistory = this.db.prepare(`SELECT history.*,candidate.asset_hash,previous.asset_hash AS previous_asset_hash
-        FROM catalog_icon_selection_history history
-        LEFT JOIN catalog_icon_candidates candidate ON candidate.id=history.candidate_id
-        LEFT JOIN catalog_icon_candidates previous ON previous.id=history.previous_candidate_id
-        WHERE history.object_id=? ORDER BY history.id`).all(row.id).map((history) => ({
-          id: Number(history.id), candidateId: history.candidate_id == null ? null : Number(history.candidate_id), assetHash: history.asset_hash || null,
-          previousCandidateId: history.previous_candidate_id == null ? null : Number(history.previous_candidate_id), previousAssetHash: history.previous_asset_hash || null,
-          action: history.action, actor: history.actor, note: history.note, objectRevision: Number(history.object_revision), createdAt: history.created_at,
-        }));
+      result.displayIcon = this.displayIconDecision.readByObjectId(row.id);
+      result.iconCandidates = result.displayIcon.candidates;
+      result.selectedIcon = result.displayIcon.selectedIcon;
+      result.iconSelectionHistory = result.displayIcon.history;
     }
     result.algorithmCandidate = this._catalogAlgorithmCandidate(row);
-    const activeRulings = this._activeCatalogRulings(row.id);
+    const activeRulings = this._semanticCatalogRulings(row);
     result.humanValues = Object.fromEntries(activeRulings);
     result.effectiveValue = [...activeRulings.values()].reduce((payload, ruling) => setFieldValue(payload, ruling.fieldPath, ruling.value), result.algorithmCandidate);
     result.rulingHistory = this._catalogRulings(row.id);
@@ -870,7 +944,7 @@ class AutomationDatabase {
     this._assertCatalogRevision(object, input.expectedRevision);
     const payload = this._validateCatalogReviewSnapshot(identity, input.snapshot);
     const algorithmCandidate = this._catalogAlgorithmCandidate(object);
-    const effectiveBefore = [...this._activeCatalogRulings(object.id).values()]
+    const effectiveBefore = [...this._semanticCatalogRulings(object).values()]
       .reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
     return {
       valid: true,
@@ -929,7 +1003,7 @@ class AutomationDatabase {
         );
       }
       this._assertCatalogRevision(before, input.expectedRevision);
-      const activeRulings = this._activeCatalogRulings(before.id);
+      const activeRulings = this._semanticCatalogRulings(before);
       const effectiveBefore = [...activeRulings.values()].reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
       const triggerReasons = this._catalogReviewReasons(before, algorithmCandidate, activeRulings);
       const evidenceReferences = this.db.prepare("SELECT id,source_type,source_ref FROM catalog_repository_evidence WHERE object_id=? ORDER BY id").all(before.id)
@@ -976,7 +1050,7 @@ class AutomationDatabase {
         optionalNote,
         nextRevision,
         canonicalJson(planningResult),
-        CURRENT_CATALOG_SCHEMA_VERSION,
+        CURRENT_CATALOG_REVIEW_SCHEMA_VERSION,
         compatibilitySource,
         now,
       );
@@ -1273,7 +1347,7 @@ class AutomationDatabase {
       const recordSameDisposition = auditAction === "accept-evidence";
       if (evidence.disposition === disposition && !recordSameDisposition) return this._catalogObjectResult(before);
       const algorithmCandidate = this._catalogAlgorithmCandidate(before);
-      const effectiveBefore = [...this._activeCatalogRulings(before.id).values()]
+      const effectiveBefore = [...this._semanticCatalogRulings(before).values()]
         .reduce((value, ruling) => setFieldValue(value, ruling.fieldPath, ruling.value), algorithmCandidate);
       const evidencePayload = parseJson(evidence.payload_json) || {};
       const auditActor = String(actor || String(reason).split(":")[0] || "system").trim() || "system";
@@ -1431,7 +1505,9 @@ class AutomationDatabase {
       const nextValue = revoke || input.decision === "confirm"
         ? candidateValue === undefined ? null : candidateValue
         : input.value;
-      const snapshot = setFieldValue(currentSnapshot, fieldPath, nextValue);
+      const snapshot = isCatalogPresentationField(identity.objectType, fieldPath)
+        ? currentSnapshot
+        : setFieldValue(currentSnapshot, fieldPath, nextValue);
       const completed = completeReview(snapshot);
       if (!revoke || completed.idempotentReplay) return completed;
       const now = input.createdAt || new Date().toISOString();
@@ -1641,105 +1717,47 @@ class AutomationDatabase {
     return disambiguateCatalogTitles(entries);
   }
 
-  _iconCandidate(row) {
-    return row ? {
-      id: Number(row.id), itemId: row.object_key, assetHash: row.asset_hash, cacheKey: row.cache_key,
-      sourceType: row.source_type, resourceUrl: row.resource_url, runtimeIdentifier: row.runtime_identifier,
-      textureUuid: row.texture_uuid, crop: parseJson(row.crop_json), selected: !!row.selected,
-      similarity: parseJson(row.similarity_json) || {}, rankScore: Number(row.rank_score), selectionOrigin: row.selection_origin || null,
-      mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size),
-      filePath: row.file_path, createdAt: row.created_at,
-    } : null;
-  }
-
   _iconCandidates(repositoryObjectId) {
-    return this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
-      FROM catalog_icon_candidates candidate
-      JOIN catalog_repository_objects object ON object.id=candidate.object_id
-      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
-      WHERE candidate.object_id=? ORDER BY candidate.id`).all(repositoryObjectId).map((row) => this._iconCandidate(row));
+    return this.displayIconDecision.candidates(repositoryObjectId);
   }
 
   _selectedIconCandidate(repositoryObjectId) {
-    const row = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
-      FROM catalog_icon_candidates candidate
-      JOIN catalog_repository_objects object ON object.id=candidate.object_id
-      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
-      WHERE candidate.object_id=? AND candidate.selected=1 ORDER BY candidate.id DESC LIMIT 1`).get(repositoryObjectId);
-    const candidate = this._iconCandidate(row);
-    return candidate && fs.existsSync(candidate.filePath) ? candidate : null;
+    return this.displayIconDecision.selected(repositoryObjectId);
   }
 
-  saveIconCandidate({ itemId, cacheKey, sourceType, resourceUrl = null, runtimeIdentifier = null, textureUuid = null, crop = {}, similarity = {}, rankScore = 1, autoSelect = true, asset }) {
-    if (!asset?.hash || !asset.mimeType || !Number.isInteger(Number(asset.width)) || !Number.isInteger(Number(asset.height)) || !asset.filePath) throw new TypeError("complete icon asset metadata is required");
-    return this.transaction(() => {
-      const object = this._catalogObjectRow("item-identity", String(itemId));
-      if (!object) throw new Error(`catalog object not found: item-identity/${itemId}`);
-      const now = new Date().toISOString();
-      this.db.prepare(`INSERT INTO catalog_icon_assets(hash,mime_type,width,height,byte_size,file_path,created_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(hash) DO NOTHING`).run(String(asset.hash), String(asset.mimeType), Number(asset.width), Number(asset.height), Number(asset.byteSize), String(asset.filePath), now);
-      const manualPreference = this.db.prepare("SELECT action FROM catalog_icon_selection_history WHERE object_id=? AND action IN ('manual-select','manual-revoke') ORDER BY id DESC LIMIT 1").get(object.id);
-      const selected = this.db.prepare("SELECT * FROM catalog_icon_candidates WHERE object_id=? AND selected=1").get(object.id);
-      const shouldSelect = autoSelect && !manualPreference && (!selected || Number(rankScore) >= Number(selected.rank_score));
-      if (shouldSelect) this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE object_id=?").run(object.id);
-      this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,similarity_json,rank_score,selection_origin,selected,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(object_id,cache_key) DO UPDATE SET asset_hash=excluded.asset_hash,source_type=excluded.source_type,resource_url=excluded.resource_url,runtime_identifier=excluded.runtime_identifier,texture_uuid=excluded.texture_uuid,crop_json=excluded.crop_json,similarity_json=excluded.similarity_json,rank_score=excluded.rank_score,selection_origin=CASE WHEN excluded.selected=1 THEN excluded.selection_origin ELSE catalog_icon_candidates.selection_origin END,selected=CASE WHEN excluded.selected=1 THEN 1 ELSE catalog_icon_candidates.selected END`)
-        .run(object.id, String(asset.hash), String(cacheKey), String(sourceType), resourceUrl, runtimeIdentifier, textureUuid, canonicalJson(crop || {}), canonicalJson(similarity || {}), Number(rankScore), shouldSelect ? "automatic" : null, shouldSelect ? 1 : 0, now);
-      this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
-      const after = this._catalogObjectRow("item-identity", String(itemId));
-      this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: `${shouldSelect ? "icon-candidate-selected" : "icon-candidate-added"}:${asset.hash}`, evidenceRevision: after.revision });
-      return this._iconCandidate(this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
-        FROM catalog_icon_candidates candidate JOIN catalog_repository_objects object ON object.id=candidate.object_id JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
-        WHERE candidate.object_id=? AND candidate.cache_key=?`).get(object.id, String(cacheKey)));
+  saveIconCandidate(input) {
+    return this.saveIconCandidateWithDecision(input).candidate;
+  }
+
+  saveIconCandidateWithDecision(input) {
+    return this.displayIconDecision.observeCandidate(input);
+  }
+
+  saveAndSelectIconCandidate(candidateInput, decisionInput) {
+    return this.displayIconDecision.observeAndDecide(candidateInput, decisionInput);
+  }
+
+  selectIconCandidate(itemId, candidateId, input = {}) {
+    return this.displayIconDecision.decide(itemId, {
+      kind: "select",
+      candidateId,
+      actor: input.actor,
+      note: input.note,
+      expectedDisplayIconRevision: input.expectedDisplayIconRevision,
     });
   }
 
-  selectIconCandidate(itemId, candidateId, { actor, note, expectedRevision } = {}) {
-    if (!String(actor || "").trim() || !String(note || "").trim()) throw new TypeError("icon selection actor and note are required");
-    return this.transaction(() => {
-      const object = this._catalogObjectRow("item-identity", String(itemId));
-      if (!object) throw new Error(`catalog object not found: item-identity/${itemId}`);
-      this._assertCatalogRevision(object, expectedRevision);
-      const candidate = this.db.prepare("SELECT * FROM catalog_icon_candidates WHERE id=? AND object_id=?").get(Number(candidateId), object.id);
-      if (!candidate) throw Object.assign(new Error(`icon candidate not found: ${candidateId}`), { statusCode: 404 });
-      const previous = this.db.prepare("SELECT id FROM catalog_icon_candidates WHERE object_id=? AND selected=1").get(object.id);
-      const now = new Date().toISOString();
-      this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE object_id=?").run(object.id);
-      this.db.prepare("UPDATE catalog_icon_candidates SET selected=1,selection_origin='manual' WHERE id=?").run(candidate.id);
-      this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
-      const after = this._catalogObjectRow("item-identity", String(itemId));
-      this.db.prepare(`INSERT INTO catalog_icon_selection_history(object_id,candidate_id,previous_candidate_id,action,actor,note,object_revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?)`).run(object.id, candidate.id, previous?.id || null, "manual-select", String(actor).trim(), String(note).trim(), after.revision, now);
-      this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: `icon-manual-select:${candidate.asset_hash}`, evidenceRevision: after.revision });
-      return this._catalogObjectResult(after);
-    });
-  }
-
-  revokeIconSelection(itemId, { actor, note, expectedRevision } = {}) {
-    if (!String(actor || "").trim() || !String(note || "").trim()) throw new TypeError("icon selection actor and note are required");
-    return this.transaction(() => {
-      const object = this._catalogObjectRow("item-identity", String(itemId));
-      if (!object) throw new Error(`catalog object not found: item-identity/${itemId}`);
-      this._assertCatalogRevision(object, expectedRevision);
-      const previous = this.db.prepare("SELECT id FROM catalog_icon_candidates WHERE object_id=? AND selected=1").get(object.id);
-      const now = new Date().toISOString();
-      this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE object_id=?").run(object.id);
-      this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
-      const after = this._catalogObjectRow("item-identity", String(itemId));
-      this.db.prepare(`INSERT INTO catalog_icon_selection_history(object_id,candidate_id,previous_candidate_id,action,actor,note,object_revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?)`).run(object.id, null, previous?.id || null, "manual-revoke", String(actor).trim(), String(note).trim(), after.revision, now);
-      this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: "icon-manual-revoke", evidenceRevision: after.revision });
-      return this._catalogObjectResult(after);
+  revokeIconSelection(itemId, input = {}) {
+    return this.displayIconDecision.decide(itemId, {
+      kind: "revoke",
+      actor: input.actor,
+      note: input.note,
+      expectedDisplayIconRevision: input.expectedDisplayIconRevision,
     });
   }
 
   findIconAcquisition(cacheKey) {
-    const row = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
-      FROM catalog_icon_candidates candidate
-      JOIN catalog_repository_objects object ON object.id=candidate.object_id
-      JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
-      WHERE candidate.cache_key=? ORDER BY candidate.id LIMIT 1`).get(String(cacheKey));
-    return this._iconCandidate(row);
+    return this.displayIconDecision.findAcquisition(cacheKey);
   }
 
   listIconCandidates(itemId) {
@@ -1753,29 +1771,7 @@ class AutomationDatabase {
   }
 
   invalidateAutomaticIconSelections(isEligible, { reason = "automatic-icon-quality-gate" } = {}) {
-    if (typeof isEligible !== "function") throw new TypeError("icon eligibility predicate is required");
-    return this.transaction(() => {
-      const rows = this.db.prepare(`SELECT candidate.*,object.object_id AS object_key,asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path
-        FROM catalog_icon_candidates candidate
-        JOIN catalog_repository_objects object ON object.id=candidate.object_id
-        JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
-        WHERE candidate.selected=1 AND candidate.selection_origin='automatic'`).all();
-      const invalidated = [];
-      for (const row of rows) {
-        const candidate = this._iconCandidate(row);
-        if (isEligible(candidate)) continue;
-        const object = this._catalogObjectRow("item-identity", candidate.itemId);
-        const now = new Date().toISOString();
-        this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE id=?").run(candidate.id);
-        this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, object.id);
-        const after = this._catalogObjectRow("item-identity", candidate.itemId);
-        this.db.prepare(`INSERT INTO catalog_icon_selection_history(object_id,candidate_id,previous_candidate_id,action,actor,note,object_revision,created_at)
-          VALUES(?,?,?,?,?,?,?,?)`).run(object.id, null, candidate.id, "automatic-invalidate", "runtime-quality-gate", String(reason), after.revision, now);
-        this._recordCatalogTransition(after, { fromStatus: object.status, fromDisposition: object.disposition, reason: `${reason}:${candidate.assetHash}`, evidenceRevision: after.revision });
-        invalidated.push({ itemId: candidate.itemId, candidateId: candidate.id, sourceType: candidate.sourceType });
-      }
-      return invalidated;
-    });
+    return this.displayIconDecision.invalidateAutomaticSelections(isEligible, { reason });
   }
 
   listIconAssets() {
@@ -1789,9 +1785,10 @@ class AutomationDatabase {
 
   getSelectedIconHashes() {
     return Object.fromEntries(this.db.prepare(`SELECT object.object_id,candidate.asset_hash
-      FROM catalog_icon_candidates candidate
-      JOIN catalog_repository_objects object ON object.id=candidate.object_id
-      WHERE object.object_type='item-identity' AND candidate.selected=1
+      FROM catalog_icon_decisions decision
+      JOIN catalog_repository_objects object ON object.id=decision.object_id
+      JOIN catalog_icon_candidates candidate ON candidate.id=decision.selected_candidate_id
+      WHERE object.object_type='item-identity'
       ORDER BY object.object_id`).all().map((row) => [String(row.object_id), String(row.asset_hash)]));
   }
 
@@ -1806,10 +1803,11 @@ class AutomationDatabase {
     const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,candidate_version_id,active_version_id FROM catalog_repository_objects ORDER BY object_type,object_id").all();
     const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
     const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
-    const selectedIcons = this.db.prepare(`SELECT object.object_id,candidate.id,candidate.asset_hash
-      FROM catalog_icon_candidates candidate
-      JOIN catalog_repository_objects object ON object.id=candidate.object_id
-      WHERE candidate.selected=1
+    const selectedIcons = this.db.prepare(`SELECT object.object_id,decision.revision,candidate.id,candidate.asset_hash
+      FROM catalog_icon_decisions decision
+      JOIN catalog_repository_objects object ON object.id=decision.object_id
+      LEFT JOIN catalog_icon_candidates candidate ON candidate.id=decision.selected_candidate_id
+      WHERE decision.selected_candidate_id IS NOT NULL OR decision.revision>1
       ORDER BY object.object_id`).all();
     return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions, selectedIcons })).digest("hex");
   }
@@ -1825,9 +1823,13 @@ class AutomationDatabase {
     const objects = this.db.prepare("SELECT object_type,object_id,status,disposition,candidate_version_id,active_version_id FROM catalog_repository_objects ORDER BY object_type,object_id").all();
     const conflicts = this.db.prepare("SELECT object_type,object_id,conflict_type,fingerprint,status FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint").all();
     const productionDistributions = this.db.prepare("SELECT producer_item_id,mode_id,revision FROM production_distribution_states ORDER BY producer_item_id,mode_id").all();
-    const iconCandidates = this.db.prepare(`SELECT object.object_id,candidate.id,candidate.asset_hash,candidate.rank_score,candidate.selected,candidate.selection_origin
+    const iconCandidates = this.db.prepare(`SELECT object.object_id,decision.revision,
+        candidate.id,candidate.asset_hash,candidate.rank_score,
+        CASE WHEN decision.selected_candidate_id=candidate.id THEN 1 ELSE 0 END AS selected,
+        CASE WHEN decision.selected_candidate_id=candidate.id THEN decision.selection_origin ELSE NULL END AS selection_origin
       FROM catalog_icon_candidates candidate
       JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      LEFT JOIN catalog_icon_decisions decision ON decision.object_id=candidate.object_id
       ORDER BY object.object_id,candidate.id`).all();
     return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions, iconCandidates })).digest("hex");
   }
@@ -2060,7 +2062,17 @@ class AutomationDatabase {
       objects: this.listCatalogObjects().map((summary) => {
         const object = this.getCatalogObject(summary.objectType, summary.objectId);
         if (object.objectType !== "item-identity") return object;
-        return { ...object, iconCandidates: object.iconCandidates.map(portableCandidate), selectedIcon: portableCandidate(object.selectedIcon) };
+        const displayIcon = {
+          ...object.displayIcon,
+          candidates: object.displayIcon.candidates.map(portableCandidate),
+          selectedIcon: portableCandidate(object.displayIcon.selectedIcon),
+        };
+        return {
+          ...object,
+          displayIcon,
+          iconCandidates: displayIcon.candidates,
+          selectedIcon: displayIcon.selectedIcon,
+        };
       }),
       conflicts: this.listCatalogConflicts({ status: null }),
       icons: { assets: this.listIconAssets().map(({ filePath, ...asset }) => ({ ...asset, contentBase64: fs.readFileSync(filePath).toString("base64") })) },
@@ -2098,17 +2110,46 @@ class AutomationDatabase {
       this.db.prepare(`INSERT INTO catalog_repository_transitions(object_id,from_status,to_status,from_disposition,to_disposition,reason,evidence_revision,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).run(repositoryObjectId, transition.fromStatus, transition.toStatus, transition.fromDisposition, transition.toDisposition, transition.reason, Number(transition.evidenceRevision), transition.createdAt || createdAt);
     }
-    const iconCandidates = exported.iconCandidates || [];
-    if (iconCandidates.filter((candidate) => candidate.selected).length > 1) throw new TypeError(`catalog snapshot has multiple selected icons: ${identity.objectId}`);
-    const iconCandidateIds = new Map();
-    for (const candidate of iconCandidates) {
-      const insertedCandidate = this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,similarity_json,rank_score,selection_origin,selected,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, candidate.assetHash, candidate.cacheKey, candidate.sourceType, candidate.resourceUrl, candidate.runtimeIdentifier, candidate.textureUuid, canonicalJson(candidate.crop || {}), canonicalJson(candidate.similarity || {}), Number(candidate.rankScore ?? 1), candidate.selectionOrigin || null, candidate.selected ? 1 : 0, candidate.createdAt || createdAt);
-      iconCandidateIds.set(Number(candidate.id), Number(insertedCandidate.lastInsertRowid));
-    }
-    for (const history of exported.iconSelectionHistory || []) {
-      this.db.prepare(`INSERT INTO catalog_icon_selection_history(object_id,candidate_id,previous_candidate_id,action,actor,note,object_revision,created_at)
-        VALUES(?,?,?,?,?,?,?,?)`).run(repositoryObjectId, iconCandidateIds.get(Number(history.candidateId)) ?? null, iconCandidateIds.get(Number(history.previousCandidateId)) ?? null, history.action, history.actor, history.note, Number(history.objectRevision), history.createdAt || createdAt);
+    if (identity.objectType === "item-identity") {
+      const iconCandidates = exported.displayIcon?.candidates || exported.iconCandidates || [];
+      if (iconCandidates.filter((candidate) => candidate.selected).length > 1) throw new TypeError(`catalog snapshot has multiple selected icons: ${identity.objectId}`);
+      const iconCandidateIds = new Map();
+      for (const candidate of iconCandidates) {
+        const insertedCandidate = this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,similarity_json,rank_score,selection_origin,selected,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, candidate.assetHash, candidate.cacheKey, candidate.sourceType, candidate.resourceUrl, candidate.runtimeIdentifier, candidate.textureUuid, canonicalJson(candidate.crop || {}), canonicalJson(candidate.similarity || {}), Number(candidate.rankScore ?? 1), candidate.selectionOrigin || null, candidate.selected ? 1 : 0, candidate.createdAt || createdAt);
+        iconCandidateIds.set(Number(candidate.id), Number(insertedCandidate.lastInsertRowid));
+      }
+      const selectedIcon = exported.displayIcon?.selectedIcon || exported.selectedIcon
+        || iconCandidates.find((candidate) => candidate.selected)
+        || null;
+      const selectedCandidateId = selectedIcon
+        ? iconCandidateIds.get(Number(selectedIcon.id)) ?? null
+        : null;
+      this.db.prepare(`INSERT INTO catalog_icon_decisions(
+        object_id,selected_candidate_id,revision,selection_origin,updated_at
+      ) VALUES(?,?,?,?,?)`).run(
+        repositoryObjectId,
+        selectedCandidateId,
+        Number(exported.displayIcon?.revision || (selectedCandidateId == null ? 1 : 2)),
+        selectedIcon?.selectionOrigin || null,
+        updatedAt,
+      );
+      for (const history of exported.displayIcon?.history || exported.iconSelectionHistory || []) {
+        this.db.prepare(`INSERT INTO catalog_icon_selection_history(
+          object_id,candidate_id,previous_candidate_id,action,actor,note,
+          object_revision,decision_revision,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
+          repositoryObjectId,
+          iconCandidateIds.get(Number(history.candidateId)) ?? null,
+          iconCandidateIds.get(Number(history.previousCandidateId)) ?? null,
+          history.action,
+          history.actor,
+          history.note,
+          Number(history.objectRevision),
+          Number(history.revision || 1),
+          history.createdAt || createdAt,
+        );
+      }
     }
   }
 

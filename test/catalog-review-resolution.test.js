@@ -229,11 +229,24 @@ test("修改后确认保存完整 Item Identity 和稳定审计说明且不确�
     name: "加固园艺手套",
     level: 3,
     type: null,
+  };
+  const snapshotWithPresentation = {
+    ...snapshot,
     displayIcon: {
       candidateId: 17,
       assetHash: "sha256:item-icon",
     },
   };
+
+  assert.throws(() => database.completeCatalogReview({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    decision: "modify",
+    snapshot: snapshotWithPresentation,
+    actor: "本地操作者",
+    requestId: "modified-identity-review-with-presentation",
+    expectedRevision: identity.revision,
+  }), (error) => error.code === "CATALOG_SNAPSHOT_VALIDATION" && error.fieldPath === "displayIcon");
 
   const completed = database.completeCatalogReview({
     objectType: identity.objectType,
@@ -252,7 +265,6 @@ test("修改后确认保存完整 Item Identity 和稳定审计说明且不确�
   assert.equal(completed.reviewResolution.optionalNote, "系统生成：修改后确认完整候选快照");
   assert.equal(completed.catalogAuditSummary.optionalNote, "系统生成：修改后确认完整候选快照");
   assert.deepEqual(completed.catalogAuditSummary.meaningfulDifferences, [
-    { fieldPath: "displayIcon", oldValue: null, newValue: snapshot.displayIcon },
     { fieldPath: "level", oldValue: 2, newValue: 3 },
     { fieldPath: "name", oldValue: "园艺手套", newValue: "加固园艺手套" },
   ]);
@@ -264,6 +276,47 @@ test("修改后确认保存完整 Item Identity 和稳定审计说明且不确�
     objectType: "merge-relation",
     objectId: identity.objectId,
   }).length, 0);
+}));
+
+test("旧展示图标裁决只保留原始历史且不进入语义投影或审核原因", () => withDatabase((database) => {
+  const identity = provisionalIdentity(database, "legacy-display-icon-ruling");
+  const objectRow = database.db.prepare(
+    "SELECT * FROM catalog_repository_objects WHERE object_type='item-identity' AND object_id=?",
+  ).get(identity.objectId);
+  database.db.prepare(`INSERT INTO catalog_repository_rulings(
+    object_id,field_path,decision,value_json,actor,note,
+    old_value_json,new_value_json,object_revision,created_at
+  ) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(
+    objectRow.id,
+    "displayIcon",
+    "modify",
+    JSON.stringify({ candidateId: 17 }),
+    "旧版本操作者",
+    "旧展示偏好",
+    "null",
+    JSON.stringify({ candidateId: 17 }),
+    objectRow.revision,
+    "2026-07-24T07:00:00.000Z",
+  );
+
+  const projected = database.getCatalogObject(identity.objectType, identity.objectId);
+  assert.equal(Object.hasOwn(projected.humanValues, "displayIcon"), false);
+  assert.equal(Object.hasOwn(projected.effectiveValue, "displayIcon"), false);
+  assert.equal(projected.reviewReasons.some((reason) => reason.fieldPath === "displayIcon"), false);
+  assert.equal(projected.rulingHistory.some((ruling) => ruling.fieldPath === "displayIcon"), true);
+
+  const revoked = database.adaptLegacyCatalogRuling({
+    objectType: identity.objectType,
+    objectId: identity.objectId,
+    fieldPath: "displayIcon",
+    actor: "迁移操作者",
+    note: "撤销旧展示偏好",
+    requestId: "revoke-legacy-display-icon",
+    expectedRevision: projected.revision,
+  }, { revoke: true });
+  assert.equal(Object.hasOwn(revoked.effectiveValue, "displayIcon"), false);
+  assert.equal(revoked.rulingHistory.at(-1).decision, "revoke");
+  assert.equal(revoked.rulingHistory.at(-1).fieldPath, "displayIcon");
 }));
 
 test("Merge Relation 领域校验定位自环、等级倒退、一物多后继和链条断裂且保持生效快照", () => withDatabase((database) => {

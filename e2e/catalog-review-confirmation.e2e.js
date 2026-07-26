@@ -589,11 +589,11 @@ async function main() {
     }, `item-identity:${draftRecoveryEditable.objectId}`), false);
     assert.equal(await page.getByRole("status").filter({ hasText: "生效快照未改变" }).count(), 0);
     assert.equal(await page.getByRole("button", { name: /确认无误|修改后确认/ }).first().isDisabled(), true);
-    for (const mutationButton of [
-      page.getByRole("button", { name: "暂时跳过" }),
+    assert.equal(await page.getByRole("button", { name: "暂时跳过" }).isDisabled(), true);
+    for (const displayIconButton of [
       page.getByRole("button", { name: "采集真实图标" }),
       page.getByRole("button", { name: "上传替代图标" }),
-    ]) assert.equal(await mutationButton.isDisabled(), true);
+    ]) assert.equal(await displayIconButton.isDisabled(), false);
     await page.getByText("高级诊断与证据处置").click();
     for (const mutationButton of [
       page.getByRole("button", { name: "采用证据" }).first(),
@@ -642,21 +642,17 @@ async function main() {
     assert.equal(modificationRequest.snapshot.name, "新名称");
     assert.equal(modificationRequest.snapshot.level, 3);
     assert.equal(modificationRequest.snapshot.type, "园艺工具");
-    assert.deepEqual(modificationRequest.snapshot.displayIcon, {
-      candidateId: editableIcon.id,
-      assetHash: editableIcon.assetHash,
-    });
+    assert.equal(Object.hasOwn(modificationRequest.snapshot, "displayIcon"), false);
     const modifiedAudit = runtime.database.listCatalogAuditSummaries({ objectId: editable.objectId }).at(-1);
     assert.equal(modifiedAudit.optionalNote, "系统生成：修改后确认完整候选快照");
     assert.deepEqual(modifiedAudit.meaningfulDifferences.map((difference) => difference.fieldPath), [
-      "displayIcon",
       "level",
       "name",
       "type",
     ]);
     assert.equal(
       runtime.database.getCatalogObject("item-identity", editable.objectId).iconSelectionHistory.at(-1).note,
-      "手动选择图标候选",
+      "手动更新展示图标选择",
     );
     const relationAfter = runtime.database.getCatalogObject("merge-relation", editable.objectId);
     assert.equal(relationAfter.revision, relationBefore.revision);
