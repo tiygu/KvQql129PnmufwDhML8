@@ -1357,6 +1357,14 @@ class AutomationDatabase {
         this.db.prepare("UPDATE catalog_repository_evidence SET disposition=? WHERE id=?").run(String(disposition), evidence.id);
       }
       this.db.prepare("UPDATE catalog_repository_objects SET revision=revision+1,updated_at=? WHERE id=?").run(now, before.id);
+      if (evidence.disposition !== disposition && identity.objectType === "production-mode"
+        && evidence.source_type === "verified-production-mode") {
+        this._rebuildProductionDistributionFromEvidence(
+          evidencePayload.producerItemId,
+          evidencePayload.modeId,
+          now,
+        );
+      }
       const after = this._catalogObjectRow(identity.objectType, identity.objectId);
       this._recordCatalogTransition(after, { fromStatus: before.status, fromDisposition: before.disposition, reason: `${auditAction}:${evidence.id}:${reason}`, evidenceRevision: after.revision });
       const auditSummary = {
@@ -1879,6 +1887,66 @@ class AutomationDatabase {
       this._recordProductionDistributionReview(state, observedAt);
       return { duplicate: false, uncertain: false, state };
     });
+  }
+
+  _rebuildProductionDistributionFromEvidence(producerItemId, modeId, observedAt) {
+    const producer = String(producerItemId || "");
+    const mode = String(modeId || "");
+    if (!producer || !mode) return null;
+    const row = this.db.prepare("SELECT * FROM production_distribution_states WHERE producer_item_id=? AND mode_id=?").get(producer, mode);
+    if (!row) return null;
+    const previous = parseJson(row.state_json);
+    let state = createDistributionState({
+      producerItemId: producer,
+      modeId: mode,
+      theoreticalDistribution: previous.theoreticalDistribution,
+      priorStrength: previous.posteriorDistribution?.priorStrength,
+      unseenAlpha: previous.posteriorDistribution?.unseen?.alpha,
+    });
+    state.theoreticalHistory = structuredClone(previous.theoreticalHistory || [previous.theoreticalDistribution]);
+
+    const actionReferencePrefix = "verified-production-mode-action:";
+    const legacySourceRef = `verified-production-mode:${producer}:${mode}`;
+    const excludedActionIds = new Set();
+    const excludedLegacyOutcomes = new Set();
+    let excludeAllLegacyActions = false;
+    const object = this._catalogObjectRow("production-mode", `${producer}:${mode}`);
+    const unavailableEvidence = object
+      ? this.db.prepare(`SELECT source_ref,payload_json FROM catalog_repository_evidence
+        WHERE object_id=? AND source_type='verified-production-mode' AND disposition!='eligible'`).all(object.id)
+      : [];
+    for (const evidence of unavailableEvidence) {
+      const sourceRef = String(evidence.source_ref || "");
+      if (sourceRef.startsWith(actionReferencePrefix)) {
+        excludedActionIds.add(sourceRef.slice(actionReferencePrefix.length));
+        continue;
+      }
+      if (sourceRef !== legacySourceRef) continue;
+      const outcomeKey = (parseJson(evidence.payload_json)?.outputs || [])
+        .map((output) => String(output?.itemId || ""))
+        .filter(Boolean)
+        .sort()
+        .join("\u0000");
+      if (outcomeKey) excludedLegacyOutcomes.add(outcomeKey);
+      else excludeAllLegacyActions = true;
+    }
+
+    const actions = this.db.prepare(`SELECT action_id,outcome_json FROM production_action_observations
+      WHERE attributable=1 AND producer_item_id=? AND mode_id=? ORDER BY id`).all(producer, mode);
+    for (const action of actions) {
+      const outcomeItemIds = parseJson(action.outcome_json);
+      const outcomeKey = [...new Set(outcomeItemIds.map(String).filter(Boolean))].sort().join("\u0000");
+      if (excludedActionIds.has(action.action_id) || excludeAllLegacyActions || excludedLegacyOutcomes.has(outcomeKey)) continue;
+      state = updateDistributionState(state, {
+        actionId: action.action_id,
+        outcomeItemIds,
+        attributable: true,
+      });
+    }
+    this.db.prepare("UPDATE production_distribution_states SET state_json=?,revision=revision+1,updated_at=? WHERE producer_item_id=? AND mode_id=?")
+      .run(JSON.stringify(state), observedAt, producer, mode);
+    this._recordProductionDistributionReview(state, observedAt);
+    return state;
   }
 
   _recordProductionDistributionReview(state, observedAt) {

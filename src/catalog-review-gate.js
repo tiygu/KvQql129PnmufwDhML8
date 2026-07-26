@@ -87,7 +87,14 @@ class CatalogReviewGate {
   }
 
   _structuredEvidence(evidence) {
-    return [...evidence].reverse().find((item) => STRUCTURED_SOURCES.has(item.sourceType) || (item.sourceType === VERIFIED_MODE_SOURCE && Number(item.observationCount) >= 2)) || null;
+    const verifiedCounts = new Map();
+    for (const item of evidence) {
+      if (item.sourceType !== VERIFIED_MODE_SOURCE) continue;
+      verifiedCounts.set(item.fingerprint, (verifiedCounts.get(item.fingerprint) || 0) + Number(item.observationCount));
+    }
+    return [...evidence].reverse().find((item) =>
+      STRUCTURED_SOURCES.has(item.sourceType)
+      || item.sourceType === VERIFIED_MODE_SOURCE && verifiedCounts.get(item.fingerprint) >= 2) || null;
   }
 
   _provisionalEvidence(evidence) {

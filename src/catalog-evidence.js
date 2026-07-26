@@ -147,6 +147,9 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
     actionDiff?.outputItemId,
     actionDiff?.actualOutputItemId,
   ]);
+  const productionActionId = actionDiff?.type === "produce" && actionDiff.verified === true
+    ? String(actionDiff.actionId || `production:${crypto.randomUUID()}`)
+    : null;
   if (actionDiff?.type === "produce" && actionDiff.verified === true) {
     for (const outputItemId of actionOutputItemIds) addObservedItem(outputItemId, {}, "action-diff:production-output");
   }
@@ -162,7 +165,7 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
         modeIds: actionDiff.productionModeId == null ? [] : [actionDiff.productionModeId],
       }),
       sourceType: "verified-production-profile",
-      sourceRef: `verified-production:${actionDiff.actionId || "runtime"}`,
+      sourceRef: `verified-production:${productionActionId}`,
       countDuplicate: false,
     });
   }
@@ -178,9 +181,11 @@ function collectPassiveCatalogEvidence(database, { state = null, actionDiff = nu
         ...(existing?.effectiveValue || existing?.algorithmCandidate || {}), producerItemId, modeId,
         outputs: [...counts].map(([itemId, count]) => ({ itemId, count, probability: 1 })),
       },
-      sourceType: "verified-production-mode", sourceRef: `verified-production-mode:${producerItemId}:${modeId}`,
+      sourceType: "verified-production-mode",
+      sourceRef: `verified-production-mode-action:${productionActionId}`,
+      countDuplicate: false,
     });
-    recordProductionObservation({ actionId: actionDiff.actionId, producerItemId, modeId, outcomeItemIds: actionOutputItemIds, attributable: true });
+    recordProductionObservation({ actionId: productionActionId, producerItemId, modeId, outcomeItemIds: actionOutputItemIds, attributable: true });
   }
   if (actionDiff?.type === "produce" && actionDiff.verified === true && actionDiff.producerItemId != null
     && actionDiff.attributionConflict) {

@@ -13,6 +13,7 @@ const {
 } = require("../src/production-distributions");
 const { AutomationDatabase } = require("../src/automation-database");
 const { productionModeRuntimeHelpersPrelude } = require("../src/production-mode-runtime");
+const { collectPassiveCatalogEvidence } = require("../src/catalog-evidence");
 
 const theory = {
   configVersion: "cfg-17",
@@ -181,6 +182,131 @@ test("database stores uncertain actions separately and emits review events for s
   assert.equal(reopened.getProductionDistribution("tree", "fruit").observedDistribution.sampleSize, 12);
   assert.equal(reopened.listUncertainProductionActions()[0].reason, "verification_read_error");
   reopened.close();
+});
+
+test("rejecting verified production evidence removes its samples from the planning distribution", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "production-rejected-evidence-"));
+  const database = new AutomationDatabase(path.join(dir, "automation.db"));
+  try {
+    database.upsertTheoreticalProductionDistribution({
+      producerItemId: "tree",
+      modeId: "fruit",
+      theoreticalDistribution: {
+        configVersion: "fixture-1",
+        extractionSource: "fixture",
+        outcomes: [{ itemId: "pear", weight: 1 }],
+      },
+    });
+    collectPassiveCatalogEvidence(database, {
+      actionDiff: {
+        type: "produce",
+        verified: true,
+        attributable: true,
+        actionId: "verified-action-1",
+        producerItemId: "tree",
+        productionModeId: "fruit",
+        actualOutputItemIds: ["pear"],
+      },
+    });
+    const before = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" });
+    const mode = database.getCatalogObject("production-mode", "tree:fruit");
+    const evidence = mode.evidence.find((entry) => entry.sourceType === "verified-production-mode");
+
+    const rejected = database.setCatalogEvidenceDisposition(
+      "production-mode",
+      "tree:fruit",
+      evidence.id,
+      "rejected",
+      {
+        reason: "operator: verified sample is unreliable",
+        expectedRevision: mode.revision,
+      },
+    );
+
+    const after = database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" });
+    assert.equal(before.planningDistribution.sampleSize, 1);
+    assert.equal(after.planningDistribution.sampleSize, 0);
+    assert.equal(database.db.prepare("SELECT COUNT(*) AS count FROM production_action_observations").get().count, 1);
+    assert.equal(database.getCatalogObject("production-mode", "tree:fruit").evidence.find((entry) => entry.id === evidence.id).disposition, "rejected");
+
+    database.setCatalogEvidenceDisposition(
+      "production-mode",
+      "tree:fruit",
+      evidence.id,
+      "eligible",
+      {
+        reason: "operator: verified sample restored",
+        expectedRevision: rejected.revision,
+      },
+    );
+    assert.equal(database.getProductionDistribution("tree", "fruit", { executionMode: "automatic" }).planningDistribution.sampleSize, 1);
+  } finally {
+    database.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("evidence disposition rebuilds only the linked production action sample", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "production-linked-evidence-"));
+  const database = new AutomationDatabase(path.join(dir, "automation.db"));
+  try {
+    database.upsertTheoreticalProductionDistribution({
+      producerItemId: "tree",
+      modeId: "fruit",
+      theoreticalDistribution: {
+        configVersion: "fixture-1",
+        extractionSource: "fixture",
+        outcomes: [{ itemId: "pear", weight: 1 }],
+      },
+    });
+    for (const actionId of ["verified-action-1", "verified-action-2"]) {
+      collectPassiveCatalogEvidence(database, {
+        actionDiff: {
+          type: "produce",
+          verified: true,
+          attributable: true,
+          actionId,
+          producerItemId: "tree",
+          productionModeId: "fruit",
+          actualOutputItemIds: ["pear"],
+        },
+      });
+    }
+    const mode = database.getCatalogObject("production-mode", "tree:fruit");
+    const evidence = mode.evidence.find((entry) =>
+      entry.sourceRef === "verified-production-mode-action:verified-action-1");
+    assert.equal(mode.evidence.filter((entry) => entry.sourceType === "verified-production-mode").length, 2);
+    assert.equal(database.getProductionDistribution("tree", "fruit").observedDistribution.sampleSize, 2);
+
+    const rejected = database.setCatalogEvidenceDisposition(
+      "production-mode",
+      "tree:fruit",
+      evidence.id,
+      "rejected",
+      {
+        reason: "operator: first sample is unreliable",
+        expectedRevision: mode.revision,
+      },
+    );
+
+    assert.equal(database.getProductionDistribution("tree", "fruit").observedDistribution.sampleSize, 1);
+    assert.equal(database.db.prepare("SELECT COUNT(*) AS count FROM production_action_observations").get().count, 2);
+
+    database.setCatalogEvidenceDisposition(
+      "production-mode",
+      "tree:fruit",
+      evidence.id,
+      "eligible",
+      {
+        reason: "operator: first sample restored",
+        expectedRevision: rejected.revision,
+      },
+    );
+    assert.equal(database.getProductionDistribution("tree", "fruit").observedDistribution.sampleSize, 2);
+  } finally {
+    database.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("attributable outcomes survive before theory extraction and are replayed into the mode posterior", () => {
