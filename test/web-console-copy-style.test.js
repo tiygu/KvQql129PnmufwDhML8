@@ -59,7 +59,7 @@ test("图鉴审核列表只在真正选中后加载详情，并支持同一项�
   assert.match(source, /loadingDetail/);
   assert.match(source, /loadError/);
   assert.match(source, /正在加载审核对象/);
-  assert.match(source, />重试</);
+  assert.match(source, />\s*重试\s*</);
   assert.match(source, /selectedKey\s*===\s*key[\s\S]*loadDetail\(entry\)/);
 });
 
@@ -70,8 +70,8 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(api, /completeCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/complete",\s*input\)/);
   assert.match(api, /setCatalogEvidenceDisposition:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/evidence\/disposition",\s*input\)/);
   assert.match(source, /完整对象 JSON/);
-  assert.match(source, />确认无误</);
-  assert.match(source, />修改后确认</);
+  assert.match(source, />\s*确认无误\s*</);
+  assert.match(source, />\s*修改后确认\s*</);
   assert.match(source, /补充说明（选填）/);
   assert.match(source, /snapshot,\s*actor/);
   assert.match(source, /requestId:\s*completionRequest\.current\.requestId/);
@@ -85,7 +85,7 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, /committedReview\.reviewStatus\s*===\s*"needs-review"\s*\|\|\s*!planningRecovered/);
   assert.match(source, /const\s+nextReviewKey\s*=[\s\S]{0,500}\?[\s\S]{0,300}:\s*null/);
   assert.match(source, /setSelectedKey\(nextReviewKey\)/);
-  assert.match(source, />暂时跳过</);
+  assert.match(source, />\s*暂时跳过\s*</);
   const skipReview = source.slice(source.indexOf("const skipCurrentReview"), source.indexOf("const completeReview"));
   assert.match(api, /skipCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/skip",\s*input\)/);
   assert.match(skipReview, /controlApi\.skipCatalogReview/);
@@ -135,7 +135,7 @@ test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验�
   assert.match(source, /planningImpact/);
   assert.match(source, /fieldPath/);
   assert.match(source, /保留当前 JSON 草稿/);
-  assert.match(source, /completeReview\("modify",\s*advancedJsonPreview\.snapshot\)/);
+  assert.match(source, /completeReview\(\s*"modify",\s*advancedJsonPreview\.snapshot,\s*\)/);
 });
 
 test("本地审核草稿跨刷新必须明确恢复或放弃，revision 冲突保留草稿并展示最新差异", () => {
@@ -194,7 +194,7 @@ test("图鉴差异使用冲突证据候选，产出档案只展示所属产出�
 test("产出档位分开显示三类分布、样本稳定性且普通路径没有概率输入", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   const modePanel = source.slice(
-    source.indexOf('detail.objectType === "production-mode" && <section'),
+    source.indexOf('detail.objectType === "production-mode"'),
     source.indexOf('<div className="candidate-snapshot">'),
   );
 
@@ -297,5 +297,5 @@ test("图鉴发布回退隐藏普通完整快照入口但保留旧高级诊断�
   assert.match(source, /ordinaryReviewEnabled\s*=\s*repository\?\.releaseControl\?\.entryMode\s*!==\s*"legacy-advanced"/);
   assert.match(source, /普通完整快照入口已由发布开关隐藏/);
   assert.match(source, /已提交领域事实保持生效/);
-  assert.match(source, /advanced-review-actions" open=\{!ordinaryReviewEnabled\}/);
+  assert.match(source, /advanced-review-actions"\s+open=\{!ordinaryReviewEnabled\}/);
 });
