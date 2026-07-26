@@ -1948,21 +1948,35 @@ class CdpRuntimeControlAdapter {
         };
       }
       if (!["rejected-precondition", "unsupported-capability"].includes(acknowledgement.outcome)) {
-        // Submission was dispatched. Use targeted verification — no fixed settle delay.
+        // Submission was dispatched. Poll the narrow order slot until the
+        // asynchronous replacement is observable or the settle budget expires.
         const preCoins = Number(acknowledgement.delta?.preCoins ?? 0);
         const preTaskId = acknowledgement.delta?.order?.previousTaskId ?? null;
+        const requestedPollMs = Number(request.options?.delayMs);
+        const pollMs = Math.max(1, Math.min(250, requestedPollMs > 0 ? requestedPollMs : 100));
+        const requestedBudgetMs = Number(request.options?.settleMs);
+        const budgetMs = Math.max(pollMs, Math.min(10_000, requestedBudgetMs > 0 ? requestedBudgetMs : 1_000));
+        const startedAt = Date.now();
+        const slotExpr = `globalThis.miniGameCtl.readOrderSlot(${JSON.stringify(slot)})`;
         let targetedSlot = null;
         let slotReadError = null;
-        try {
-          const slotExpr = `globalThis.miniGameCtl.readOrderSlot(${JSON.stringify(slot)})`;
-          targetedSlot = await this._evaluate(slotExpr, signal, "targeted");
-        } catch (error) {
-          if (error?.name === "AbortError") throw error;
-          slotReadError = error?.message || String(error);
-        }
-        const orderReplaced = !targetedSlot?.ok
-          || !targetedSlot?.occupied
-          || (targetedSlot.taskId != null && String(targetedSlot.taskId) !== String(preTaskId));
+        let orderReplaced = false;
+        do {
+          assertNotAborted(signal);
+          try {
+            targetedSlot = await this._evaluate(slotExpr, signal, "targeted");
+            slotReadError = null;
+          } catch (error) {
+            if (error?.name === "AbortError") throw error;
+            targetedSlot = null;
+            slotReadError = error?.message || String(error);
+          }
+          orderReplaced = targetedSlot?.ok === true
+            && (!targetedSlot.occupied
+              || (targetedSlot.taskId != null && String(targetedSlot.taskId) !== String(preTaskId)));
+          if (orderReplaced || Date.now() - startedAt >= budgetMs) break;
+          await waitForAbortable(new Promise((resolve) => setTimeout(resolve, pollMs)), signal);
+        } while (Date.now() - startedAt < budgetMs);
         const coinsChanged = targetedSlot?.ok
           && Number.isFinite(targetedSlot.coins)
           && Number(targetedSlot.coins) > preCoins;
@@ -2026,6 +2040,7 @@ class CdpRuntimeControlAdapter {
           acknowledgement: cloneRecord(acknowledgement),
           targetedVerification: cloneRecord(targetedSlot),
           before: command.before ?? null,
+          timing: { stage: "order-replacement", elapsedMs: Date.now() - startedAt, budgetMs },
         };
       }
       // Rejected or unsupported

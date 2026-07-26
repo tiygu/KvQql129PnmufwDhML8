@@ -191,6 +191,18 @@ class OrderCoinLoop {
         const submitted = await this.submitOrder(this.targetSlot, { signal, before: state });
         actions.push({ step: actions.length + 1, type: "submit-order", slot: this.targetSlot, ok: submitted.ok, reason: submitted.reason, before: submitted.before, after: submitted.after, coinsBefore: submitted.coinsBefore, coinsAfter: submitted.coinsAfter });
         this.onEvent?.(actions.at(-1));
+        if (!submitted.ok && submitted.pauseRequested) {
+          await this.onActionTimeout?.({
+            reason: submitted.reason || "order_submission_confirmation_timeout",
+            timing: submitted.timing || null,
+            submission: submitted,
+          });
+          await this.waitIfPaused?.(signal);
+          if (signal?.aborted) return { ok: false, executed: true, reason: "aborted", targetSlot: this.targetSlot, actions, submission: submitted };
+          nextState = null;
+          step -= 1;
+          continue;
+        }
         return { ok: submitted.ok, executed: true, reason: submitted.reason, targetSlot: this.targetSlot, actions, submission: submitted };
       }
       const plannedAction = target.nextAction || null;

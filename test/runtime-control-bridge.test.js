@@ -825,6 +825,50 @@ test("CDP Adapter reports order-replaced-but-coins-not-observed when coins uncha
   assert.equal(result.actions[0].coinsAfter, 50);
 });
 
+test("CDP Adapter waits for an asynchronously replaced order slot after dispatch", async () => {
+  const fixture = orderSubmissionRuntimeFixture();
+  installOrderSubmissionBridge(fixture, "7");
+
+  let slotReads = 0;
+  const adapter = new CdpRuntimeControlAdapter({
+    client: {
+      evaluate: async (expression) => {
+        const result = vm.runInContext(expression, fixture.sandbox);
+        if (expression.startsWith("globalThis.miniGameCtl.readOrderSlot(")) {
+          slotReads += 1;
+          if (slotReads === 1) {
+            const newTask = {
+              taskId: 202,
+              itemInfos: [{ itemId: "item-3", isComplete: false, status: 0 }],
+            };
+            fixture.taskView._taskItemDataMap.set("order-1", { task: newTask });
+            fixture.resourceMap.set(1, 60);
+          }
+        }
+        return result;
+      },
+    },
+    contextId: 7,
+    legacy: {
+      ready: async () => ({ adapterId: "legacy-cdp" }),
+      readState: async () => normalizedBaseline(),
+      execute: async () => ({ ok: true }),
+    },
+  });
+
+  await adapter.ready();
+  const result = await adapter.execute(
+    { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+    { options: { delayMs: 1, settleMs: 20 } },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "order-submitted-and-coins-received");
+  assert.equal(result.actions[0].orderReplaced, true);
+  assert.equal(result.actions[0].coinsChanged, true);
+  assert.equal(slotReads, 2);
+});
+
 test("CDP Adapter pauses with uncertainty when order slot is not yet replaced after dispatch", async () => {
   const fixture = orderSubmissionRuntimeFixture();
   installOrderSubmissionBridge(fixture, "7");
@@ -845,6 +889,7 @@ test("CDP Adapter pauses with uncertainty when order slot is not yet replaced af
   await adapter.ready();
   const result = await adapter.execute(
     { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
+    { options: { delayMs: 1, settleMs: 2 } },
   );
 
   assert.equal(result.ok, false);

@@ -105,6 +105,62 @@ test("订单金币循环在每个棋盘动作后重规划并在订单满足后�
   assert.equal(result.actions.at(-1).type, "submit-order");
 });
 
+test("订单提交等待替换时暂停并在恢复后重新同步而不是结束循环", async () => {
+  const readyState = {
+    resources: { energy: 10 },
+    board: { empty: 3, mergeCandidates: [] },
+    orders: [{ slot: "a", ready: true }],
+  };
+  const replacedState = {
+    resources: { energy: 10 },
+    board: { empty: 3, mergeCandidates: [] },
+    orders: [],
+  };
+  let submissions = 0;
+  let paused = false;
+  let recoveryWaits = 0;
+  let collections = 0;
+  const loop = new OrderCoinLoop({
+    collectState: async () => {
+      collections += 1;
+      return replacedState;
+    },
+    planOrders: async (state) => state.orders.length
+      ? {
+          plans: [{ slot: "a", ready: true, feasible: true, actionable: true }],
+          recommended: { slot: "a", ready: true, feasible: true, actionable: true },
+        }
+      : { plans: [], recommended: null, boundaryReason: "no-feasible-order" },
+    runBoardAction: async () => ({ ok: true }),
+    submitOrder: async () => {
+      submissions += 1;
+      return {
+        ok: false,
+        executed: true,
+        reason: "order-submission-awaiting-replacement",
+        pauseRequested: true,
+      };
+    },
+    onActionTimeout: async () => {
+      paused = true;
+    },
+    waitIfPaused: async () => {
+      if (paused) {
+        recoveryWaits += 1;
+        paused = false;
+      }
+    },
+  });
+
+  const result = await loop.run({ execute: true, initialState: readyState });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "waiting-no-feasible-order");
+  assert.equal(submissions, 1);
+  assert.equal(recoveryWaits, 1);
+  assert.equal(collections, 1);
+});
+
 test("没有可先合成组合且体力到阈值时停在等待边界", async () => {
   let actions = 0;
   const loop = new OrderCoinLoop({
