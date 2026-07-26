@@ -35,6 +35,17 @@ This workspace snapshot has no Git history, so no established commit convention 
 
 The reliable connection order is: start the debug CDP route, then open the game. Do not commit local databases, logs, captures containing private state, or packaged binaries unless a release specifically requires them.
 
+## WSL Development Completion Rule
+
+This rule applies only when working in the WSL checkout at `/home/tiygu/mini-game-adapter-lab` and only to this repository and its descendants. After every completed development task, before reporting completion:
+
+1. Run the relevant validation and review the task diff.
+2. Synchronize only the files changed by the current task, including deletions, to the Windows checkout at `/mnt/d/Desktop/Projects/mini-game-adapter-lab/`. Preserve the Windows checkout's `.git`, dependencies, generated/local-only files, databases, logs, captures containing private state, and packaged binaries unless the task explicitly changes them.
+3. Commit only the current task's changes with a concise Conventional Commit subject and push the current branch to `origin`. Do not include unrelated pre-existing workspace changes.
+4. Verify both the Windows synchronization and the remote push. If either step fails, report the exact failure and leave the verified local work intact rather than claiming completion.
+
+Do not apply this workflow from another checkout, outside WSL, or to any other repository.
+
 ## Agent skills
 
 ### Issue tracker
