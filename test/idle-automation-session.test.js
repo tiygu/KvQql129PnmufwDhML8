@@ -63,6 +63,24 @@ test("idle session sleeps once, reconnects, reads fresh state, and replans befor
   assert.equal(runs, 1);
 });
 
+test("the first connection retry keeps automatic startup responsive", async () => {
+  const clock = new FakeClock();
+  let attempts = 0;
+  const session = new IdleAutomationSession({
+    clock,
+    ensureConnection: async () => { attempts += 1; if (attempts === 1) throw new Error("connect ECONNREFUSED 127.0.0.1:62000"); },
+    collectState: async () => state(5),
+    planState: async () => ({ recommended: { estimatedEnergy: 1 } }),
+    runBoundedSession: async () => ({ ok: false, reason: "done" }),
+  });
+  const running = session.run();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(clock.pending[0].ms, 5_000);
+  clock.advanceOne();
+  assert.equal((await running).reason, "done");
+  assert.equal(attempts, 2);
+});
+
 test("disconnects use bounded low-frequency backoff and always re-read after recovery", async () => {
   const clock = new FakeClock();
   let attempts = 0, reads = 0;
@@ -119,7 +137,7 @@ test("connection failure results back off while planning errors terminate", asyn
   });
   const running = session.run();
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(clock.pending[0].ms, 30_000);
+  assert.equal(clock.pending[0].ms, 5_000);
   clock.advanceOne();
   assert.equal((await running).reason, "done");
 
@@ -139,7 +157,7 @@ test("node transport error codes enter connection backoff", async () => {
   });
   const running = session.run({ signal: controller.signal });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(clock.pending[0].ms, 30_000);
+  assert.equal(clock.pending[0].ms, 5_000);
   controller.abort();
   session.interruptWait("stop");
   assert.equal((await running).reason, "aborted");

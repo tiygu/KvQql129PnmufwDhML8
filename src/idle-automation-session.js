@@ -2,7 +2,7 @@
 
 const { setTimeout: delay } = require("node:timers/promises");
 
-const DEFAULT_CONNECTION_BACKOFF_MS = 30_000;
+const DEFAULT_CONNECTION_BACKOFF_MS = 5_000;
 const MAX_CONNECTION_BACKOFF_MS = 5 * 60_000;
 const DEFAULT_RECOVERY_POLL_MS = 60_000;
 
