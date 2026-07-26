@@ -217,6 +217,7 @@ class AutomationDatabase {
       db: this.db,
       transaction: (work) => this.transaction(work),
       objectResult: (row) => this._catalogObjectResult(row),
+      resolveAssetPath: (hash, storedFilePath) => this._resolveIconAssetPath(hash, storedFilePath),
     });
   }
 
@@ -1783,12 +1784,35 @@ class AutomationDatabase {
   }
 
   listIconAssets() {
-    return this.db.prepare("SELECT * FROM catalog_icon_assets ORDER BY hash").all().map((row) => ({ hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at }));
+    return this.db.prepare("SELECT * FROM catalog_icon_assets ORDER BY hash").all().map((row) => this._iconAsset(row));
   }
 
   getIconAsset(hash) {
     const row = this.db.prepare("SELECT * FROM catalog_icon_assets WHERE hash=?").get(String(hash));
-    return row ? { hash: row.hash, mimeType: row.mime_type, width: Number(row.width), height: Number(row.height), byteSize: Number(row.byte_size), filePath: row.file_path, createdAt: row.created_at } : null;
+    return this._iconAsset(row);
+  }
+
+  _iconAsset(row) {
+    return row ? {
+      hash: row.hash,
+      mimeType: row.mime_type,
+      width: Number(row.width),
+      height: Number(row.height),
+      byteSize: Number(row.byte_size),
+      filePath: this._resolveIconAssetPath(row.hash, row.file_path),
+      createdAt: row.created_at,
+    } : null;
+  }
+
+  _resolveIconAssetPath(hash, storedFilePath) {
+    if (storedFilePath && fs.existsSync(storedFilePath)) return storedFilePath;
+    const cachePath = path.join(
+      path.dirname(this.filePath),
+      "icon-cache",
+      String(hash).slice(0, 2),
+      `${hash}.png`,
+    );
+    return fs.existsSync(cachePath) ? cachePath : storedFilePath;
   }
 
   getSelectedIconHashes() {

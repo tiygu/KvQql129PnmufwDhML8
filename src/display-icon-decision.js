@@ -8,10 +8,11 @@ function parseJson(value) {
 }
 
 class DisplayIconDecision {
-  constructor({ db, transaction, objectResult }) {
+  constructor({ db, transaction, objectResult, resolveAssetPath = (_hash, filePath) => filePath }) {
     this.db = db;
     this.transaction = transaction;
     this.objectResult = objectResult;
+    this.resolveAssetPath = resolveAssetPath;
   }
 
   _candidate(row) {
@@ -33,7 +34,7 @@ class DisplayIconDecision {
       width: Number(row.width),
       height: Number(row.height),
       byteSize: Number(row.byte_size),
-      filePath: row.file_path,
+      filePath: this.resolveAssetPath(row.asset_hash, row.file_path),
       createdAt: row.created_at,
     } : null;
   }
