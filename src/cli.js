@@ -56,7 +56,7 @@ Usage:
   node src/cli.js catalog-import [--catalog captures/item-catalog.json] [--db data/automation.db]
   node src/cli.js catalog-export [--db data/automation.db] [--out catalog-repository.json]
   node src/cli.js plan [--db data/automation.db] [--json true] [--out plan.json]
-  node src/cli.js eval --context ID --expression "1 + 1" [--url URL]
+  node src/cli.js eval --context ID --expression "1 + 1" [--expression-file FILE] [--url URL]
   node src/cli.js watch [--url URL]
   node src/cli.js scaffold --name game-id --engine cocos
 `);
@@ -83,6 +83,12 @@ async function withLab(args, action) {
   } finally {
     await lab.close();
   }
+}
+
+async function resolveEvalExpression(args) {
+  return args["expression-file"]
+    ? fs.readFile(path.resolve(String(args["expression-file"])), "utf8")
+    : args.expression;
 }
 
 async function main() {
@@ -121,9 +127,10 @@ async function main() {
 
   await withLab(args, async (lab) => {
     if (command === "eval") {
-      if (!args.context || !args.expression) throw new Error("eval requires --context and --expression");
+      const expression = await resolveEvalExpression(args);
+      if (!args.context || !expression) throw new Error("eval requires --context and --expression or --expression-file");
       await lab.client.connect();
-      const value = await lab.client.evaluate(args.expression, Number(args.context));
+      const value = await lab.client.evaluate(expression, Number(args.context));
       console.log(util.inspect(value, { depth: 8, colors: true }));
       return;
     }
@@ -381,7 +388,11 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  console.error(`[adapter-lab] ${error.stack || error.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`[adapter-lab] ${error.stack || error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { parseArgs, resolveEvalExpression };
