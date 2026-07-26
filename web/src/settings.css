@@ -1,0 +1,30 @@
+.ghost-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer}
+.ghost-btn:disabled{opacity:.5;cursor:not-allowed}
+.step-btn{height:41px;padding:0 13px}
+.modal-backdrop{position:fixed;inset:0;z-index:50;background:rgba(14,38,30,.42);backdrop-filter:blur(5px);display:grid;place-items:center;padding:24px}
+.settings-modal{width:min(470px,100%);background:#fff;border:1px solid #dfe8df;border-radius:22px;padding:24px;box-shadow:0 28px 80px rgba(19,50,39,.24)}
+.modal-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
+.modal-head h2{margin:4px 0 0;font-size:var(--type-xl)}
+.settings-modal>label{display:grid;grid-template-columns:1fr 145px;gap:7px 16px;align-items:center;padding:13px 0;border-top:1px solid #edf1ed;font-size:var(--type-xs);font-weight:600}
+.settings-modal input{height:38px;border:1px solid #dce5dc;border-radius:10px;padding:0 11px;color:#25483c;outline:none}
+.settings-modal select{height:38px;border:1px solid #dce5dc;border-radius:10px;padding:0 9px;color:#25483c;background:#fff;outline:none;font-size:var(--type-xs)}
+.settings-modal input:focus{border-color:#69b77d;box-shadow:0 0 0 3px rgba(105,183,125,.12)}
+.settings-modal small{grid-column:1/-1;color:#8b9a93;font-size:var(--type-micro);font-weight:400}
+.settings-warning{margin-top:12px;padding:12px 14px;background:#fff8e6;border:1px solid #f1dfac;border-radius:11px;color:#886727;font-size:var(--type-micro);line-height:1.65}
+.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
+.modal-actions .run-btn{height:38px}
+.modal-actions .ghost-btn{padding:0 16px}
+.mode-switch{display:flex;background:#edf2ed;border:1px solid #dde6dd;border-radius:11px;padding:3px}.mode-switch button{border:0;background:transparent;color:#7a8e84;border-radius:8px;padding:7px 9px;font-size:var(--type-micro);cursor:pointer}.mode-switch button.active{background:#fff;color:#27724e;box-shadow:0 2px 8px rgba(28,66,51,.1);font-weight:700}.mode-switch button:disabled{opacity:.55}
+.settings-boundary {
+  border: 1px solid #d8e4dc;
+  border-radius: 12px;
+  background: #f5faf6;
+  color: #315548;
+  padding: 12px 14px;
+  font-weight: 700;
+}
+
+.settings-boundary b {
+  color: #9a7650;
+  padding: 0 8px;
+}

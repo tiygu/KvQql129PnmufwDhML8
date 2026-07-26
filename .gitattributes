@@ -1,0 +1,6 @@
+# Keep copied Windows-origin files stable across Windows and WSL.
+README.md text eol=lf
+load-env.cjs text eol=lf
+web/src/settings.css text eol=lf
+wmpf/** text eol=lf
+*.bat text eol=crlf

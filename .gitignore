@@ -2,11 +2,22 @@ node_modules/
 .env
 reports/
 *.log
+
+# Local runtime state and generated captures
+captures/
+data*/
+release*/
+target-*.json
+*.db
+*.db-shm
+*.db-wal
+
+# Local design and agent tooling state
 .scratch/
 .agents/
 .claude/
 .pi-subagents/
 .reasonix/
-[object Object]
-[object Object]-shm
-[object Object]-wal
+design-qa.md
+*.prototype.html
+skills-lock.json
