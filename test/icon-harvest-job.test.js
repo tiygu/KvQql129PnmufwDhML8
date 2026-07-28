@@ -77,6 +77,58 @@ test("single-item Icon Harvest Job persists one child and replays an idempotent 
   }
 });
 
+test("runtime-busy harvest jobs persist a stable queued reason until the safe boundary returns", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "icon-harvest-busy-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  const item = runtime.database.listCatalogObjects({ objectType: "item-identity" })[0];
+  const acquiredPath = path.join(dataDir, "busy-acquired.png");
+  fs.writeFileSync(acquiredPath, "acquired");
+  runtime.iconService.resolveSpriteFrame = async () => ({
+    resourceUrl: "fixture://busy-icon",
+    runtimeIdentifier: "busy-icon",
+    rect: { x: 0, y: 0, width: 1, height: 1 },
+    originalSize: { width: 1, height: 1 },
+    offset: { x: 0, y: 0 },
+    mimeType: "image/png",
+  });
+  runtime.iconService.readResource = async () => ({
+    body: Buffer.from("fixture"),
+    mimeType: "image/png",
+    resolvedUrl: "fixture://busy-icon",
+  });
+  runtime.iconService.processImage = async () => iconAsset(
+    acquiredPath,
+    "e".repeat(64),
+  );
+
+  try {
+    runtime.running = true;
+    const created = runtime.createIconHarvestJob({
+      scope: { type: "item", itemId: item.objectId },
+      idempotencyKey: "runtime-busy-single-item-job",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const queued = runtime.getIconHarvestJob(created.jobId);
+    assert.equal(queued.state, "queued");
+    assert.equal(queued.stage, "waiting-for-runtime-slot");
+    assert.equal(queued.reason, "automation-runtime-busy");
+    assert.equal(queued.children[0].retryable, true);
+
+    runtime.running = false;
+    runtime.iconService.notifySafeBoundary();
+    await runtime.iconService.waitForIdle();
+    assert.equal(runtime.getIconHarvestJob(created.jobId).state, "succeeded");
+  } finally {
+    runtime.running = false;
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("successful acquisition publishes and persists one revisioned job snapshot without replacing a manual display choice", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "icon-harvest-success-"));
   const events = [];

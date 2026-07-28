@@ -170,6 +170,20 @@ class IconHarvestJobService {
     if (!Number.isInteger(runnerTaskId) || !jobIds?.size) return [];
     const snapshots = [];
     for (const jobId of jobIds) {
+      if (event.type === "icon-acquisition-queued") {
+        snapshots.push(this._transition(jobId, {
+          state: "queued",
+          stage: event.stage || "waiting-for-runtime-slot",
+          reason: event.reason || "automation-runtime-busy",
+          retryable: true,
+          operatorSummary: "运行时采集槽位正忙，任务会在安全边界继续。",
+          technicalDetails: {
+            reason: event.reason || "automation-runtime-busy",
+          },
+          markStarted: false,
+        }));
+        continue;
+      }
       if (event.type === "icon-acquisition-started") {
         snapshots.push(this._transition(jobId, {
           state: "running",

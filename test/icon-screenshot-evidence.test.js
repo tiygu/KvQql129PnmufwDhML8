@@ -91,6 +91,7 @@ test("screenshot provider finds an item icon nested in the order view tree", asy
   const target = await resolveScreenshotTarget({ client, contextId: 9, itemId: "10100109" });
 
   assert.equal(target.runtimeSource, "controller-item-view");
+  assert.equal(target.visible, true);
   assert.equal(JSON.stringify(target.bounds), JSON.stringify({ x: 20, y: 20, width: 40, height: 50 }));
 });
 
@@ -305,6 +306,7 @@ test("clipped control-console chrome never becomes an automatic display icon", a
   });
   const target = {
     observedItemId: "10100210",
+    visible: true,
     runtimeSource: "board-item-view",
     captureEligibility: "eligible",
     bounds: { x: 0, y: 0, width: 64, height: 64 },
@@ -449,7 +451,7 @@ test("exact mapping failure falls back to stable runtime screenshot evidence wit
   const service = new IconEvidenceService({
     database, cacheDir: path.join(root, "cache"), concurrency: 1, screenshotFrameDelayMs: 0,
     resolveSpriteFrame: async () => { throw new Error("no SpriteFrame mapping"); },
-    resolveScreenshotBounds: async ({ itemId }) => ({ observedItemId: itemId, bounds: { x: 0, y: 0, width: 40, height: 40 }, viewport: { width: 40, height: 40 }, devicePixelRatio: 1, runtimeSource: "board-cell" }),
+    resolveScreenshotBounds: async ({ itemId }) => ({ observedItemId: itemId, visible: true, bounds: { x: 0, y: 0, width: 40, height: 40 }, viewport: { width: 40, height: 40 }, devicePixelRatio: 1, runtimeSource: "board-cell" }),
     captureScreenshot: async () => frames[captures++],
   });
   try {
@@ -481,6 +483,7 @@ test("transformed board screenshots remain audit candidates but are never automa
     resolveSpriteFrame: async () => { throw new Error("no SpriteFrame mapping"); },
     resolveScreenshotBounds: async ({ itemId }) => ({
       observedItemId: itemId,
+      visible: true,
       bounds: { x: 0, y: 0, width: 40, height: 40 },
       viewport: { width: 40, height: 40 },
       devicePixelRatio: 1,

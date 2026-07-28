@@ -20,13 +20,61 @@ function cleanupUncommittedAsset(database, asset) {
   }
 }
 
-function runIconWorker(input) {
+function runIconWorker(
+  input,
+  signal = null,
+  createWorker = (...args) => new Worker(...args),
+) {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(path.join(__dirname, "icon-image-worker.js"), { workerData: input });
+    const { signal: _signal, ...workerData } = input;
+    const worker = createWorker(
+      path.join(__dirname, "icon-image-worker.js"),
+      { workerData },
+    );
     let settled = false;
-    worker.once("message", (message) => { settled = true; message?.error ? reject(Object.assign(new Error(message.error.message), { stack: message.error.stack })) : resolve(message); });
-    worker.once("error", (error) => { settled = true; reject(error); });
-    worker.once("exit", (code) => { if (code !== 0 && !settled) reject(new Error(`icon image worker exited with code ${code}`)); });
+    let terminating = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => {
+      if (settled || terminating) return;
+      terminating = true;
+      const reason = signal?.reason instanceof Error
+        ? signal.reason
+        : Object.assign(new Error("icon image worker aborted"), {
+          name: "AbortError",
+        });
+      Promise.resolve()
+        .then(() => worker.terminate())
+        .catch(() => undefined)
+        .then(() => finish(reject, reason));
+    };
+    worker.once("message", (message) => {
+      if (terminating) return;
+      if (message?.error) {
+        finish(
+          reject,
+          Object.assign(new Error(message.error.message), {
+            stack: message.error.stack,
+          }),
+        );
+        return;
+      }
+      finish(resolve, message);
+    });
+    worker.once("error", (error) => {
+      if (!terminating) finish(reject, error);
+    });
+    worker.once("exit", (code) => {
+      if (!terminating && code !== 0) {
+        finish(reject, new Error(`icon image worker exited with code ${code}`));
+      }
+    });
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -119,11 +167,14 @@ function processIconResource({ resourceBody, metadata, cacheDir }) {
 }
 
 function processIconInWorker(input) {
-  return runIconWorker(input).then((message) => message.asset);
+  return runIconWorker(input, input.signal).then((message) => message.asset);
 }
 
 function processScreenshotInWorker(input) {
-  return runIconWorker({ ...input, operation: "screenshot-frames" });
+  return runIconWorker(
+    { ...input, operation: "screenshot-frames" },
+    input.signal,
+  );
 }
 
 function buildScreenshotDiscoveryExpression(itemIdentity, token) {
@@ -133,12 +184,23 @@ function buildScreenshotDiscoveryExpression(itemIdentity, token) {
 }
 
 function buildScreenshotTargetExpression(token) {
-  return `(() => {const slots=globalThis.__miniGameCatalogScreenshotNodes,node=slots?.[${JSON.stringify(String(token))}];if(slots)delete slots[${JSON.stringify(String(token))}];const cc=globalThis.cc,box=node?.getBoundingBoxToWorld?.()||node?._uiProps?.uiTransformComp?.getBoundingBoxToWorld?.(),visible=cc?.view?.getVisibleSize?.();if(!box||!visible?.width||!visible?.height)return null;return{bounds:{x:Number(box.x)/visible.width*innerWidth,y:(visible.height-Number(box.y)-Number(box.height))/visible.height*innerHeight,width:Number(box.width)/visible.width*innerWidth,height:Number(box.height)/visible.height*innerHeight},viewport:{width:innerWidth,height:innerHeight},devicePixelRatio:Number(globalThis.devicePixelRatio||1)};})()`;
+  return `(() => {const slots=globalThis.__miniGameCatalogScreenshotNodes,node=slots?.[${JSON.stringify(String(token))}];if(slots)delete slots[${JSON.stringify(String(token))}];const cc=globalThis.cc,box=node?.getBoundingBoxToWorld?.()||node?._uiProps?.uiTransformComp?.getBoundingBoxToWorld?.(),visibleSize=cc?.view?.getVisibleSize?.();if(!box||!visibleSize?.width||!visibleSize?.height)return null;const bounds={x:Number(box.x)/visibleSize.width*innerWidth,y:(visibleSize.height-Number(box.y)-Number(box.height))/visibleSize.height*innerHeight,width:Number(box.width)/visibleSize.width*innerWidth,height:Number(box.height)/visibleSize.height*innerHeight},viewport={width:innerWidth,height:innerHeight},opacity=Number(node?.opacity??node?._uiProps?.opacity??255),visible=node?.activeInHierarchy!==false&&node?.active!==false&&opacity>0&&bounds.width>0&&bounds.height>0&&bounds.x>=0&&bounds.y>=0&&bounds.x+bounds.width<=viewport.width&&bounds.y+bounds.height<=viewport.height;return{bounds,viewport,visible,devicePixelRatio:Number(globalThis.devicePixelRatio||1)};})()`;
 }
 
 async function resolveScreenshotTarget({ client, contextId, itemId, itemIdentity = null, signal = null }) {
-  const hook = await client.evaluate(`globalThis.__miniGameCatalogResolveScreenshotTarget?.(${JSON.stringify(String(itemId))})??null`, contextId, { signal });
-  if (hook?.bounds && String(hook.observedItemId) === String(itemId)) return hook;
+  const hook = await client.evaluate(
+    `globalThis.__miniGameCatalogResolveScreenshotTarget?.(${JSON.stringify(String(itemId))})??null`,
+    contextId,
+    { signal },
+  );
+  if (hook?.bounds && String(hook.observedItemId) === String(itemId)) {
+    const viewport = hook.viewport || await client.evaluate(
+      "({width:innerWidth,height:innerHeight})",
+      contextId,
+      { signal },
+    );
+    return { ...hook, viewport, visible: hook.visible === true };
+  }
   const token = crypto.randomUUID();
   const discovery = await client.evaluate(buildScreenshotDiscoveryExpression(itemIdentity || { itemId }, token), contextId, { signal });
   const bounds = await client.evaluate(buildScreenshotTargetExpression(token), contextId, { signal });
@@ -180,237 +242,932 @@ async function readCdpResource({ client, resourceUrl, mimeType, signal = null })
   return { body: Buffer.from(content.content || "", content.base64Encoded ? "base64" : "utf8"), mimeType: resource.mimeType || mimeType || "application/octet-stream", resolvedUrl: resource.url };
 }
 
+const DEFAULT_STAGE_DEADLINES = Object.freeze({
+  resolve: 5_000,
+  download: 15_000,
+  screenshotTarget: 3_000,
+  screenshotCapture: 10_000,
+  process: 30_000,
+  commit: 5_000,
+});
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const numeric = Number(value);
+  return Math.max(
+    minimum,
+    Math.min(maximum, Number.isFinite(numeric) ? Math.floor(numeric) : fallback),
+  );
+}
+
+function screenshotTargetVisibility(target, itemId) {
+  const bounds = target?.bounds;
+  const viewport = target?.viewport;
+  const values = [
+    bounds?.x,
+    bounds?.y,
+    bounds?.width,
+    bounds?.height,
+    viewport?.width,
+    viewport?.height,
+  ].map(Number);
+  if (
+    String(target?.observedItemId) !== String(itemId)
+    || target?.visible !== true
+    || !values.every(Number.isFinite)
+  ) {
+    return false;
+  }
+  const [x, y, width, height, viewportWidth, viewportHeight] = values;
+  return width > 0
+    && height > 0
+    && viewportWidth > 0
+    && viewportHeight > 0
+    && x >= 0
+    && y >= 0
+    && x + width <= viewportWidth
+    && y + height <= viewportHeight;
+}
+
+function screenshotTargetError(itemId) {
+  const error = new Error(`runtime screenshot target is not reliably visible for item ${itemId}`);
+  error.code = "ICON_SCREENSHOT_TARGET_NOT_VISIBLE";
+  error.reason = "screenshot-target-not-visible";
+  return error;
+}
+
 class IconEvidenceService {
-  constructor({ database, cacheDir, concurrency = 2, queueLimit = 100, resolveSpriteFrame = resolveCocosSpriteFrame, readResource = readCdpResource, processImage = processIconInWorker, resolveScreenshotBounds = resolveScreenshotTarget, captureScreenshot = captureCdpScreenshot, processScreenshot = processScreenshotInWorker, screenshotFrameCount = 3, screenshotFrameDelayMs = 60, onEvent = null, isSafeBoundary = null }) {
+  constructor({
+    database,
+    cacheDir,
+    concurrency = 2,
+    offlineConcurrency = concurrency,
+    queueLimit = 100,
+    hardQueueLimit = 1000,
+    stageDeadlines = {},
+    resolveSpriteFrame = resolveCocosSpriteFrame,
+    readResource = readCdpResource,
+    processImage = processIconInWorker,
+    resolveScreenshotBounds = resolveScreenshotTarget,
+    captureScreenshot = captureCdpScreenshot,
+    processScreenshot = processScreenshotInWorker,
+    screenshotFrameCount = 3,
+    screenshotFrameDelayMs = 60,
+    onEvent = null,
+    isSafeBoundary = null,
+  }) {
     if (!database) throw new TypeError("database is required");
     this.database = database;
     this.cacheDir = path.resolve(String(cacheDir));
-    this.concurrency = Math.max(1, Math.min(4, Number(concurrency) || 2));
-    this.queueLimit = Math.max(this.concurrency, Math.min(1000, Number(queueLimit) || 100));
+    this.runtimeConcurrency = 1;
+    this.offlineConcurrency = boundedInteger(offlineConcurrency, 2, 1, 4);
+    this.concurrency = this.offlineConcurrency;
+    this.softQueueLimit = boundedInteger(queueLimit, 100, 1, 1000);
+    this.hardQueueLimit = boundedInteger(
+      hardQueueLimit,
+      1000,
+      this.softQueueLimit,
+      1000,
+    );
+    this.queueLimit = this.softQueueLimit;
+    this.stageDeadlines = {
+      ...DEFAULT_STAGE_DEADLINES,
+      ...Object.fromEntries(
+        Object.entries(stageDeadlines || {}).map(([stage, deadline]) => [
+          stage,
+          boundedInteger(deadline, DEFAULT_STAGE_DEADLINES[stage] || 30_000, 1, 300_000),
+        ]),
+      ),
+    };
     this.resolveSpriteFrame = resolveSpriteFrame;
     this.readResource = readResource;
     this.processImage = processImage;
     this.resolveScreenshotBounds = resolveScreenshotBounds;
     this.captureScreenshot = captureScreenshot;
     this.processScreenshot = processScreenshot;
-    this.screenshotFrameCount = Math.max(3, Math.min(7, Number(screenshotFrameCount) || 3));
-    this.screenshotFrameDelayMs = Math.max(0, Math.min(500, Number(screenshotFrameDelayMs) || 0));
+    this.screenshotFrameCount = boundedInteger(screenshotFrameCount, 3, 3, 7);
+    this.screenshotFrameDelayMs = boundedInteger(screenshotFrameDelayMs, 0, 0, 500);
     this.onEvent = onEvent;
     this.isSafeBoundary = typeof isSafeBoundary === "function" ? isSafeBoundary : () => true;
-    this.pending = [];
-    this.active = 0;
+    this.runtimeQueues = new Map();
+    this.runtimeParentOrder = [];
+    this.runtimeParentIndex = 0;
+    this.lastRuntimeParentId = null;
+    this.activeRuntimeTask = null;
+    this.offlinePending = [];
+    this.activeOffline = 0;
     this.nextTaskId = 1;
     this.tasks = new Map();
     this.inFlight = new Map();
     this.idleWaiters = [];
+    this.runtimeIdleWaiters = [];
+    this.boundaryRetryTimer = null;
     fs.mkdirSync(this.cacheDir, { recursive: true });
   }
 
   request(itemId, runtime = {}) {
     const key = String(itemId);
-    const existing = this.inFlight.get(key);
-    if (existing) return { status: "queued", taskId: existing, itemId: key };
-    if (this.pending.length + this.active >= this.queueLimit) throw Object.assign(new Error("icon acquisition queue is full"), { code: "ICON_ACQUISITION_QUEUE_FULL", statusCode: 429 });
-    const controller = new AbortController();
-    const signal = runtime.signal ? AbortSignal.any([runtime.signal, controller.signal]) : controller.signal;
-    const task = { id: this.nextTaskId++, itemId: key, runtime: { ...runtime, signal }, controller, status: "queued", requestedAt: new Date().toISOString() };
+    const existingTaskId = this.inFlight.get(key);
+    if (existingTaskId) {
+      return {
+        status: "queued",
+        taskId: existingTaskId,
+        itemId: key,
+        shared: true,
+      };
+    }
+    const occupancy = this.inFlight.size;
+    if (occupancy >= this.hardQueueLimit) {
+      throw this._queueCapacityError(
+        "ICON_ACQUISITION_QUEUE_HARD_LIMIT",
+        "queue-hard-capacity",
+        this.hardQueueLimit,
+      );
+    }
+    if (occupancy >= this.softQueueLimit && runtime.allowSoftOverflow !== true) {
+      throw this._queueCapacityError(
+        "ICON_ACQUISITION_QUEUE_SOFT_LIMIT",
+        "queue-soft-capacity",
+        this.softQueueLimit,
+      );
+    }
+
+    const id = this.nextTaskId++;
+    const parentTaskId = String(runtime.parentTaskId || `request-${id}`);
+    const task = {
+      id,
+      itemId: key,
+      parentTaskId,
+      runtime: { ...runtime },
+      runtimeController: new AbortController(),
+      status: "queued",
+      phase: "runtime-queued",
+      stage: "queued",
+      reason: null,
+      code: null,
+      error: null,
+      technicalDetails: null,
+      requestedAt: new Date().toISOString(),
+      startedAt: null,
+      completedAt: null,
+      timings: [],
+      result: null,
+    };
     this.tasks.set(task.id, task);
     this.inFlight.set(key, task.id);
-    this.pending.push(task);
+    this._enqueueRuntime(task);
     queueMicrotask(() => this._drain());
-    return { status: "queued", taskId: task.id, itemId: key };
+    return {
+      status: "queued",
+      taskId: task.id,
+      itemId: key,
+      shared: false,
+    };
   }
 
   getTask(taskId) {
     const task = this.tasks.get(Number(taskId));
-    return task ? { ...task, runtime: undefined, controller: undefined } : null;
+    if (!task) return null;
+    return {
+      id: task.id,
+      taskId: task.id,
+      itemId: task.itemId,
+      parentTaskId: task.parentTaskId,
+      status: task.status,
+      phase: task.phase,
+      stage: task.stage,
+      reason: task.reason,
+      code: task.code,
+      error: task.error,
+      technicalDetails: task.technicalDetails
+        ? { ...task.technicalDetails }
+        : null,
+      requestedAt: task.requestedAt,
+      startedAt: task.startedAt,
+      completedAt: task.completedAt,
+      timings: task.timings.map((timing) => ({ ...timing })),
+      result: task.result,
+    };
   }
 
   interruptForAutomation() {
-    let interrupted = 0;
-    for (const task of this.tasks.values()) {
-      if (!["queued", "running"].includes(task.status) || task.controller.signal.aborted) continue;
-      task.controller.abort();
-      interrupted += 1;
+    const task = this.activeRuntimeTask;
+    if (!task || task.runtimeController.signal.aborted) return 0;
+    task.runtimeController.abort(
+      Object.assign(new Error("runtime acquisition preempted by automation"), {
+        name: "AbortError",
+        code: "ICON_ACQUISITION_DEFERRED",
+      }),
+    );
+    return 1;
+  }
+
+  notifySafeBoundary() {
+    if (this.boundaryRetryTimer) {
+      clearTimeout(this.boundaryRetryTimer);
+      this.boundaryRetryTimer = null;
     }
-    return interrupted;
+    this._drain();
   }
 
   waitForIdle() {
-    if (!this.active && !this.pending.length) return Promise.resolve();
+    if (this._isIdle()) return Promise.resolve();
     return new Promise((resolve) => this.idleWaiters.push(resolve));
   }
 
+  waitForRuntimeIdle() {
+    if (!this.activeRuntimeTask) return Promise.resolve();
+    return new Promise((resolve) => this.runtimeIdleWaiters.push(resolve));
+  }
+
+  _queueCapacityError(code, reason, limit) {
+    const error = new Error(`icon acquisition queue reached ${reason}`);
+    error.code = code;
+    error.reason = reason;
+    error.limit = limit;
+    error.statusCode = 429;
+    return error;
+  }
+
+  _enqueueRuntime(task) {
+    if (!this.runtimeQueues.has(task.parentTaskId)) {
+      this.runtimeQueues.set(task.parentTaskId, []);
+      this.runtimeParentOrder.push(task.parentTaskId);
+    }
+    this.runtimeQueues.get(task.parentTaskId).push(task);
+  }
+
+  _takeNextRuntimeTask() {
+    while (this.runtimeParentOrder.length) {
+      const lastParentIndex = this.runtimeParentOrder.indexOf(
+        this.lastRuntimeParentId,
+      );
+      const index = lastParentIndex >= 0
+        ? (lastParentIndex + 1) % this.runtimeParentOrder.length
+        : Math.min(this.runtimeParentIndex, this.runtimeParentOrder.length - 1);
+      const parentTaskId = this.runtimeParentOrder[index];
+      const queue = this.runtimeQueues.get(parentTaskId);
+      if (!queue?.length) {
+        this.runtimeQueues.delete(parentTaskId);
+        this.runtimeParentOrder.splice(index, 1);
+        this.runtimeParentIndex = Math.min(
+          index,
+          Math.max(0, this.runtimeParentOrder.length - 1),
+        );
+        continue;
+      }
+      const task = queue.shift();
+      this.lastRuntimeParentId = parentTaskId;
+      if (!queue.length) {
+        this.runtimeQueues.delete(parentTaskId);
+        this.runtimeParentOrder.splice(index, 1);
+        if (this.runtimeParentIndex >= this.runtimeParentOrder.length) {
+          this.runtimeParentIndex = 0;
+        }
+      } else {
+        this.runtimeParentIndex = (index + 1)
+          % this.runtimeParentOrder.length;
+      }
+      return task;
+    }
+    return null;
+  }
+
   _drain() {
-    while (this.active < this.concurrency && this.pending.length) {
-      const task = this.pending.shift();
-      this.active += 1;
-      task.status = "running";
-      this.onEvent?.({
-        type: "icon-acquisition-started",
-        itemId: task.itemId,
-        taskId: task.id,
-        stage: "resolving",
-      });
-      this._run(task).then((result) => { task.status = "complete"; task.result = result; }, (error) => {
-        const deferred = error.code === "ICON_ACQUISITION_DEFERRED"
-          || (error.name === "AbortError" && !this.isSafeBoundary());
-        task.status = deferred ? "deferred" : "error";
-        task.error = error.message;
-        this.onEvent?.({
-          type: deferred ? "icon-acquisition-deferred" : "icon-acquisition-error",
-          itemId: task.itemId,
-          taskId: task.id,
-          error: error.message,
-          code: error.code || null,
-          reason: deferred ? "automation-safe-boundary" : error.code || "icon-acquisition-failed",
-          stage: deferred ? "waiting-for-safe-boundary" : "failed",
-          retryable: deferred,
-          technicalDetails: {
-            message: error.message,
-            code: error.code || null,
-          },
-        });
+    this._drainRuntime();
+    this._drainOffline();
+    this._resolveIdleWaiters();
+  }
+
+  _drainRuntime() {
+    if (this.activeRuntimeTask || !this.runtimeParentOrder.length) return;
+    if (!this.isSafeBoundary()) {
+      this._markRuntimeBusy();
+      this._scheduleBoundaryRetry();
+      return;
+    }
+    const task = this._takeNextRuntimeTask();
+    if (!task) return;
+    this.activeRuntimeTask = task;
+    task.status = "running";
+    task.phase = "runtime";
+    task.stage = "resolving";
+    task.reason = null;
+    task.startedAt ||= new Date().toISOString();
+    this.onEvent?.({
+      type: "icon-acquisition-started",
+      itemId: task.itemId,
+      taskId: task.id,
+      parentTaskId: task.parentTaskId,
+      stage: task.stage,
+      phase: task.phase,
+    });
+    this._prepareRuntime(task)
+      .then((prepared) => {
+        task.prepared = prepared;
+        task.status = "queued";
+        task.phase = "offline-queued";
+        task.stage = "waiting-for-offline-worker";
+        this.offlinePending.push(task);
       })
-        .finally(() => { this.active -= 1; this.inFlight.delete(task.itemId); while (this.tasks.size > 256) { const oldest = this.tasks.entries().next().value; if (!oldest || ["queued", "running"].includes(oldest[1].status)) break; this.tasks.delete(oldest[0]); } this._drain(); if (!this.active && !this.pending.length) this.idleWaiters.splice(0).forEach((resolve) => resolve()); });
+      .catch((error) => this._settleError(task, error))
+      .finally(() => {
+        this.activeRuntimeTask = null;
+        this.runtimeIdleWaiters.splice(0).forEach((resolve) => resolve());
+        this._drain();
+      });
+  }
+
+  _drainOffline() {
+    while (
+      this.activeOffline < this.offlineConcurrency
+      && this.offlinePending.length
+    ) {
+      const task = this.offlinePending.shift();
+      this.activeOffline += 1;
+      task.status = "running";
+      task.phase = "offline";
+      task.stage = "processing";
+      this._processPrepared(task, task.prepared)
+        .then((result) => {
+          task.status = "complete";
+          task.phase = "complete";
+          task.stage = "committed";
+          task.reason = null;
+          task.result = result;
+        })
+        .catch((error) => this._settleError(task, error))
+        .finally(() => {
+          delete task.prepared;
+          this.activeOffline -= 1;
+          this._finishTask(task);
+          this._drain();
+        });
     }
   }
 
-  async _run(task) {
+  _markRuntimeBusy() {
+    for (const queue of this.runtimeQueues.values()) {
+      for (const task of queue) {
+        const changed = task.reason !== "automation-runtime-busy";
+        task.status = "queued";
+        task.phase = "runtime-queued";
+        task.stage = "waiting-for-runtime-slot";
+        task.reason = "automation-runtime-busy";
+        if (changed) {
+          this.onEvent?.({
+            type: "icon-acquisition-queued",
+            itemId: task.itemId,
+            taskId: task.id,
+            parentTaskId: task.parentTaskId,
+            stage: task.stage,
+            reason: task.reason,
+          });
+        }
+      }
+    }
+  }
+
+  _scheduleBoundaryRetry() {
+    if (this.boundaryRetryTimer) return;
+    this.boundaryRetryTimer = setTimeout(() => {
+      this.boundaryRetryTimer = null;
+      this._drain();
+    }, 50);
+    this.boundaryRetryTimer.unref?.();
+  }
+
+  _resolveIdleWaiters() {
+    if (!this._isIdle()) return;
+    this.idleWaiters.splice(0).forEach((resolve) => resolve());
+  }
+
+  _isIdle() {
+    return !this.inFlight.size
+      && !this.activeRuntimeTask
+      && !this.activeOffline
+      && !this.runtimeParentOrder.length
+      && !this.offlinePending.length;
+  }
+
+  _finishTask(task) {
+    task.completedAt ||= new Date().toISOString();
+    if (this.inFlight.get(task.itemId) === task.id) {
+      this.inFlight.delete(task.itemId);
+    }
+    while (this.tasks.size > 256) {
+      const oldest = this.tasks.entries().next().value;
+      if (!oldest || ["queued", "running"].includes(oldest[1].status)) break;
+      this.tasks.delete(oldest[0]);
+    }
+  }
+
+  _settleError(task, error) {
+    const deferred = error?.code === "ICON_ACQUISITION_DEFERRED"
+      || (error?.name === "AbortError" && task.phase === "runtime");
+    task.status = deferred ? "deferred" : "error";
+    task.phase = deferred ? "deferred" : "failed";
+    task.stage = deferred ? "waiting-for-safe-boundary" : "failed";
+    task.error = error?.message || String(error);
+    task.code = error?.code || null;
+    task.reason = deferred
+      ? "automation-safe-boundary"
+      : error?.reason
+        || (error?.code === "ICON_ACQUISITION_STAGE_TIMEOUT"
+          ? "stage-deadline-exceeded"
+          : error?.code || "icon-acquisition-failed");
+    task.technicalDetails = {
+      message: task.error,
+      code: task.code,
+      ...(error?.technicalDetails || {}),
+    };
+    this.onEvent?.({
+      type: deferred ? "icon-acquisition-deferred" : "icon-acquisition-error",
+      itemId: task.itemId,
+      taskId: task.id,
+      parentTaskId: task.parentTaskId,
+      error: task.error,
+      code: task.code,
+      reason: task.reason,
+      stage: task.stage,
+      retryable: deferred,
+      technicalDetails: task.technicalDetails,
+    });
+    if (task !== this.activeRuntimeTask) this._finishTask(task);
+    else {
+      task.completedAt = new Date().toISOString();
+      if (this.inFlight.get(task.itemId) === task.id) {
+        this.inFlight.delete(task.itemId);
+      }
+    }
+  }
+
+  async _runStage(task, stage, deadlineKey, runtimeStage, operation) {
+    const deadlineMs = this.stageDeadlines[deadlineKey]
+      || DEFAULT_STAGE_DEADLINES[deadlineKey]
+      || 30_000;
+    const startedAt = new Date().toISOString();
+    const startedNs = process.hrtime.bigint();
+    const stageController = new AbortController();
+    const signals = [
+      task.runtime.signal,
+      runtimeStage ? task.runtimeController.signal : null,
+      stageController.signal,
+    ].filter(Boolean);
+    const signal = signals.length > 1
+      ? AbortSignal.any(signals)
+      : signals[0] || stageController.signal;
+    task.stage = stage;
+    this.onEvent?.({
+      type: "icon-acquisition-stage-started",
+      itemId: task.itemId,
+      taskId: task.id,
+      parentTaskId: task.parentTaskId,
+      phase: task.phase,
+      stage,
+      deadlineMs,
+      startedAt,
+    });
+    let timer;
+    let operationPromise = null;
+    let status = "succeeded";
+    let failure = null;
+    const timeout = new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error(`icon acquisition stage ${stage} exceeded ${deadlineMs}ms`);
+        error.code = "ICON_ACQUISITION_STAGE_TIMEOUT";
+        error.reason = "stage-deadline-exceeded";
+        error.technicalDetails = { stage, deadlineMs };
+        stageController.abort(error);
+        reject(error);
+      }, deadlineMs);
+    });
+    try {
+      if (signal.aborted) {
+        throw signal.reason instanceof Error
+          ? signal.reason
+          : Object.assign(new Error("icon acquisition aborted"), { name: "AbortError" });
+      }
+      operationPromise = Promise.resolve().then(() => operation(signal));
+      return await Promise.race([operationPromise, timeout]);
+    } catch (error) {
+      failure = error;
+      status = error?.code === "ICON_ACQUISITION_STAGE_TIMEOUT"
+        ? "timed-out"
+        : "failed";
+      if (status === "timed-out" && operationPromise) {
+        await operationPromise.then(
+          () => undefined,
+          () => undefined,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      const completedAt = new Date().toISOString();
+      const durationMs = Number(process.hrtime.bigint() - startedNs) / 1_000_000;
+      const timing = {
+        stage,
+        deadlineMs,
+        startedAt,
+        completedAt,
+        durationMs: Math.round(durationMs * 1000) / 1000,
+        status,
+      };
+      task.timings.push(timing);
+      this.onEvent?.({
+        type: "icon-acquisition-stage-complete",
+        itemId: task.itemId,
+        taskId: task.id,
+        parentTaskId: task.parentTaskId,
+        phase: task.phase,
+        ...timing,
+        code: failure?.code || null,
+      });
+    }
+  }
+
+  async _prepareRuntime(task) {
     this._assertSafeBoundary();
     try {
-      return await this._runExact(task);
+      return await this._prepareExactRuntime(task);
     } catch (exactError) {
       if (exactError.code !== "ICON_EXACT_PROVIDER_UNAVAILABLE") throw exactError;
-      return this._runScreenshotFallback(task, exactError);
+      return this._prepareScreenshotRuntime(task, exactError);
     }
   }
 
-  async _runExact(task) {
+  async _prepareExactRuntime(task) {
     let metadata;
     try {
-      metadata = await this.resolveSpriteFrame({ ...task.runtime, itemId: task.itemId });
-      this._assertSafeBoundary();
-      if (!metadata?.resourceUrl) throw new Error(`SpriteFrame resource not found for item ${task.itemId}`);
+      metadata = await this._runStage(
+        task,
+        "resolve-runtime-resource",
+        "resolve",
+        true,
+        async (signal) => {
+          const result = await this.resolveSpriteFrame({
+            ...task.runtime,
+            signal,
+            itemId: task.itemId,
+          });
+          this._assertSafeBoundary();
+          if (!result?.resourceUrl) {
+            throw new Error(`SpriteFrame resource not found for item ${task.itemId}`);
+          }
+          return result;
+        },
+      );
     } catch (error) {
-      if (/SpriteFrame resource not found|SpriteFrame mapping/i.test(error.message)) error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
+      if (/SpriteFrame resource not found|SpriteFrame mapping/i.test(error.message)) {
+        error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
+      }
       throw error;
     }
-    const crop = { rect: metadata.rect, rotated: !!metadata.rotated, rotation: metadata.rotation ?? null, originalSize: metadata.originalSize, offset: metadata.offset, yOrigin: metadata.yOrigin || "top-left" };
-    const cacheKey = crypto.createHash("sha256").update(canonicalJson({ reconstructionVersion: ICON_RECONSTRUCTION_VERSION, resourceUrl: metadata.resourceUrl, textureUuid: metadata.textureUuid || null, crop })).digest("hex");
+    const crop = {
+      rect: metadata.rect,
+      rotated: !!metadata.rotated,
+      rotation: metadata.rotation ?? null,
+      originalSize: metadata.originalSize,
+      offset: metadata.offset,
+      yOrigin: metadata.yOrigin || "top-left",
+    };
+    const cacheKey = crypto
+      .createHash("sha256")
+      .update(canonicalJson({
+        reconstructionVersion: ICON_RECONSTRUCTION_VERSION,
+        resourceUrl: metadata.resourceUrl,
+        textureUuid: metadata.textureUuid || null,
+        crop,
+      }))
+      .digest("hex");
     const cached = this.database.findIconAcquisition(cacheKey);
     if (cached && fs.existsSync(cached.filePath)) {
-      const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
-        itemId: task.itemId, cacheKey, sourceType: cached.sourceType, resourceUrl: cached.resourceUrl,
-        runtimeIdentifier: metadata.runtimeIdentifier || cached.runtimeIdentifier, textureUuid: metadata.textureUuid || cached.textureUuid, crop,
-        rankScore: cached.rankScore ?? 1,
-        asset: { hash: cached.assetHash, mimeType: cached.mimeType, width: cached.width, height: cached.height, byteSize: cached.byteSize, filePath: cached.filePath },
-      });
-      this.onEvent?.({
-        type: "icon-acquisition-complete",
-        itemId: task.itemId,
-        taskId: task.id,
-        candidate,
+      return { kind: "exact", metadata, crop, cacheKey, cached };
+    }
+    let resource;
+    try {
+      resource = await this._runStage(
+        task,
+        "download-runtime-resource",
+        "download",
+        true,
+        async (signal) => {
+          this._assertSafeBoundary();
+          const result = await this.readResource({
+            ...task.runtime,
+            signal,
+            resourceUrl: metadata.resourceUrl,
+            mimeType: metadata.mimeType,
+          });
+          this._assertSafeBoundary();
+          return result;
+        },
+      );
+    } catch (error) {
+      if (/resource (?:not loaded|not found)|not found for item/i.test(error.message)) {
+        error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
+      }
+      throw error;
+    }
+    return { kind: "exact", metadata, crop, cacheKey, resource, cached: null };
+  }
+
+  async _prepareScreenshotRuntime(task, exactError) {
+    const frames = [];
+    const targets = [];
+    for (
+      let attempt = 0;
+      attempt < this.screenshotFrameCount * 2 && frames.length < this.screenshotFrameCount;
+      attempt += 1
+    ) {
+      this._assertSafeBoundary();
+      const before = await this._runStage(
+        task,
+        "locate-screenshot-target",
+        "screenshotTarget",
+        true,
+        (signal) => this.resolveScreenshotBounds({
+          ...task.runtime,
+          signal,
+          itemId: task.itemId,
+        }),
+      );
+      if (!screenshotTargetVisibility(before, task.itemId)) {
+        throw screenshotTargetError(task.itemId);
+      }
+      const body = await this._runStage(
+        task,
+        "capture-screenshot-frame",
+        "screenshotCapture",
+        true,
+        (signal) => {
+          this._assertSafeBoundary();
+          return this.captureScreenshot({
+            ...task.runtime,
+            signal,
+            target: before,
+          });
+        },
+      );
+      this._assertSafeBoundary();
+      const after = await this._runStage(
+        task,
+        "verify-screenshot-target",
+        "screenshotTarget",
+        true,
+        (signal) => this.resolveScreenshotBounds({
+          ...task.runtime,
+          signal,
+          itemId: task.itemId,
+        }),
+      );
+      if (!screenshotTargetVisibility(after, task.itemId)) {
+        throw screenshotTargetError(task.itemId);
+      }
+      const drift = Math.max(
+        ...["x", "y", "width", "height"].map((key) => Math.abs(
+          Number(before.bounds[key]) - Number(after.bounds[key]),
+        )),
+      );
+      if (drift > 2) continue;
+      frames.push(body);
+      targets.push({ ...before, insetRatio: 0.06, mimeType: "image/png" });
+      if (this.screenshotFrameDelayMs && frames.length < this.screenshotFrameCount) {
+        await new Promise((resolve) => setTimeout(resolve, this.screenshotFrameDelayMs));
+      }
+    }
+    if (frames.length < 3) {
+      const error = new Error(
+        `stable screenshot frames unavailable after exact provider failed: ${exactError.message}`,
+      );
+      error.code = "ICON_SCREENSHOT_FRAMES_UNSTABLE";
+      error.reason = "screenshot-frames-unstable";
+      throw error;
+    }
+    return { kind: "screenshot", frames, targets, exactError };
+  }
+
+  async _processPrepared(task, prepared) {
+    if (prepared.kind === "exact") {
+      return this._processExactPrepared(task, prepared);
+    }
+    return this._processScreenshotPrepared(task, prepared);
+  }
+
+  async _processExactPrepared(task, prepared) {
+    const { metadata, crop, cacheKey, cached, resource } = prepared;
+    if (cached) {
+      const { candidate, decisionChange } = await this._runStage(
+        task,
+        "commit-icon-evidence",
+        "commit",
+        false,
+        async () => this.database.saveIconCandidateWithDecision({
+          itemId: task.itemId,
+          cacheKey,
+          sourceType: cached.sourceType,
+          resourceUrl: cached.resourceUrl,
+          runtimeIdentifier: metadata.runtimeIdentifier || cached.runtimeIdentifier,
+          textureUuid: metadata.textureUuid || cached.textureUuid,
+          crop,
+          rankScore: cached.rankScore ?? 1,
+          asset: {
+            hash: cached.assetHash,
+            mimeType: cached.mimeType,
+            width: cached.width,
+            height: cached.height,
+            byteSize: cached.byteSize,
+            filePath: cached.filePath,
+          },
+        }),
+      );
+      this._emitComplete(task, candidate, {
         cached: true,
         displayIconRevision: decisionChange?.revision ?? null,
       });
       return { candidate, cached: true };
     }
-    let resource;
-    try {
-      this._assertSafeBoundary();
-      resource = await this.readResource({ ...task.runtime, resourceUrl: metadata.resourceUrl, mimeType: metadata.mimeType });
-      this._assertSafeBoundary();
-    } catch (error) {
-      if (/resource (?:not loaded|not found)|not found for item/i.test(error.message)) error.code = "ICON_EXACT_PROVIDER_UNAVAILABLE";
-      throw error;
-    }
-    const asset = await this.processImage({ resourceBody: resource.body, metadata: { ...metadata, mimeType: resource.mimeType || metadata.mimeType }, cacheDir: this.cacheDir });
+    const asset = await this._runStage(
+      task,
+      "process-image-bytes",
+      "process",
+      false,
+      (signal) => this.processImage({
+        signal,
+        resourceBody: resource.body,
+        metadata: {
+          ...metadata,
+          mimeType: resource.mimeType || metadata.mimeType,
+        },
+        cacheDir: this.cacheDir,
+      }),
+    );
     let candidate;
     let decisionChange;
     try {
-      ({ candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
-        itemId: task.itemId, cacheKey, sourceType: "cocos-runtime-resource", resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
-        runtimeIdentifier: metadata.runtimeIdentifier || null, textureUuid: metadata.textureUuid || null, crop,
-        rankScore: 1, asset,
-      }));
+      ({ candidate, decisionChange } = await this._runStage(
+        task,
+        "commit-icon-evidence",
+        "commit",
+        false,
+        async () => this.database.saveIconCandidateWithDecision({
+          itemId: task.itemId,
+          cacheKey,
+          sourceType: "cocos-runtime-resource",
+          resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
+          runtimeIdentifier: metadata.runtimeIdentifier || null,
+          textureUuid: metadata.textureUuid || null,
+          crop,
+          rankScore: 1,
+          asset,
+        }),
+      ));
     } catch (error) {
       cleanupUncommittedAsset(this.database, asset);
       throw error;
     }
-    this.onEvent?.({
-      type: "icon-acquisition-complete",
-      itemId: task.itemId,
-      taskId: task.id,
-      candidate,
+    this._emitComplete(task, candidate, {
       cached: false,
       displayIconRevision: decisionChange?.revision ?? null,
     });
     return { candidate, cached: false };
   }
 
-  async _runScreenshotFallback(task, exactError) {
-    const frames = [], targets = [];
-    for (let attempt = 0; attempt < this.screenshotFrameCount * 2 && frames.length < this.screenshotFrameCount; attempt += 1) {
-      this._assertSafeBoundary();
-      const before = await this.resolveScreenshotBounds({ ...task.runtime, itemId: task.itemId });
-      this._assertSafeBoundary();
-      const body = await this.captureScreenshot({ ...task.runtime, target: before });
-      this._assertSafeBoundary();
-      const after = await this.resolveScreenshotBounds({ ...task.runtime, itemId: task.itemId });
-      if (String(before.observedItemId) !== task.itemId || String(after.observedItemId) !== task.itemId) continue;
-      const drift = Math.max(...["x", "y", "width", "height"].map((key) => Math.abs(Number(before.bounds[key]) - Number(after.bounds[key]))));
-      if (drift > 2) continue;
-      frames.push(body);
-      targets.push({ ...before, insetRatio: 0.06, mimeType: "image/png" });
-      if (this.screenshotFrameDelayMs && frames.length < this.screenshotFrameCount) await new Promise((resolve) => setTimeout(resolve, this.screenshotFrameDelayMs));
-    }
-    if (frames.length < 3) throw new Error(`stable screenshot frames unavailable after exact provider failed: ${exactError.message}`);
+  async _processScreenshotPrepared(task, prepared) {
+    const { frames, targets, exactError } = prepared;
     const allCandidates = this.database.listIconCandidates(task.itemId);
-    const prioritizedCandidates = [...allCandidates.filter((candidate) => candidate.selected), ...allCandidates.slice(-12)];
-    const comparisonCandidates = [...new Map(prioritizedCandidates.map((candidate) => [candidate.id, candidate])).values()].slice(0, 12);
-    const processed = await this.processScreenshot({ frames, targets, cacheDir: this.cacheDir, comparisonCandidates });
-    this._assertSafeBoundary();
-    const crop = { provider: "runtime-screenshot", ...processed.crop, exactProviderError: exactError.message };
-    const cacheKey = crypto.createHash("sha256").update(canonicalJson({ itemId: task.itemId, assetHash: processed.asset.hash, bounds: crop.bounds, viewport: crop.viewport })).digest("hex");
-    const stability = processed.similarity.frameSelection.acceptedFrameIndexes.length / frames.length;
+    const prioritizedCandidates = [
+      ...allCandidates.filter((candidate) => candidate.selected),
+      ...allCandidates.slice(-12),
+    ];
+    const comparisonCandidates = [
+      ...new Map(
+        prioritizedCandidates.map((candidate) => [candidate.id, candidate]),
+      ).values(),
+    ].slice(0, 12);
+    const processed = await this._runStage(
+      task,
+      "process-screenshot-bytes",
+      "process",
+      false,
+      (signal) => this.processScreenshot({
+        signal,
+        frames,
+        targets,
+        cacheDir: this.cacheDir,
+        comparisonCandidates,
+      }),
+    );
+    const crop = {
+      provider: "runtime-screenshot",
+      ...processed.crop,
+      exactProviderError: exactError.message,
+    };
+    const cacheKey = crypto
+      .createHash("sha256")
+      .update(canonicalJson({
+        itemId: task.itemId,
+        assetHash: processed.asset.hash,
+        bounds: crop.bounds,
+        viewport: crop.viewport,
+      }))
+      .digest("hex");
+    const stability = processed.similarity.frameSelection.acceptedFrameIndexes.length
+      / frames.length;
     const qualityReasons = [];
-    if (processed.similarity.frameSelection.acceptedFrameIndexes.length < Math.max(2, Math.ceil(frames.length * 2 / 3))) qualityReasons.push("unstable-frames");
-    if (processed.crop.backgroundRemoval?.applied !== true) qualityReasons.push("background-not-isolated");
-    if (processed.crop.backgroundRemoval?.applied === true
-      && processed.crop.backgroundRemoval?.foreground?.touchesEdge !== false) qualityReasons.push("foreground-clipped");
-    if (processed.crop.backgroundRemoval?.applied === true
-      && Number(processed.crop.backgroundRemoval?.foreground?.largestComponentFraction || 0) < 0.5) qualityReasons.push("foreground-fragmented");
-    if (targets.some((target) => target.captureEligibility === "transformed-board-item")) qualityReasons.push("transformed-board-item");
-    const qualityGate = { status: qualityReasons.length ? "rejected" : "eligible", reasons: qualityReasons, stability };
+    if (
+      processed.similarity.frameSelection.acceptedFrameIndexes.length
+      < Math.max(2, Math.ceil(frames.length * 2 / 3))
+    ) {
+      qualityReasons.push("unstable-frames");
+    }
+    if (processed.crop.backgroundRemoval?.applied !== true) {
+      qualityReasons.push("background-not-isolated");
+    }
+    if (
+      processed.crop.backgroundRemoval?.applied === true
+      && processed.crop.backgroundRemoval?.foreground?.touchesEdge !== false
+    ) {
+      qualityReasons.push("foreground-clipped");
+    }
+    if (
+      processed.crop.backgroundRemoval?.applied === true
+      && Number(
+        processed.crop.backgroundRemoval?.foreground?.largestComponentFraction || 0,
+      ) < 0.5
+    ) {
+      qualityReasons.push("foreground-fragmented");
+    }
+    if (
+      targets.some(
+        (target) => target.captureEligibility === "transformed-board-item",
+      )
+    ) {
+      qualityReasons.push("transformed-board-item");
+    }
+    const qualityGate = {
+      status: qualityReasons.length ? "rejected" : "eligible",
+      reasons: qualityReasons,
+      stability,
+    };
     let candidate;
     let decisionChange;
     try {
-      ({ candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
-        itemId: task.itemId, cacheKey, sourceType: "screenshot-runtime", runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds", crop,
-        similarity: { ...processed.similarity, qualityGate }, rankScore: 0.5 + stability * 0.3, autoSelect: qualityGate.status === "eligible", asset: processed.asset,
-      }));
+      ({ candidate, decisionChange } = await this._runStage(
+        task,
+        "commit-icon-evidence",
+        "commit",
+        false,
+        async () => this.database.saveIconCandidateWithDecision({
+          itemId: task.itemId,
+          cacheKey,
+          sourceType: "screenshot-runtime",
+          runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds",
+          crop,
+          similarity: { ...processed.similarity, qualityGate },
+          rankScore: 0.5 + stability * 0.3,
+          autoSelect: qualityGate.status === "eligible",
+          asset: processed.asset,
+        }),
+      ));
     } catch (error) {
       cleanupUncommittedAsset(this.database, processed.asset);
       throw error;
     }
-    this.onEvent?.({
-      type: "icon-acquisition-complete",
-      itemId: task.itemId,
-      taskId: task.id,
-      candidate,
+    this._emitComplete(task, candidate, {
       cached: false,
       provider: "screenshot-runtime",
       exactProviderError: exactError.message,
       displayIconRevision: decisionChange?.revision ?? null,
     });
-    return { candidate, cached: false, provider: "screenshot-runtime", exactProviderError: exactError.message };
+    return {
+      candidate,
+      cached: false,
+      provider: "screenshot-runtime",
+      exactProviderError: exactError.message,
+    };
+  }
+
+  _emitComplete(task, candidate, details) {
+    this.onEvent?.({
+      type: "icon-acquisition-complete",
+      itemId: task.itemId,
+      taskId: task.id,
+      parentTaskId: task.parentTaskId,
+      candidate,
+      ...details,
+    });
   }
 
   _assertSafeBoundary() {
     if (this.isSafeBoundary()) return;
-    throw Object.assign(new Error("icon acquisition deferred until automation reaches an idle boundary"), { code: "ICON_ACQUISITION_DEFERRED" });
+    const error = new Error(
+      "icon acquisition deferred until automation reaches an idle boundary",
+    );
+    error.code = "ICON_ACQUISITION_DEFERRED";
+    error.reason = "automation-safe-boundary";
+    throw error;
   }
 }
 
-module.exports = { IconEvidenceService, reconstructIcon, processIconResource, processIconInWorker, processScreenshotInWorker, buildSpriteFrameExpression, resolveCocosSpriteFrame, buildScreenshotDiscoveryExpression, buildScreenshotTargetExpression, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource, flattenResourceTree };
+module.exports = { IconEvidenceService, runIconWorker, reconstructIcon, processIconResource, processIconInWorker, processScreenshotInWorker, buildSpriteFrameExpression, resolveCocosSpriteFrame, buildScreenshotDiscoveryExpression, buildScreenshotTargetExpression, resolveScreenshotTarget, captureCdpScreenshot, readCdpResource, flattenResourceTree };
