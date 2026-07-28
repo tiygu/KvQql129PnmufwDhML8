@@ -817,6 +817,8 @@ class AutomationRuntime {
     let task;
     try {
       task = this.iconService.request(itemId, {
+        parentTaskId: created.snapshot.jobId,
+        allowSoftOverflow: true,
         itemIdentity: {
           itemId,
           ...(object.effectiveValue || object.algorithmCandidate || {}),
@@ -1120,7 +1122,8 @@ class AutomationRuntime {
     this.actionBoundaryPending = true;
     try {
       if (this.running) await this.pauseGate.waitForBoundary();
-      await this.iconService.waitForIdle();
+      this.iconService.interruptForAutomation();
+      await this.iconService.waitForRuntimeIdle();
       const selection = await this.connect();
       const before = await this.collectState();
       if (before.scene !== "board") return { ok: false, reason: "active-catalog-scan-board-scene-required", before };
@@ -1496,6 +1499,8 @@ class AutomationRuntime {
     if (this.running || this.actionBoundaryPending) return { ok: false, executed: false, reason: "automation-action-boundary-busy" };
     this.actionBoundaryPending = true;
     try {
+      this.iconService.interruptForAutomation();
+      await this.iconService.waitForRuntimeIdle();
       await this.connect();
       const before = await this.collectState();
       const catalog = this.getPlanningCatalog({ executionMode: "assisted" });
@@ -1523,7 +1528,8 @@ class AutomationRuntime {
     if (this.running || this.actionBoundaryPending) throw new Error("another automation action is already entering its execution boundary");
     this.actionBoundaryPending = true;
     try {
-      await this.iconService.waitForIdle();
+      this.iconService.interruptForAutomation();
+      await this.iconService.waitForRuntimeIdle();
       await this.connect();
       const runtimeControl = this.ensureRuntimeControl();
       const sessionId = this.database.startSession("map-mission", { explicitUserAction: true });
@@ -1555,6 +1561,7 @@ class AutomationRuntime {
     this.running = true;
     try {
       this.iconService.interruptForAutomation();
+      await this.iconService.waitForRuntimeIdle();
       await this.connect();
     } catch (error) {
       this.running = false;
@@ -1627,9 +1634,10 @@ class AutomationRuntime {
 
   async startIdle(options = {}) {
     if (this.running || this.actionBoundaryPending) throw new Error("automation task is already running");
-    this.iconService.interruptForAutomation();
     const settings = { ...this.getSettings(), ...options, mode: options.mode === "observation" ? "assisted" : options.mode || "assisted" };
     this.running = true;
+    this.iconService.interruptForAutomation();
+    await this.iconService.waitForRuntimeIdle();
     this.sessionKind = "idle";
     this.pauseGate.reset();
     this.abortController = new AbortController();

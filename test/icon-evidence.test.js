@@ -198,7 +198,7 @@ test("identical resource and crop reuse processing across Item Identities", asyn
   assert.equal(database.getSelectedIconCandidate("i1").assetHash, database.getSelectedIconCandidate("i2").assetHash);
 }));
 
-test("image tasks are bounded and request returns before processing", async () => withService(async ({ database, dir }) => {
+test("runtime downloads are single-slot and requests return before processing", async () => withService(async ({ database, dir }) => {
   let active = 0, maximum = 0;
   for (let index = 3; index <= 7; index += 1) database.observeCatalogObject({ objectType: "item-identity", objectId: `i${index}`, payload: { itemId: `i${index}` }, sourceType: "runtime" });
   const service = new IconEvidenceService({
@@ -210,7 +210,7 @@ test("image tasks are bounded and request returns before processing", async () =
   assert.equal(queued.every((result) => result.status === "queued"), true);
   assert.equal(active, 0);
   await service.waitForIdle();
-  assert.equal(maximum, 2);
+  assert.equal(maximum, 1);
 }));
 
 test("image decoding and reconstruction yield the Node event loop to a worker", async () => withService(async ({ database, dir }) => {

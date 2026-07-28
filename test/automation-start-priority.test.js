@@ -79,7 +79,7 @@ test("后台挂机启动在返回已接受之前同步抢占图标采集", async
   }
 });
 
-test("自动化启动中断截图处理后不会再发布图标完成事件", async () => {
+test("自动化启动不会中断已下载的截图离线处理", async () => {
   const cacheDir = fs.mkdtempSync(path.join(os.tmpdir(), "interrupted-icon-event-"));
   const events = [];
   let safeBoundary = true;
@@ -104,6 +104,7 @@ test("自动化启动中断截图处理后不会再发布图标完成事件", as
     },
     resolveScreenshotBounds: async () => ({
       observedItemId: "item-1",
+      visible: true,
       bounds: { x: 1, y: 2, width: 3, height: 4 },
       viewport: { width: 100, height: 100 },
       runtimeSource: "board-cell",
@@ -142,14 +143,14 @@ test("自动化启动中断截图处理后不会再发布图标完成事件", as
     const queued = service.request("item-1");
     await processingStarted;
     safeBoundary = false;
-    assert.equal(service.interruptForAutomation(), 1);
+    assert.equal(service.interruptForAutomation(), 0);
     releaseProcessing();
     await service.waitForIdle();
 
-    assert.equal(service.getTask(queued.taskId).status, "deferred");
+    assert.equal(service.getTask(queued.taskId).status, "complete");
     assert.equal(
       events.some((event) => event.type === "icon-acquisition-complete"),
-      false,
+      true,
     );
   } finally {
     fs.rmSync(cacheDir, { recursive: true, force: true });
