@@ -241,12 +241,56 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         broadcast({ type: "catalog-repository-imported", revision: result.revision, imported: result.imported, preserved: result.preserved });
         return writeJson(res, 200, result);
       }
-      if (route === "POST /api/catalog/icon/acquire") {
+      if (
+        route === "POST /api/catalog/icon-harvest-jobs"
+        || route === "POST /api/catalog/icon/jobs"
+        || route === "POST /api/catalog/icon/acquire"
+      ) {
         const body = await readJson(req);
-        if (!body.objectId) return writeJson(res, 400, { ok: false, error: "catalog-item-id-required" });
-        const task = runtime.acquireCatalogIcon(String(body.objectId));
-        broadcast({ type: "icon-acquisition-queued", itemId: String(body.objectId), taskId: task.taskId });
+        const itemId = body.scope?.itemId || body.scope?.objectId || body.itemId || body.objectId;
+        const wantsHarvestJob = Boolean(body.idempotencyKey || body.scope || route !== "POST /api/catalog/icon/acquire");
+        if (wantsHarvestJob && body.scope?.type != null && body.scope.type !== "item") {
+          return writeJson(res, 400, {
+            ok: false,
+            error: "invalid-icon-harvest-job-scope",
+          });
+        }
+        if (wantsHarvestJob && (!itemId || !body.idempotencyKey)) {
+          return writeJson(res, 400, {
+            ok: false,
+            error: "invalid-icon-harvest-job-request",
+          });
+        }
+        if (wantsHarvestJob) {
+          const job = runtime.createIconHarvestJob({
+            scope: {
+              type: "item",
+              itemId: String(itemId),
+            },
+            idempotencyKey: String(body.idempotencyKey),
+          });
+          return writeJson(res, job.idempotentReplay ? 200 : 202, job);
+        }
+        if (!itemId) return writeJson(res, 400, { ok: false, error: "catalog-item-id-required" });
+        const task = runtime.acquireCatalogIcon(String(itemId));
+        broadcast({ type: "icon-acquisition-queued", itemId: String(itemId), taskId: task.taskId });
         return writeJson(res, 202, task);
+      }
+      if (route === "GET /api/catalog/icon-harvest-jobs" || route === "GET /api/catalog/icon/jobs") {
+        return writeJson(res, 200, { jobs: runtime.listIconHarvestJobs() });
+      }
+      const iconHarvestJobMatch = /^\/api\/catalog\/icon(?:-harvest-jobs|\/jobs)\/([^/]+)$/.exec(
+        requestUrl.pathname,
+      );
+      if ((req.method || "GET") === "GET" && iconHarvestJobMatch) {
+        const job = runtime.getIconHarvestJob(
+          decodeURIComponent(iconHarvestJobMatch[1]),
+        );
+        return writeJson(
+          res,
+          job ? 200 : 404,
+          job || { ok: false, error: "icon-harvest-job-not-found" },
+        );
       }
       if (route === "GET /api/catalog/icon/task") {
         const task = runtime.getCatalogIconTask(requestUrl.searchParams.get("id"));
@@ -446,6 +490,15 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       at: new Date().toISOString(),
       catalogQueryRevision,
     }));
+    if (typeof runtime.listIconHarvestJobs === "function") {
+      for (const job of runtime.listIconHarvestJobs()) {
+        client.send(JSON.stringify({
+          type: "icon-harvest-job-updated",
+          at: new Date().toISOString(),
+          job,
+        }));
+      }
+    }
     client.on("close", () => clients.delete(client));
     client.on("error", () => clients.delete(client));
   });

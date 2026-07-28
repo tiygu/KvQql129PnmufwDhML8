@@ -18,6 +18,9 @@ const CATALOG_RULING_DECISIONS = new Set(["confirm", "modify", "revoke"]);
 const CATALOG_RELEASE_ENTRY_MODES = new Set(["full-snapshot", "legacy-advanced"]);
 const CURRENT_CATALOG_SCHEMA_VERSION = 4;
 const CURRENT_CATALOG_REVIEW_SCHEMA_VERSION = 2;
+const CURRENT_FEATURE_SCHEMA_VERSIONS = Object.freeze({
+  "icon-harvest-jobs": 1,
+});
 const UNSAFE_FIELD_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 const ITEM_IDENTITY_PRESENTATION_FIELDS = new Set([
   "displayIcon",
@@ -367,6 +370,11 @@ class AutomationDatabase {
         name TEXT NOT NULL,
         applied_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS feature_schema_versions (
+        feature TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        applied_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS catalog_compatibility_calls (
         operation TEXT PRIMARY KEY,
         call_count INTEGER NOT NULL DEFAULT 0,
@@ -475,6 +483,35 @@ class AutomationDatabase {
         FOREIGN KEY(predecessor_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT,
         FOREIGN KEY(successor_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
       );
+      CREATE TABLE IF NOT EXISTS icon_harvest_jobs (
+        id TEXT PRIMARY KEY,
+        scope_type TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS icon_harvest_acquisitions (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        reason_code TEXT,
+        retryable INTEGER NOT NULL DEFAULT 0,
+        operator_summary TEXT,
+        technical_details_json TEXT,
+        result_json TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(job_id,item_id),
+        FOREIGN KEY(job_id) REFERENCES icon_harvest_jobs(id) ON DELETE RESTRICT
+      );
       CREATE TABLE IF NOT EXISTS automation_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, started_at TEXT NOT NULL,
         ended_at TEXT, status TEXT NOT NULL, settings_json TEXT
@@ -536,6 +573,8 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_currency_history_candidate ON catalog_icon_currency_history(candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_predecessor ON catalog_icon_candidate_lineage(predecessor_candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_successor ON catalog_icon_candidate_lineage(successor_candidate_id,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_jobs_updated ON icon_harvest_jobs(updated_at,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_acquisitions_job ON icon_harvest_acquisitions(job_id,id);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);
@@ -573,6 +612,11 @@ class AutomationDatabase {
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(2,'full-snapshot-compatibility',?)").run(migratedAt);
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(3,'independent-display-icon-decision',?)").run(migratedAt);
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(4,'item-icon-evidence-currency',?)").run(migratedAt);
+    for (const [feature, version] of Object.entries(CURRENT_FEATURE_SCHEMA_VERSIONS)) {
+      this.db.prepare(
+        "INSERT OR IGNORE INTO feature_schema_versions(feature,version,applied_at) VALUES(?,?,?)",
+      ).run(feature, version, migratedAt);
+    }
     this.db.exec(`INSERT OR IGNORE INTO catalog_icon_decisions(
       object_id,selected_candidate_id,revision,selection_origin,updated_at
     )
@@ -603,6 +647,13 @@ class AutomationDatabase {
       migrations: this.db.prepare("SELECT version,name,applied_at FROM schema_migrations ORDER BY version").all().map((row) => ({
         version: Number(row.version),
         name: row.name,
+        appliedAt: row.applied_at,
+      })),
+      featureVersions: this.db.prepare(
+        "SELECT feature,version,applied_at FROM feature_schema_versions ORDER BY feature",
+      ).all().map((row) => ({
+        feature: row.feature,
+        version: Number(row.version),
         appliedAt: row.applied_at,
       })),
     };

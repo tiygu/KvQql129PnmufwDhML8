@@ -29,6 +29,7 @@ const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./run
 const { mergeRelationWaitingForObservation } = require("./catalog-review-state");
 const { canonicalJson } = require("./canonical-json");
 const { CatalogItemQuery } = require("./catalog-item-query");
+const { IconHarvestJobService } = require("./icon-harvest-jobs");
 
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -334,6 +335,10 @@ class AutomationRuntime {
     }
     this.catalogGate = new CatalogReviewGate(this.database);
     this.catalogItemQuery = new CatalogItemQuery(this.database);
+    this.iconHarvestJobs = new IconHarvestJobService({
+      database: this.database,
+      onUpdate: (job) => this.emit("icon-harvest-job-updated", { job }),
+    });
     for (const conflict of this.database.listCatalogConflicts()) {
       this.catalogGate.evaluateObject(conflict.objectType, conflict.objectId);
     }
@@ -378,6 +383,7 @@ class AutomationRuntime {
       isSafeBoundary: () => !this.running && !this.actionBoundaryPending,
       onEvent: (event) => {
         const itemId = String(event.itemId || "");
+        this.iconHarvestJobs.handleAcquisitionEvent(event);
         if (event.type === "icon-acquisition-complete") {
           const rejected = event.candidate?.sourceType === "screenshot-runtime" && event.candidate?.similarity?.qualityGate?.status === "rejected";
           if (rejected) this.iconEvidenceRetryAt.set(itemId, Date.now() + 300_000);
@@ -776,6 +782,75 @@ class AutomationRuntime {
     if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
     this.iconEvidenceRetryAt.delete(String(itemId));
     return this.iconService.request(String(itemId), { itemIdentity: { itemId: String(itemId), ...(object.effectiveValue || object.algorithmCandidate || {}) } });
+  }
+
+  createIconHarvestJob({ scope, idempotencyKey } = {}) {
+    if (scope?.type !== "item" || !String(scope.itemId || "").trim()) {
+      const error = new TypeError("single-item Icon Harvest Job scope is required");
+      error.code = "ICON_HARVEST_SCOPE_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    const itemId = String(scope.itemId);
+    const replay = this.iconHarvestJobs.findByIdempotencyKey(idempotencyKey);
+    if (replay) {
+      if (replay.scope.itemId !== itemId) {
+        const conflict = new Error("Icon Harvest Job idempotency key belongs to another scope");
+        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return { ...replay, idempotentReplay: true };
+    }
+    const object = this.database.getCatalogObject("item-identity", itemId);
+    if (!object) {
+      throw Object.assign(
+        new Error(`catalog object not found: item-identity/${itemId}`),
+        { statusCode: 404 },
+      );
+    }
+    const created = this.iconHarvestJobs.createSingleItem({ itemId, idempotencyKey });
+    if (created.idempotentReplay) {
+      return { ...created.snapshot, idempotentReplay: true };
+    }
+    this.iconEvidenceRetryAt.delete(itemId);
+    let task;
+    try {
+      task = this.iconService.request(itemId, {
+        itemIdentity: {
+          itemId,
+          ...(object.effectiveValue || object.algorithmCandidate || {}),
+        },
+      });
+    } catch (error) {
+      const failed = this.iconHarvestJobs.failToStart(created.snapshot.jobId, error);
+      return {
+        ...failed,
+        idempotentReplay: false,
+        taskId: null,
+      };
+    }
+    this.iconHarvestJobs.trackRunnerTask(created.snapshot.jobId, task.taskId);
+    const snapshot = this.iconHarvestJobs.syncRunnerTask(
+      created.snapshot.jobId,
+      this.iconService.getTask(task.taskId),
+    );
+    if (snapshot?.revision === created.snapshot.revision) {
+      this.iconHarvestJobs.onUpdate?.(snapshot);
+    }
+    return {
+      ...snapshot,
+      idempotentReplay: false,
+      taskId: task.taskId,
+    };
+  }
+
+  listIconHarvestJobs() {
+    return this.iconHarvestJobs.list();
+  }
+
+  getIconHarvestJob(jobId) {
+    return this.iconHarvestJobs.get(jobId);
   }
 
   queueVisibleBoardIconEvidence(state) {

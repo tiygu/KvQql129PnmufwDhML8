@@ -1,0 +1,363 @@
+"use strict";
+
+const crypto = require("node:crypto");
+
+const TERMINAL_CHILD_STATES = new Set([
+  "succeeded",
+  "deferred",
+  "failed",
+  "cancelled",
+]);
+
+function parseJson(value) {
+  return value == null ? null : JSON.parse(value);
+}
+
+function parentState(childState) {
+  if (childState === "succeeded") return "succeeded";
+  if (childState === "deferred") return "completed-with-gaps";
+  if (childState === "failed") return "failed";
+  if (childState === "cancelled") return "cancelled";
+  return childState === "running" ? "running" : "queued";
+}
+
+class IconHarvestJobService {
+  constructor({ database, onUpdate = null } = {}) {
+    if (!database) throw new TypeError("database is required");
+    this.database = database;
+    this.onUpdate = onUpdate;
+    this.jobsByRunnerTask = new Map();
+    this.recoverUnfinished();
+  }
+
+  recoverUnfinished() {
+    const rows = this.database.db.prepare(`
+      SELECT job_id
+      FROM icon_harvest_acquisitions
+      WHERE state IN ('queued','running')
+      ORDER BY created_at,id
+    `).all();
+    for (const row of rows) {
+      this._transition(row.job_id, {
+        state: "deferred",
+        stage: "runtime-restarted",
+        reason: "runtime-restarted",
+        retryable: true,
+        operatorSummary: "运行时已重启，未完成的图标采集已延期，可重新发起任务。",
+        technicalDetails: { reason: "runtime-restarted" },
+        markStarted: false,
+      });
+    }
+    return rows.length;
+  }
+
+  createSingleItem({ itemId, idempotencyKey }) {
+    const normalizedItemId = String(itemId || "").trim();
+    const normalizedKey = String(idempotencyKey || "").trim();
+    if (!normalizedItemId) throw new TypeError("Icon Harvest Job itemId is required");
+    if (!normalizedKey) {
+      const error = new TypeError("Icon Harvest Job idempotencyKey is required");
+      error.code = "ICON_HARVEST_IDEMPOTENCY_KEY_REQUIRED";
+      error.statusCode = 400;
+      throw error;
+    }
+    const existing = this.database.db.prepare(
+      "SELECT id,scope_key FROM icon_harvest_jobs WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (existing) {
+      if (existing.scope_key !== normalizedItemId) {
+        const conflict = new Error("Icon Harvest Job idempotency key belongs to another scope");
+        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return { snapshot: this.get(existing.id), idempotentReplay: true };
+    }
+
+    const now = new Date().toISOString();
+    const jobId = `job_${crypto.randomUUID()}`;
+    const acquisitionId = `acq_${crypto.randomUUID()}`;
+    this.database.transaction(() => {
+      this.database.db.prepare(`INSERT INTO icon_harvest_jobs(
+        id,scope_type,scope_key,idempotency_key,revision,created_at,updated_at
+      ) VALUES(?,?,?,?,1,?,?)`).run(
+        jobId,
+        "item",
+        normalizedItemId,
+        normalizedKey,
+        now,
+        now,
+      );
+      this.database.db.prepare(`INSERT INTO icon_harvest_acquisitions(
+        id,job_id,item_id,state,stage,retryable,created_at,updated_at
+      ) VALUES(?,?,?,'queued','queued',0,?,?)`).run(
+        acquisitionId,
+        jobId,
+        normalizedItemId,
+        now,
+        now,
+      );
+    });
+    return { snapshot: this.get(jobId), idempotentReplay: false };
+  }
+
+  findByIdempotencyKey(idempotencyKey) {
+    const normalizedKey = String(idempotencyKey || "").trim();
+    if (!normalizedKey) return null;
+    const row = this.database.db.prepare(
+      "SELECT id FROM icon_harvest_jobs WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    return row ? this.get(row.id) : null;
+  }
+
+  trackRunnerTask(jobId, runnerTaskId) {
+    const numericTaskId = Number(runnerTaskId);
+    if (!Number.isInteger(numericTaskId)) return;
+    if (!this.jobsByRunnerTask.has(numericTaskId)) {
+      this.jobsByRunnerTask.set(numericTaskId, new Set());
+    }
+    this.jobsByRunnerTask.get(numericTaskId).add(String(jobId));
+  }
+
+  syncRunnerTask(jobId, task) {
+    if (!task || task.status === "queued") return this.get(jobId);
+    if (task.status === "running") {
+      return this._transition(jobId, {
+        state: "running",
+        stage: "resolving",
+      });
+    }
+    if (task.status === "complete") {
+      const result = task.result || {};
+      const snapshot = this._transition(jobId, {
+        state: "succeeded",
+        stage: "committed",
+        result: {
+          candidateId: result.candidate?.id ?? null,
+          assetHash: result.candidate?.assetHash ?? null,
+          provider: result.provider || result.candidate?.sourceType || null,
+          cached: !!result.cached,
+        },
+      });
+      return snapshot;
+    }
+    if (task.status === "deferred") {
+      return this._transition(jobId, {
+        state: "deferred",
+        stage: "waiting-for-safe-boundary",
+        reason: "automation-safe-boundary",
+        retryable: true,
+        operatorSummary: "采集条件暂不可用，可稍后重试。",
+        technicalDetails: { message: task.error || null },
+      });
+    }
+    if (task.status === "error") {
+      return this._transition(jobId, {
+        state: "failed",
+        stage: "failed",
+        reason: "icon-acquisition-failed",
+        retryable: false,
+        operatorSummary: "图标证据提交失败。",
+        technicalDetails: { message: task.error || null },
+      });
+    }
+    return this.get(jobId);
+  }
+
+  handleAcquisitionEvent(event) {
+    const runnerTaskId = Number(event?.taskId);
+    const jobIds = this.jobsByRunnerTask.get(runnerTaskId);
+    if (!Number.isInteger(runnerTaskId) || !jobIds?.size) return [];
+    const snapshots = [];
+    for (const jobId of jobIds) {
+      if (event.type === "icon-acquisition-started") {
+        snapshots.push(this._transition(jobId, {
+          state: "running",
+          stage: event.stage || "resolving",
+        }));
+        continue;
+      }
+      if (event.type === "icon-acquisition-complete") {
+        snapshots.push(this._transition(jobId, {
+          state: "succeeded",
+          stage: "committed",
+          result: {
+            candidateId: event.candidate?.id ?? null,
+            assetHash: event.candidate?.assetHash ?? null,
+            provider: event.provider || event.candidate?.sourceType || null,
+            cached: !!event.cached,
+          },
+        }));
+        continue;
+      }
+      if (event.type === "icon-acquisition-deferred") {
+        snapshots.push(this._transition(jobId, {
+          state: "deferred",
+          stage: event.stage || "deferred",
+          reason: event.reason || event.code || "prerequisite-unavailable",
+          retryable: event.retryable !== false,
+          operatorSummary: event.operatorSummary || "采集条件暂不可用，可稍后重试。",
+          technicalDetails: event.technicalDetails || null,
+        }));
+        continue;
+      }
+      if (event.type === "icon-acquisition-error") {
+        snapshots.push(this._transition(jobId, {
+          state: "failed",
+          stage: event.stage || "failed",
+          reason: event.reason || event.code || "icon-acquisition-failed",
+          retryable: !!event.retryable,
+          operatorSummary: event.operatorSummary || "图标证据提交失败。",
+          technicalDetails: event.technicalDetails || { message: event.error || null },
+        }));
+      }
+    }
+    if (snapshots.some((snapshot) => TERMINAL_CHILD_STATES.has(snapshot?.children?.[0]?.state))) {
+      this.jobsByRunnerTask.delete(runnerTaskId);
+    }
+    return snapshots.filter(Boolean);
+  }
+
+  failToStart(jobId, error) {
+    return this._transition(jobId, {
+      state: "failed",
+      stage: "queued",
+      reason: error?.code || "icon-acquisition-queue-failed",
+      operatorSummary: "任务未能进入采集队列。",
+      technicalDetails: { message: error?.message || String(error) },
+      markStarted: false,
+    });
+  }
+
+  get(jobId) {
+    const job = this.database.db.prepare(
+      "SELECT * FROM icon_harvest_jobs WHERE id=?",
+    ).get(String(jobId));
+    if (!job) return null;
+    const children = this.database.db.prepare(
+      "SELECT * FROM icon_harvest_acquisitions WHERE job_id=? ORDER BY created_at,id",
+    ).all(job.id).map((row) => ({
+      acquisitionId: row.id,
+      itemId: row.item_id,
+      state: row.state,
+      stage: row.stage,
+      reason: row.reason_code || null,
+      retryable: !!row.retryable,
+      operatorSummary: row.operator_summary || null,
+      technicalDetails: parseJson(row.technical_details_json),
+      result: parseJson(row.result_json),
+      createdAt: row.created_at,
+      startedAt: row.started_at || null,
+      completedAt: row.completed_at || null,
+      updatedAt: row.updated_at,
+    }));
+    const terminal = {
+      succeeded: children.filter((child) => child.state === "succeeded").length,
+      deferred: children.filter((child) => child.state === "deferred").length,
+      failed: children.filter((child) => child.state === "failed").length,
+      cancelled: children.filter((child) => child.state === "cancelled").length,
+    };
+    const settled = Object.values(terminal).reduce((sum, count) => sum + count, 0);
+    const child = children[0];
+    const state = parentState(child?.state || "queued");
+    return {
+      jobId: job.id,
+      revision: Number(job.revision),
+      scope: { type: job.scope_type, itemId: job.scope_key },
+      state,
+      finalStatus: TERMINAL_CHILD_STATES.has(child?.state) ? state : null,
+      stage: child?.stage || "queued",
+      reason: child?.reason || null,
+      progress: {
+        settled,
+        total: children.length,
+        terminal,
+      },
+      children,
+      createdAt: job.created_at,
+      startedAt: job.started_at || null,
+      completedAt: job.completed_at || null,
+      updatedAt: job.updated_at,
+    };
+  }
+
+  list() {
+    return this.database.db.prepare(
+      "SELECT id FROM icon_harvest_jobs ORDER BY created_at DESC,id DESC",
+    ).all().map((row) => this.get(row.id));
+  }
+
+  publish(jobId) {
+    const snapshot = this.get(jobId);
+    if (snapshot) this.onUpdate?.(snapshot);
+    return snapshot;
+  }
+
+  _transition(jobId, {
+    state,
+    stage,
+    reason = null,
+    retryable = false,
+    operatorSummary = null,
+    technicalDetails = null,
+    result = null,
+    markStarted = true,
+  }) {
+    const now = new Date().toISOString();
+    const changed = this.database.transaction(() => {
+      const child = this.database.db.prepare(
+        "SELECT * FROM icon_harvest_acquisitions WHERE job_id=?",
+      ).get(String(jobId));
+      if (!child || TERMINAL_CHILD_STATES.has(child.state)) return false;
+      const terminal = TERMINAL_CHILD_STATES.has(state);
+      this.database.db.prepare(`UPDATE icon_harvest_acquisitions SET
+        state=?,stage=?,reason_code=?,retryable=?,operator_summary=?,
+        technical_details_json=?,result_json=?,
+        started_at=COALESCE(started_at,?),
+        completed_at=CASE WHEN ? THEN ? ELSE completed_at END,
+        updated_at=?
+        WHERE id=?`).run(
+        state,
+        stage,
+        reason,
+        retryable ? 1 : 0,
+        operatorSummary,
+        technicalDetails == null ? null : JSON.stringify(technicalDetails),
+        result == null ? null : JSON.stringify(result),
+        markStarted ? now : null,
+        terminal ? 1 : 0,
+        now,
+        now,
+        child.id,
+      );
+      this.database.db.prepare(`UPDATE icon_harvest_jobs SET
+        revision=revision+1,
+        started_at=COALESCE(started_at,?),
+        completed_at=CASE WHEN ? THEN ? ELSE completed_at END,
+        updated_at=?
+        WHERE id=?`).run(
+        markStarted ? now : null,
+        terminal ? 1 : 0,
+        now,
+        now,
+        String(jobId),
+      );
+      return true;
+    });
+    if (!changed) return this.get(jobId);
+    const snapshot = this.publish(jobId);
+    if (TERMINAL_CHILD_STATES.has(snapshot?.children?.[0]?.state)) {
+      for (const [runnerTaskId, jobIds] of this.jobsByRunnerTask.entries()) {
+        jobIds.delete(String(jobId));
+        if (!jobIds.size) this.jobsByRunnerTask.delete(runnerTaskId);
+      }
+    }
+    return snapshot;
+  }
+}
+
+module.exports = {
+  IconHarvestJobService,
+  TERMINAL_CHILD_STATES,
+  parentState,
+};

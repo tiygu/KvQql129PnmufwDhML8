@@ -41,6 +41,30 @@ export type CatalogItemQueryPage = {
   items: any[];
   selectionInResults?: boolean;
 };
+export type IconHarvestJobSnapshot = {
+  jobId: string;
+  revision: number;
+  scope: { type: "item"; itemId: string };
+  state: "queued" | "running" | "succeeded" | "completed-with-gaps" | "failed" | "cancelled";
+  finalStatus: "succeeded" | "completed-with-gaps" | "failed" | "cancelled" | null;
+  stage: string;
+  reason: string | null;
+  progress: {
+    settled: number;
+    total: number;
+    terminal: {
+      succeeded: number;
+      deferred: number;
+      failed: number;
+      cancelled: number;
+    };
+  };
+  children: any[];
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  updatedAt: string;
+};
 
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
@@ -150,6 +174,16 @@ export const controlApi = {
   importCatalog: (snapshot: any) => post("/api/catalog/import", snapshot),
   acquireCatalogIcon: (objectId: string) => post("/api/catalog/icon/acquire", { objectId }),
   getCatalogIconTask: (taskId: number) => request(`/api/catalog/icon/task?id=${encodeURIComponent(taskId)}`),
+  createIconHarvestJob: (itemId: string, idempotencyKey: string) => post(
+    "/api/catalog/icon-harvest-jobs",
+    { scope: { type: "item", itemId }, idempotencyKey },
+  ) as Promise<IconHarvestJobSnapshot & { idempotentReplay: boolean; taskId?: number }>,
+  listIconHarvestJobs: () => request<{ jobs: IconHarvestJobSnapshot[] }>(
+    "/api/catalog/icon-harvest-jobs",
+  ),
+  getIconHarvestJob: (jobId: string) => request<IconHarvestJobSnapshot>(
+    `/api/catalog/icon-harvest-jobs/${encodeURIComponent(jobId)}`,
+  ),
   selectCatalogIcon: (input: any) => post("/api/catalog/icon/select", input),
   revokeCatalogIcon: (input: any) => post("/api/catalog/icon/revoke", input),
   uploadCatalogIcon: (input: any) => post("/api/catalog/icon/upload", input),

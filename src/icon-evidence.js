@@ -11,6 +11,15 @@ const { writeContentAddressedIcon } = require("./icon-cache");
 
 const ICON_RECONSTRUCTION_VERSION = 2;
 
+function cleanupUncommittedAsset(database, asset) {
+  if (!asset?.filePath || database.getIconAsset(asset.hash)) return;
+  try {
+    fs.unlinkSync(asset.filePath);
+  } catch (_) {
+    // The database transaction remains authoritative if cleanup races with a cache reader.
+  }
+}
+
 function runIconWorker(input) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(path.join(__dirname, "icon-image-worker.js"), { workerData: input });
@@ -237,7 +246,32 @@ class IconEvidenceService {
       const task = this.pending.shift();
       this.active += 1;
       task.status = "running";
-      this._run(task).then((result) => { task.status = "complete"; task.result = result; }, (error) => { const deferred = error.code === "ICON_ACQUISITION_DEFERRED" || (error.name === "AbortError" && !this.isSafeBoundary()); task.status = deferred ? "deferred" : "error"; task.error = error.message; if (!deferred) this.onEvent?.({ type: "icon-acquisition-error", itemId: task.itemId, taskId: task.id, error: error.message }); })
+      this.onEvent?.({
+        type: "icon-acquisition-started",
+        itemId: task.itemId,
+        taskId: task.id,
+        stage: "resolving",
+      });
+      this._run(task).then((result) => { task.status = "complete"; task.result = result; }, (error) => {
+        const deferred = error.code === "ICON_ACQUISITION_DEFERRED"
+          || (error.name === "AbortError" && !this.isSafeBoundary());
+        task.status = deferred ? "deferred" : "error";
+        task.error = error.message;
+        this.onEvent?.({
+          type: deferred ? "icon-acquisition-deferred" : "icon-acquisition-error",
+          itemId: task.itemId,
+          taskId: task.id,
+          error: error.message,
+          code: error.code || null,
+          reason: deferred ? "automation-safe-boundary" : error.code || "icon-acquisition-failed",
+          stage: deferred ? "waiting-for-safe-boundary" : "failed",
+          retryable: deferred,
+          technicalDetails: {
+            message: error.message,
+            code: error.code || null,
+          },
+        });
+      })
         .finally(() => { this.active -= 1; this.inFlight.delete(task.itemId); while (this.tasks.size > 256) { const oldest = this.tasks.entries().next().value; if (!oldest || ["queued", "running"].includes(oldest[1].status)) break; this.tasks.delete(oldest[0]); } this._drain(); if (!this.active && !this.pending.length) this.idleWaiters.splice(0).forEach((resolve) => resolve()); });
     }
   }
@@ -292,11 +326,18 @@ class IconEvidenceService {
       throw error;
     }
     const asset = await this.processImage({ resourceBody: resource.body, metadata: { ...metadata, mimeType: resource.mimeType || metadata.mimeType }, cacheDir: this.cacheDir });
-    const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
-      itemId: task.itemId, cacheKey, sourceType: "cocos-runtime-resource", resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
-      runtimeIdentifier: metadata.runtimeIdentifier || null, textureUuid: metadata.textureUuid || null, crop,
-      rankScore: 1, asset,
-    });
+    let candidate;
+    let decisionChange;
+    try {
+      ({ candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
+        itemId: task.itemId, cacheKey, sourceType: "cocos-runtime-resource", resourceUrl: resource.resolvedUrl || metadata.resourceUrl,
+        runtimeIdentifier: metadata.runtimeIdentifier || null, textureUuid: metadata.textureUuid || null, crop,
+        rankScore: 1, asset,
+      }));
+    } catch (error) {
+      cleanupUncommittedAsset(this.database, asset);
+      throw error;
+    }
     this.onEvent?.({
       type: "icon-acquisition-complete",
       itemId: task.itemId,
@@ -342,10 +383,17 @@ class IconEvidenceService {
       && Number(processed.crop.backgroundRemoval?.foreground?.largestComponentFraction || 0) < 0.5) qualityReasons.push("foreground-fragmented");
     if (targets.some((target) => target.captureEligibility === "transformed-board-item")) qualityReasons.push("transformed-board-item");
     const qualityGate = { status: qualityReasons.length ? "rejected" : "eligible", reasons: qualityReasons, stability };
-    const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
-      itemId: task.itemId, cacheKey, sourceType: "screenshot-runtime", runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds", crop,
-      similarity: { ...processed.similarity, qualityGate }, rankScore: 0.5 + stability * 0.3, autoSelect: qualityGate.status === "eligible", asset: processed.asset,
-    });
+    let candidate;
+    let decisionChange;
+    try {
+      ({ candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
+        itemId: task.itemId, cacheKey, sourceType: "screenshot-runtime", runtimeIdentifier: processed.crop.runtimeSource || "runtime-bounds", crop,
+        similarity: { ...processed.similarity, qualityGate }, rankScore: 0.5 + stability * 0.3, autoSelect: qualityGate.status === "eligible", asset: processed.asset,
+      }));
+    } catch (error) {
+      cleanupUncommittedAsset(this.database, processed.asset);
+      throw error;
+    }
     this.onEvent?.({
       type: "icon-acquisition-complete",
       itemId: task.itemId,
