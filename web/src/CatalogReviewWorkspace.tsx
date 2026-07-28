@@ -3,6 +3,7 @@ import { AlertTriangle, Check, ChevronLeft, ChevronRight, History, Image, Pause,
 import { CatalogWorkspaceCommands, type CatalogWorkspaceCommand } from "./catalog-workspace-commands";
 import { controlApi } from "./control-api";
 import { ImageLightbox } from "./ImageLightbox";
+import { CatalogItemDirectory } from "./catalog-item-directory";
 
 const reviewReasonMetadata: Record<string, { label: string; explanation: string }> = {
   "new-observation": {
@@ -459,7 +460,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
   };
 
   useEffect(() => { loadDetail(); }, [selectedSummary?.objectType, selectedSummary?.objectId, selectedSummary?.revision]);
-  useEffect(() => { if (focusObject) setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`); }, [focusObject?.objectType, focusObject?.objectId]);
+  useEffect(() => {
+    if (!focusObject) return;
+    setSelectedKey(`${focusObject.objectType}:${focusObject.objectId}`);
+  }, [focusObject?.objectType, focusObject?.objectId]);
   useEffect(() => {
     const commandRevision = Number(repository?.reviewSession?.commandRevision) || 0;
     let appliedRevision = 0;
@@ -1030,9 +1034,28 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
     onUnavailable: setMessage,
   });
 
+  const directoryObjects = repository?.objects || [];
+  const directoryRefreshRevision = useMemo(
+    () => JSON.stringify(directoryObjects.map((entry: any) => [
+      entry.objectType,
+      entry.objectId,
+      entry.revision,
+      entry.updatedAt,
+      entry.status,
+      entry.disposition,
+    ])),
+    [directoryObjects],
+  );
+
   return <>
     {lightboxSrc && <ImageLightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />}
-    <section className="catalog-review-workspace">
+    <CatalogItemDirectory
+      itemIdentityCount={directoryObjects.filter((entry: any) => entry.objectType === "item-identity").length}
+      refreshRevision={directoryRefreshRevision}
+      pendingCount={queue.length}
+      forcePendingKey={focusObject ? `${focusObject.objectType}:${focusObject.objectId}` : null}
+      onEnterSemanticReview={(itemId) => setSelectedKey(`item-identity:${itemId}`)}
+    >
       <div className="panel review-queue">
         <div className="panel-head"><div><span className="eyebrow">语义审核</span><h2>待裁定对象</h2></div><b>{queue.length}</b></div>
         <p className="review-help">这里只显示会影响条目生效或需要人工取舍的原因。图标待补等完整性缺口放在“以后再看”，不影响当前规划。</p>
@@ -1189,7 +1212,10 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
                     {(advancedJsonPreview.planningImpact?.relations || []).map((relation: any) => <span key={relation.objectId}>{relation.sourceLabel} × 2 → {relation.targetLabel}</span>)}
                   </section>
                   <p>再次确认将提交整个对象快照、生成 Catalog Audit Summary 并立即重新规划。</p>
-                  <div><MutationButton command={commands.semantic(() => completeReview("modify", advancedJsonPreview.snapshot))}>确认提交完整快照</MutationButton><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
+                  <div><MutationButton command={commands.semantic(() => completeReview(
+                    "modify",
+                    advancedJsonPreview.snapshot,
+                  ))}>确认提交完整快照</MutationButton><button className="ghost-btn" disabled={busy} onClick={() => setAdvancedJsonPreview(null)}>返回继续编辑</button></div>
                 </div>}
               </div>}
             <div className="field-table"><div className="field-row head"><span>字段</span><span>生效值</span><span>算法候选</span><span>人工值</span></div>{fields.map((field) => <div className="field-row" key={field}><strong>{fieldLabel(field)}</strong><span>{display(detail.effectiveValue?.[field])}</span><span>{display(detail.algorithmCandidate?.[field])}</span><span>{display(detail.humanValues?.[field]?.value)}</span></div>)}</div>
@@ -1231,6 +1257,6 @@ export function CatalogReviewWorkspace({ repository, onChanged, onContinueAutoma
           </details>
         </>}
       </div>
-    </section>
+    </CatalogItemDirectory>
   </>;
 }

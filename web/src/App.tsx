@@ -119,7 +119,10 @@ async function waitForCatalogIconTask(taskId: number) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(() => {
+    try { return new URLSearchParams(globalThis.location?.search || "").has("itemId") ? "catalog" : "overview"; }
+    catch (_) { return "overview"; }
+  });
   const [data, setData] = useState<any>(demo);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("正在等待 CDP 连接");

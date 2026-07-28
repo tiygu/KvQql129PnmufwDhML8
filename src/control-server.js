@@ -6,6 +6,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { MAX_ACTIVE_CATALOG_SCAN_TARGETS } = require("./catalog-scan");
 const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
+const { CatalogItemQuery } = require("./catalog-item-query");
 const WebSocket = require("ws");
 
 const WS_PATH = "/ws";
@@ -142,6 +143,13 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "GET /api/health") return writeJson(res, 200, { ok: true, wsPath: WS_PATH });
       if (route === "GET /api/dashboard") return writeJson(res, 200, await dashboard());
       if (route === "GET /api/catalog") return writeJson(res, 200, runtime.getCatalogView());
+      if (route === "GET /api/catalog/items") {
+        return writeJson(res, 200, runtime.listCatalogItems(CatalogItemQuery.fromSearchParams(requestUrl.searchParams)));
+      }
+      const catalogItemMatch = /^\/api\/catalog\/items\/([^/]+)$/.exec(requestUrl.pathname);
+      if ((req.method || "GET") === "GET" && catalogItemMatch) {
+        return writeJson(res, 200, runtime.getCatalogItem(decodeURIComponent(catalogItemMatch[1])));
+      }
       if (route === "GET /api/catalog/release-control") return writeJson(res, 200, runtime.getCatalogReleaseStatus());
       if (route === "POST /api/catalog/release-control") {
         const body = await readJson(req);
@@ -350,6 +358,10 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (error?.currentObject) payload.currentObject = error.currentObject;
       if (error?.currentDisplayIcon) payload.currentDisplayIcon = error.currentDisplayIcon;
       if (error?.meaningfulDifferences) payload.meaningfulDifferences = error.meaningfulDifferences;
+      if (error?.catalogQueryRevision) payload.catalogQueryRevision = error.catalogQueryRevision;
+      if (error?.itemId) payload.itemId = error.itemId;
+      if (error?.minimum) payload.minimum = error.minimum;
+      if (error?.maximum) payload.maximum = error.maximum;
       writeJson(res, error?.statusCode || 500, payload);
     }
   });

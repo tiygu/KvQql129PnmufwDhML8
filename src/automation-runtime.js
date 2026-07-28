@@ -28,6 +28,7 @@ const { unknownWarehouseInventoryKnowledge } = require("./warehouse-domain");
 const { CdpRuntimeControlAdapter, LegacyRuntimeControlAdapter } = require("./runtime-control-bridge");
 const { mergeRelationWaitingForObservation } = require("./catalog-review-state");
 const { canonicalJson } = require("./canonical-json");
+const { CatalogItemQuery } = require("./catalog-item-query");
 
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -332,6 +333,7 @@ class AutomationRuntime {
       throw empty;
     }
     this.catalogGate = new CatalogReviewGate(this.database);
+    this.catalogItemQuery = new CatalogItemQuery(this.database);
     for (const conflict of this.database.listCatalogConflicts()) {
       this.catalogGate.evaluateObject(conflict.objectType, conflict.objectId);
     }
@@ -506,6 +508,14 @@ class AutomationRuntime {
       : cacheKey;
     this.catalogViewCache.set(resolvedCacheKey, result);
     return result;
+  }
+
+  listCatalogItems(input = {}) {
+    return this.catalogItemQuery.list(input);
+  }
+
+  getCatalogItem(itemId) {
+    return this.catalogItemQuery.detail(itemId);
   }
 
   projectCatalogReviewQueue(reviewQueue) {

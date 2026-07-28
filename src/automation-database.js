@@ -1923,6 +1923,42 @@ class AutomationDatabase {
     return crypto.createHash("sha256").update(canonicalJson({ objects, conflicts, productionDistributions, iconCandidates })).digest("hex");
   }
 
+  getCatalogQueryRevision() {
+    const objects = this.db.prepare(`SELECT object_type,object_id,status,disposition,revision,
+      candidate_version_id,active_version_id,updated_at
+      FROM catalog_repository_objects ORDER BY object_type,object_id`).all();
+    const conflicts = this.db.prepare(`SELECT object_type,object_id,conflict_type,fingerprint,status
+      FROM catalog_repository_conflicts ORDER BY object_type,object_id,conflict_type,fingerprint`).all();
+    const iconCandidates = this.db.prepare(`SELECT object.object_id,candidate.id,candidate.asset_hash,
+      candidate.source_type,candidate.currency_status,candidate.currency_reason,
+      candidate.resource_url,candidate.runtime_identifier,candidate.rank_score,
+      candidate.created_at,
+      decision.revision AS decision_revision,decision.selected_candidate_id,
+      decision.selection_origin
+      FROM catalog_icon_candidates candidate
+      JOIN catalog_repository_objects object ON object.id=candidate.object_id
+      LEFT JOIN catalog_icon_decisions decision ON decision.object_id=candidate.object_id
+      ORDER BY object.object_id,candidate.id`).all();
+    const iconDecisions = this.db.prepare(`SELECT object.object_id,decision.revision,
+      decision.selected_candidate_id,decision.selection_origin
+      FROM catalog_icon_decisions decision
+      JOIN catalog_repository_objects object ON object.id=decision.object_id
+      ORDER BY object.object_id`).all();
+    const iconLineage = this.db.prepare(`SELECT predecessor_candidate_id,successor_candidate_id,
+      relation,reason,created_at FROM catalog_icon_candidate_lineage
+      ORDER BY predecessor_candidate_id,successor_candidate_id`).all();
+    const iconAssets = this.db.prepare(`SELECT hash,mime_type,width,height,byte_size,file_path
+      FROM catalog_icon_assets ORDER BY hash`).all();
+    return crypto.createHash("sha256").update(canonicalJson({
+      objects,
+      conflicts,
+      iconCandidates,
+      iconDecisions,
+      iconLineage,
+      iconAssets,
+    })).digest("hex");
+  }
+
   upsertTheoreticalProductionDistribution({ producerItemId, modeId, theoreticalDistribution, observedAt = new Date().toISOString() }) {
     const producer = String(producerItemId || ""), mode = String(modeId || "");
     if (!producer || !mode) throw new TypeError("producerItemId and modeId are required");

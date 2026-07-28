@@ -78,6 +78,15 @@ async function exportCatalog() {
 export const controlApi = {
   getDashboard: () => request("/api/dashboard"),
   getCatalog: () => request("/api/catalog"),
+  getCatalogItems: (input: { query?: string; scope?: "all" | "pending"; pageSize?: number; cursor?: string | null } = {}) => {
+    const search = new URLSearchParams();
+    if (input.query) search.set("q", input.query);
+    if (input.scope) search.set("scope", input.scope);
+    if (input.pageSize != null) search.set("pageSize", String(input.pageSize));
+    if (input.cursor) search.set("cursor", input.cursor);
+    return request(`/api/catalog/items?${search.toString()}`);
+  },
+  getCatalogItem: (itemId: string) => request(`/api/catalog/items/${encodeURIComponent(itemId)}`),
   getCatalogObject: (objectType: string, objectId: string) => request(`/api/catalog/object?type=${encodeURIComponent(objectType)}&id=${encodeURIComponent(objectId)}`),
   previewCatalogReview: (input: any) => post("/api/catalog/review/preview", input),
   skipCatalogReview: (input: any) => post("/api/catalog/review/skip", input),
