@@ -1536,6 +1536,7 @@ class AutomationRuntime {
 
   async startIdle(options = {}) {
     if (this.running || this.actionBoundaryPending) throw new Error("automation task is already running");
+    this.iconService.interruptForAutomation();
     const settings = { ...this.getSettings(), ...options, mode: options.mode === "observation" ? "assisted" : options.mode || "assisted" };
     this.running = true;
     this.sessionKind = "idle";
@@ -1587,6 +1588,7 @@ class AutomationRuntime {
 
   startIdleInBackground(options = {}) {
     if (this.activeRunPromise || this.running) return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
+    this.iconService.interruptForAutomation();
     this.activeRunPromise = new Promise((resolve) => setImmediate(resolve))
       .then(() => this.startIdle(options))
       .then((result) => { this.emit("automation-complete", { result }); return result; })

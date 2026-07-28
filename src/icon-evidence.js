@@ -329,6 +329,7 @@ class IconEvidenceService {
     const prioritizedCandidates = [...allCandidates.filter((candidate) => candidate.selected), ...allCandidates.slice(-12)];
     const comparisonCandidates = [...new Map(prioritizedCandidates.map((candidate) => [candidate.id, candidate])).values()].slice(0, 12);
     const processed = await this.processScreenshot({ frames, targets, cacheDir: this.cacheDir, comparisonCandidates });
+    this._assertSafeBoundary();
     const crop = { provider: "runtime-screenshot", ...processed.crop, exactProviderError: exactError.message };
     const cacheKey = crypto.createHash("sha256").update(canonicalJson({ itemId: task.itemId, assetHash: processed.asset.hash, bounds: crop.bounds, viewport: crop.viewport })).digest("hex");
     const stability = processed.similarity.frameSelection.acceptedFrameIndexes.length / frames.length;
