@@ -66,6 +66,26 @@ test("完整循环把已采集状态传给订单循环而不立即重复读取",
   assert.equal(received, state);
 });
 
+test("完整循环把已生成计划传给订单循环而不立即重复规划", async () => {
+  const state = { scene: "board", mapMission: { canComplete: false }, marker: "fresh-state" };
+  const plan = { recommended: { slot: "a" }, plans: [{ slot: "a" }] };
+  let received = null;
+  const loop = new FullAutomationLoop({
+    collectState: async () => state,
+    navigate: async () => ({ ok: true }),
+    completeMapMission: async () => ({ ok: true }),
+    runOrderCycle: async (options) => {
+      received = options.initialPlan;
+      return { ok: true, reason: "waiting-no-feasible-order", actions: [] };
+    },
+  });
+
+  const result = await loop.run({ execute: true, initialState: state, initialPlan: plan });
+
+  assert.equal(result.reason, "waiting-no-feasible-order");
+  assert.equal(received, plan);
+});
+
 test("导航失败会保留转场前后状态和原生动作供日志诊断", async () => {
   const before = { mapVisible: true, boardVisible: false };
   const after = { mapVisible: true, boardVisible: false };

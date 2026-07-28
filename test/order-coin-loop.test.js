@@ -21,6 +21,26 @@ test("订单循环首步复用调用方提供的实时状态", async () => {
   assert.equal(collections, 0);
 });
 
+test("订单循环首步复用调用方提供的实时计划", async () => {
+  const initialState = { resources: { energy: 10 }, board: { empty: 3, mergeCandidates: [] }, orders: [] };
+  const initialPlan = { plans: [], recommended: null, boundaryReason: "no-feasible-order", warehouseStoreCandidates: [] };
+  let replans = 0;
+  const loop = new OrderCoinLoop({
+    collectState: async () => initialState,
+    planOrders: async () => {
+      replans += 1;
+      throw new Error("first step must reuse initial plan");
+    },
+    runBoardAction: async () => ({ ok: true }),
+    submitOrder: async () => ({ ok: true }),
+  });
+
+  const result = await loop.run({ execute: true, initialState, initialPlan });
+
+  assert.equal(result.reason, "waiting-no-feasible-order");
+  assert.equal(replans, 0);
+});
+
 test("可执行棋盘合成优先于无关的仓库库存加载请求", async () => {
   const state = {
     resources: { energy: 10 },

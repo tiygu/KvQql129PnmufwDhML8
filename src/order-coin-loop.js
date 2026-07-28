@@ -133,13 +133,14 @@ class OrderCoinLoop {
     return { continue: true };
   }
 
-  async run({ execute = false, maxActions = null, signal = null, initialState = null } = {}) {
+  async run({ execute = false, maxActions = null, signal = null, initialState = null, initialPlan = null } = {}) {
     const requestedLimit = Number(maxActions);
     const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
       ? Math.max(1, Math.floor(requestedLimit))
       : Infinity;
     const actions = [];
     let nextState = initialState;
+    let nextPlan = initialPlan;
     for (let step = 0; step < limit; step += 1) {
       if (signal?.aborted) return { ok: false, executed: execute, reason: "aborted", targetSlot: this.targetSlot, actions };
       const state = nextState || await this.collectState(signal);
@@ -148,7 +149,8 @@ class OrderCoinLoop {
       if (Number.isFinite(energy) && energy <= this.minEnergy) {
         return { ok: true, executed: execute, reason: "energy-depleted", targetSlot: this.targetSlot, actions, state };
       }
-      const plan = await this.planOrders(state);
+      const plan = nextPlan || await this.planOrders(state);
+      nextPlan = null;
       const actionContext = { hasMergeCandidate: (state.board?.mergeCandidates || []).length > 0 };
       const actionable = (candidate) => isPlanActionable(candidate, actionContext);
       const lockedTarget = this.targetSlot == null ? null : plan.plans.find((item) => String(item.slot) === this.targetSlot);
