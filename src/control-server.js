@@ -299,7 +299,12 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "POST /api/catalog/icon/select") {
         const body = await readJson(req);
         if (!body.objectId || !Number.isInteger(Number(body.candidateId)) || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-selection-request" });
-        const object = runtime.selectCatalogIcon(String(body.objectId), Number(body.candidateId), { actor: body.actor, note: body.note, expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision) });
+        const object = runtime.selectCatalogIcon(String(body.objectId), Number(body.candidateId), {
+          actor: body.actor,
+          note: body.note,
+          confirmStale: body.confirmStale === true,
+          expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision),
+        });
         publishCatalogQueryRevisionIfChanged();
         return writeJson(res, 200, object);
       }
@@ -307,6 +312,13 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         const body = await readJson(req);
         if (!body.objectId || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-revoke-request" });
         const object = runtime.revokeCatalogIconSelection(String(body.objectId), { actor: body.actor, note: body.note, expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision) });
+        publishCatalogQueryRevisionIfChanged();
+        return writeJson(res, 200, object);
+      }
+      if (route === "POST /api/catalog/icon/automatic") {
+        const body = await readJson(req);
+        if (!body.objectId || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-automatic-request" });
+        const object = runtime.returnCatalogIconSelectionToAutomatic(String(body.objectId), { actor: body.actor, note: body.note, expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision) });
         publishCatalogQueryRevisionIfChanged();
         return writeJson(res, 200, object);
       }

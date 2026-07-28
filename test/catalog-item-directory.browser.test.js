@@ -159,7 +159,10 @@ test("Catalog Review Workspace 明确切换全部物品且只在显式选择后�
     assert.equal(await page.locator(".catalog-directory-detail .panel-head small").innerText(), firstDetail.summary.itemId);
     assert.equal(await page.locator(".directory-facts").getByText(String(firstDetail.identity.effectiveFacts.level)).count(), 1);
     assert.match(page.url(), /[?&]itemId=browser-directory-one(?:&|$)/);
-    assert.equal(await page.locator(".catalog-directory-detail input, .catalog-directory-detail textarea").count(), 0);
+    assert.equal(await page.locator(
+      '.catalog-directory-detail input:not([aria-label="Display icon operator"]):not([aria-label="Display icon reason"]), .catalog-directory-detail textarea',
+    ).count(), 0);
+    assert.equal(await page.locator(".display-icon-decision-form input").count(), 2);
 
     await page.reload({ waitUntil: "networkidle" });
     await page.getByRole("heading", { name: "浏览花一" }).waitFor();
@@ -183,6 +186,146 @@ test("Catalog Review Workspace 明确切换全部物品且只在显式选择后�
     await server.close();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("Item Identity detail manages grouped display icon evidence without changing semantic identity", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-icons-browser-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  activateIdentity(runtime, "display-icon-browser", "Display Icon Browser", 4);
+  const saveCandidate = ({ cacheKey, sourceType, hash, rankScore }) => {
+    const filePath = path.join(dataDir, `${cacheKey}.png`);
+    fs.writeFileSync(filePath, cacheKey);
+    return runtime.database.saveIconCandidate({
+      itemId: "display-icon-browser",
+      cacheKey,
+      sourceType,
+      rankScore,
+      autoSelect: false,
+      asset: {
+        hash,
+        mimeType: "image/png",
+        width: 2,
+        height: 3,
+        byteSize: fs.statSync(filePath).size,
+        filePath,
+      },
+    });
+  };
+  const eligible = saveCandidate({
+    cacheKey: "eligible",
+    sourceType: "user-upload",
+    hash: "d".repeat(64),
+    rankScore: 10,
+  });
+  const stale = saveCandidate({
+    cacheKey: "stale",
+    sourceType: "unknown-legacy-source",
+    hash: "e".repeat(64),
+    rankScore: 30,
+  });
+  const predecessor = saveCandidate({
+    cacheKey: "predecessor",
+    sourceType: "user-upload",
+    hash: "f".repeat(64),
+    rankScore: 40,
+  });
+  runtime.database.db.prepare(`INSERT INTO catalog_icon_candidate_lineage(
+    predecessor_candidate_id,successor_candidate_id,relation,reason,created_at
+  ) VALUES(?,?,?,?,?)`).run(
+    predecessor.id,
+    eligible.id,
+    "replaced-by",
+    "clearer current candidate",
+    new Date().toISOString(),
+  );
+  fs.rmSync(stale.filePath);
+  const semanticRevision = runtime.database.getCatalogObject(
+    "item-identity",
+    "display-icon-browser",
+  ).revision;
+  const fixture = await createBrowserDirectoryFixture(
+    runtime,
+    dataDir,
+    { width: 1440, height: 1000 },
+  );
+  const { page, port } = fixture;
+  let acquisitionRequests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/catalog/icon/acquire") {
+      acquisitionRequests += 1;
+    }
+  });
+
+  try {
+    await page.goto(
+      `http://127.0.0.1:${port}/?itemId=display-icon-browser`,
+      { waitUntil: "networkidle" },
+    );
+    await page.getByRole("button", { name: "图鉴", exact: true }).click();
+    await page.getByRole("heading", { name: "Display Icon Browser" }).waitFor();
+
+    await page.getByRole("heading", { name: "Current Display" }).waitFor();
+    await page.getByRole("heading", { name: "Eligible Candidates" }).waitFor();
+    await page.getByRole("heading", { name: "Historical Evidence" }).waitFor();
+    assert.equal(await page.locator(
+      `.display-icon-candidate[data-candidate-id="${eligible.id}"]`,
+    ).getByText("Currency: current").count(), 1);
+    assert.equal(await page.locator(
+      `.display-icon-candidate[data-candidate-id="${predecessor.id}"]`,
+    ).getByText("Lineage: superseded").count(), 1);
+    assert.equal(await page.locator(
+      `.display-icon-candidate[data-candidate-id="${stale.id}"]`,
+    ).getByText("Currency: stale").count(), 1);
+
+    await page.getByLabel("Display icon operator").fill("browser-operator");
+    await page.getByLabel("Display icon reason").fill("recognizable historical artwork");
+    await page.getByRole("button", { name: `Select candidate ${stale.id}` }).click();
+    const staleConfirmation = page.getByRole("alertdialog", {
+      name: "Confirm stale icon selection",
+    });
+    await staleConfirmation.waitFor();
+    assert.equal(
+      await page.locator(".display-icon-current .display-icon-candidate").count(),
+      0,
+    );
+    await staleConfirmation.getByRole("button", { name: "Confirm stale selection" }).click();
+    await page.locator(
+      `.display-icon-current .display-icon-candidate[data-candidate-id="${stale.id}"]`,
+    ).waitFor();
+    await page.getByRole("alert").getByText(
+      "The manual display choice is preserved, but its image asset is unavailable.",
+    ).waitFor();
+
+    await page.getByLabel("Display icon reason").fill("leave a protected empty display");
+    await page.getByRole("button", { name: "Revoke to protected empty" }).click();
+    await page.getByRole("status").getByText(
+      "Protected empty: automatic candidates will not fill this display.",
+      { exact: true },
+    ).waitFor();
+
+    await page.getByLabel("Display icon reason").fill("resume automatic display selection");
+    await page.getByRole("button", { name: "Return to automatic" }).click();
+    await page.locator(
+      `.display-icon-current .display-icon-candidate[data-candidate-id="${eligible.id}"]`,
+    ).waitFor();
+    assert.equal(acquisitionRequests, 0);
+
+    const audit = page.getByText("Display Icon Selection audit");
+    await audit.click();
+    await page.getByText("manual-select-stale-confirmed", { exact: true }).waitFor();
+    await page.getByText("manual-revoke", { exact: true }).waitFor();
+    await page.getByText("automatic-control-return", { exact: true }).waitFor();
+    const semanticAfter = await page.evaluate(async () =>
+      fetch("/api/catalog/object?type=item-identity&id=display-icon-browser")
+        .then((response) => response.json()));
+    assert.equal(semanticAfter.revision, semanticRevision);
+  } finally {
+    await fixture.close();
   }
 });
 
@@ -274,7 +417,7 @@ test("complete-directory controls preserve server order and restore pending quer
 
   try {
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
-    await page.getByRole("button", { name: "图鉴" }).click();
+    await page.getByRole("button", { name: "图鉴", exact: true }).click();
 
     const pendingScope = page.getByRole("button", { name: /待处理/ });
     const allScope = page.getByRole("button", { name: /全部物品/ });
@@ -435,7 +578,9 @@ test("relationship history restores query, pagination, list scroll, and keyboard
     const targetHeading = page.getByRole("heading", { name: "History Item Target" });
     await targetHeading.waitFor();
     await page.locator("[data-selection-status=\"out-of-results\"]").waitFor();
-    assert.equal(await page.locator(".catalog-directory-detail input, .catalog-directory-detail textarea").count(), 0);
+    assert.equal(await page.locator(
+      '.catalog-directory-detail input:not([aria-label="Display icon operator"]):not([aria-label="Display icon reason"]), .catalog-directory-detail textarea',
+    ).count(), 0);
     assert.equal(await targetHeading.evaluate((element) => element === document.activeElement), true);
     assert.equal(await list.evaluate((element) => element.scrollTop), originalScrollTop);
 

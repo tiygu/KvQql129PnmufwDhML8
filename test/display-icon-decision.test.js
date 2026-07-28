@@ -177,3 +177,54 @@ test("旧候选选择在当前 Schema 中回填展示图标决定", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("stale-confirmed manual selection stays protected after automatic control", () =>
+  withDatabase(({ database, filePath }) => {
+    const automaticCandidate = database.saveIconCandidate({
+      itemId: "item-1",
+      cacheKey: "automatic-before-stale",
+      sourceType: "runtime-resource",
+      autoSelect: true,
+      rankScore: 5,
+      asset: asset(filePath, "6".repeat(64)),
+    });
+    const staleCandidate = database.saveIconCandidate({
+      itemId: "item-1",
+      cacheKey: "stale-manual-choice",
+      sourceType: "runtime-resource",
+      autoSelect: false,
+      rankScore: 4,
+      asset: asset(filePath, "7".repeat(64)),
+    });
+    database.db.prepare(
+      "UPDATE catalog_icon_candidates SET currency_status='stale' WHERE id=?",
+    ).run(staleCandidate.id);
+
+    const automatic = database.returnIconSelectionToAutomatic("item-1", {
+      actor: "operator",
+      note: "restore automatic control before choosing history",
+      expectedDisplayIconRevision: 2,
+    });
+    const selected = database.selectIconCandidate("item-1", staleCandidate.id, {
+      actor: "operator",
+      note: "historical image is the recognizable display",
+      confirmStale: true,
+      expectedDisplayIconRevision: automatic.displayIcon.revision,
+    });
+    assert.equal(selected.displayIcon.selectedCandidate.id, staleCandidate.id);
+    assert.equal(selected.displayIcon.manualProtection, true);
+    assert.equal(selected.displayIcon.history.at(-1).action, "manual-select-stale-confirmed");
+
+    database.saveIconCandidate({
+      itemId: "item-1",
+      cacheKey: "new-automatic-evidence",
+      sourceType: "runtime-resource",
+      autoSelect: true,
+      rankScore: 99,
+      asset: asset(filePath, "8".repeat(64)),
+    });
+    const protectedSelection = database.getCatalogObject("item-identity", "item-1");
+    assert.equal(protectedSelection.displayIcon.selectedCandidate.id, staleCandidate.id);
+    assert.equal(protectedSelection.displayIcon.selectedCandidate.id === automaticCandidate.id, false);
+    assert.equal(protectedSelection.displayIcon.manualProtection, true);
+  }));

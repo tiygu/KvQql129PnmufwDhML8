@@ -200,6 +200,211 @@ test("完整物品目录通过真实控制服务恰好投影每个 Item Identity
   });
 });
 
+test("Item Identity detail separates icon currency, selection, lineage, assets, and audited decisions", async () => {
+  await withFixture(async ({ runtime, baseUrl }) => {
+    activateIdentity(runtime, "display-icon-detail", {
+      itemId: "display-icon-detail",
+      name: "Display Icon Detail",
+      level: 4,
+      type: "flower",
+      chainId: "display-icon-chain",
+    });
+    const iconRoot = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-icon-detail-"));
+    const writeCandidate = (name, contents) => {
+      const filePath = path.join(iconRoot, `${name}.png`);
+      fs.writeFileSync(filePath, contents);
+      return filePath;
+    };
+    const saveCandidate = ({
+      cacheKey,
+      sourceType,
+      hash,
+      rankScore,
+      filePath,
+    }) => runtime.database.saveIconCandidate({
+      itemId: "display-icon-detail",
+      cacheKey,
+      sourceType,
+      autoSelect: false,
+      rankScore,
+      asset: {
+        hash,
+        mimeType: "image/png",
+        width: 2,
+        height: 3,
+        byteSize: fs.statSync(filePath).size,
+        filePath,
+      },
+    });
+
+    try {
+      const current = saveCandidate({
+        cacheKey: "current-candidate",
+        sourceType: "user-upload",
+        hash: "a".repeat(64),
+        rankScore: 9,
+        filePath: writeCandidate("current", "current"),
+      });
+      const stale = saveCandidate({
+        cacheKey: "stale-candidate",
+        sourceType: "unknown-legacy-source",
+        hash: "b".repeat(64),
+        rankScore: 20,
+        filePath: writeCandidate("stale", "stale"),
+      });
+      const predecessor = saveCandidate({
+        cacheKey: "superseded-candidate",
+        sourceType: "user-upload",
+        hash: "c".repeat(64),
+        rankScore: 30,
+        filePath: writeCandidate("superseded", "superseded"),
+      });
+      runtime.database.db.prepare(`INSERT INTO catalog_icon_candidate_lineage(
+        predecessor_candidate_id,successor_candidate_id,relation,reason,created_at
+      ) VALUES(?,?,?,?,?)`).run(
+        predecessor.id,
+        current.id,
+        "replaced-by",
+        "operator chose the clearer source",
+        new Date().toISOString(),
+      );
+
+      const unconfirmedResponse = await fetch(`${baseUrl}/api/catalog/icon/select`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objectId: "display-icon-detail",
+          candidateId: stale.id,
+          actor: "detail-operator",
+          note: "historical candidate is the recognizable icon",
+          expectedDisplayIconRevision: 1,
+        }),
+      });
+      assert.equal(unconfirmedResponse.status, 409);
+      assert.equal((await unconfirmedResponse.json()).code, "STALE_ICON_CONFIRMATION_REQUIRED");
+      assert.equal(runtime.database.getCatalogObject(
+        "item-identity",
+        "display-icon-detail",
+      ).displayIcon.revision, 1);
+
+      const selectedResponse = await fetch(`${baseUrl}/api/catalog/icon/select`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objectId: "display-icon-detail",
+          candidateId: stale.id,
+          actor: "detail-operator",
+          note: "historical candidate is the recognizable icon",
+          expectedDisplayIconRevision: 1,
+          confirmStale: true,
+        }),
+      });
+      assert.equal(selectedResponse.status, 200);
+      fs.rmSync(stale.filePath);
+
+      const selectedDetail = await fetch(
+        `${baseUrl}/api/catalog/items/display-icon-detail`,
+      ).then((response) => response.json());
+      assert.equal(selectedDetail.displayIcon.selection.revision, 2);
+      assert.equal(selectedDetail.displayIcon.selection.manualProtection, true);
+      assert.equal(selectedDetail.displayIcon.candidates.currentDisplay[0].candidateId, stale.id);
+      assert.equal(selectedDetail.displayIcon.candidates.currentDisplay[0].currency.status, "stale");
+      assert.equal(selectedDetail.displayIcon.candidates.currentDisplay[0].selection.origin, "manual");
+      assert.equal(selectedDetail.displayIcon.candidates.currentDisplay[0].lineage.status, "retained");
+      assert.equal(selectedDetail.displayIcon.candidates.currentDisplay[0].asset.available, false);
+      assert.deepEqual(
+        selectedDetail.displayIcon.candidates.eligible.map((candidate) => candidate.candidateId),
+        [current.id],
+      );
+      assert.deepEqual(
+        selectedDetail.displayIcon.candidates.historical.map((candidate) => candidate.candidateId),
+        [predecessor.id],
+      );
+      assert.deepEqual(
+        selectedDetail.displayIcon.candidates.historical[0].lineage.replacedByCandidateIds,
+        [current.id],
+      );
+      assert.equal(selectedDetail.displayIcon.candidates.historical[0].currency.status, "current");
+      assert.equal(
+        selectedDetail.displayIcon.candidates.historical[0].lineage.status,
+        "superseded",
+      );
+      assert.equal(
+        selectedDetail.displayIcon.candidates.historical[0].technical.assetHash,
+        "c".repeat(64),
+      );
+
+      const revokedResponse = await fetch(`${baseUrl}/api/catalog/icon/revoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objectId: "display-icon-detail",
+          actor: "detail-operator",
+          note: "protect an intentionally empty display",
+          expectedDisplayIconRevision: 2,
+        }),
+      });
+      assert.equal(revokedResponse.status, 200);
+      const revoked = await revokedResponse.json();
+      assert.equal(revoked.displayIcon.protectedEmpty, true);
+
+      const automaticResponse = await fetch(`${baseUrl}/api/catalog/icon/automatic`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objectId: "display-icon-detail",
+          actor: "detail-operator",
+          note: "return display choice to automatic control",
+          expectedDisplayIconRevision: 3,
+        }),
+      });
+      assert.equal(automaticResponse.status, 200);
+      const automatic = await automaticResponse.json();
+      assert.equal(automatic.displayIcon.revision, 4);
+      assert.equal(automatic.displayIcon.selectedCandidate.id, current.id);
+      assert.equal(automatic.displayIcon.selectionOrigin, "automatic");
+
+      const finalDetail = await fetch(
+        `${baseUrl}/api/catalog/items/display-icon-detail`,
+      ).then((response) => response.json());
+      assert.deepEqual(
+        finalDetail.displayIcon.selectionHistory.map((entry) => ({
+          action: entry.action,
+          actor: entry.actor,
+          previousCandidateId: entry.previousCandidateId,
+          candidateId: entry.candidateId,
+          revision: entry.revision,
+        })),
+        [
+          {
+            action: "manual-select-stale-confirmed",
+            actor: "detail-operator",
+            previousCandidateId: null,
+            candidateId: stale.id,
+            revision: 2,
+          },
+          {
+            action: "manual-revoke",
+            actor: "detail-operator",
+            previousCandidateId: stale.id,
+            candidateId: null,
+            revision: 3,
+          },
+          {
+            action: "automatic-control-return",
+            actor: "detail-operator",
+            previousCandidateId: null,
+            candidateId: current.id,
+            revision: 4,
+          },
+        ],
+      );
+    } finally {
+      fs.rmSync(iconRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 test("物品目录搜索、游标和只读详情保持同一 Catalog Query Revision", async () => {
   await withFixture(async ({ runtime, baseUrl }) => {
     activateIdentity(runtime, "directory-search-a", {

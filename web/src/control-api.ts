@@ -186,6 +186,7 @@ export const controlApi = {
   ),
   selectCatalogIcon: (input: any) => post("/api/catalog/icon/select", input),
   revokeCatalogIcon: (input: any) => post("/api/catalog/icon/revoke", input),
+  returnCatalogIconToAutomatic: (input: any) => post("/api/catalog/icon/automatic", input),
   uploadCatalogIcon: (input: any) => post("/api/catalog/icon/upload", input),
   getConnectionStatus: () => request("/api/connection"),
   startConnection: (options?: any) => post("/api/connection/start", options || {}),

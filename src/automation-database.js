@@ -1851,6 +1851,7 @@ class AutomationDatabase {
       candidateId,
       actor: input.actor,
       note: input.note,
+      confirmStale: input.confirmStale,
       expectedDisplayIconRevision: input.expectedDisplayIconRevision,
     });
   }
@@ -1880,6 +1881,32 @@ class AutomationDatabase {
   listIconCandidates(itemId) {
     const object = this._catalogObjectRow("item-identity", String(itemId));
     return object ? this._iconCandidates(object.id) : [];
+  }
+
+  listIconCandidateLineage(itemId) {
+    const object = this._catalogObjectRow("item-identity", String(itemId));
+    if (!object) return [];
+    return this.db.prepare(`SELECT
+      lineage.id,
+      lineage.predecessor_candidate_id,
+      lineage.successor_candidate_id,
+      lineage.relation,
+      lineage.reason,
+      lineage.created_at
+    FROM catalog_icon_candidate_lineage lineage
+    JOIN catalog_icon_candidates predecessor
+      ON predecessor.id=lineage.predecessor_candidate_id
+    JOIN catalog_icon_candidates successor
+      ON successor.id=lineage.successor_candidate_id
+    WHERE predecessor.object_id=? AND successor.object_id=?
+    ORDER BY lineage.id`).all(object.id, object.id).map((entry) => ({
+      id: Number(entry.id),
+      predecessorCandidateId: Number(entry.predecessor_candidate_id),
+      successorCandidateId: Number(entry.successor_candidate_id),
+      relation: entry.relation,
+      reason: entry.reason,
+      createdAt: entry.created_at,
+    }));
   }
 
   getSelectedIconCandidate(itemId) {

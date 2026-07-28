@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const { canonicalJson } = require("./canonical-json");
+const { automaticCandidateEligible } = require("./icon-evidence-currency");
 
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
@@ -149,9 +150,16 @@ function summaryFromObject(object) {
   };
 }
 
-function candidateSummary(candidate, selection) {
+function candidateSummary(candidate, selection, lineage) {
   const selected = Number(selection?.selectedCandidate?.id) === Number(candidate.id);
   const assetAvailable = !!candidate.filePath && fs.existsSync(candidate.filePath);
+  const replacedBy = lineage.filter((entry) =>
+    Number(entry.predecessorCandidateId) === Number(candidate.id));
+  const replaces = lineage.filter((entry) =>
+    Number(entry.successorCandidateId) === Number(candidate.id));
+  const automaticallyEligible = automaticCandidateEligible(candidate, {
+    assetAvailable: () => assetAvailable,
+  });
   return {
     candidateId: Number(candidate.id),
     sourceType: candidate.sourceType,
@@ -166,22 +174,48 @@ function candidateSummary(candidate, selection) {
       origin: selected ? selection.selectionOrigin || null : null,
       manualProtection: selected && selection.manualProtection === true,
     },
+    automaticallyEligible,
     superseded: candidate.superseded === true,
     assetAvailable,
     url: assetAvailable ? `/api/catalog/icon/${candidate.assetHash}` : null,
     acquiredAt: candidate.createdAt,
+    lineage: {
+      status: replacedBy.length ? "superseded" : "retained",
+      replacedByCandidateIds: replacedBy.map((entry) => entry.successorCandidateId),
+      replacesCandidateIds: replaces.map((entry) => entry.predecessorCandidateId),
+      relations: [...replacedBy, ...replaces],
+    },
+    asset: {
+      available: assetAvailable,
+      url: assetAvailable ? `/api/catalog/icon/${candidate.assetHash}` : null,
+      width: candidate.width,
+      height: candidate.height,
+      mimeType: candidate.mimeType,
+    },
+    technical: {
+      assetHash: candidate.assetHash,
+      cacheKey: candidate.cacheKey,
+      runtimeIdentifier: candidate.runtimeIdentifier,
+      resourceUrl: candidate.resourceUrl,
+      textureUuid: candidate.textureUuid,
+      provenance: candidate.provenance,
+      crop: candidate.crop,
+      similarity: candidate.similarity,
+      rankScore: candidate.rankScore,
+      currencyPolicyVersion: candidate.currency?.policyVersion || null,
+    },
   };
 }
 
-function candidateGroups(object) {
+function candidateGroups(object, lineage) {
   const candidates = (object.displayIcon?.candidates || [])
-    .map((candidate) => candidateSummary(candidate, object.displayIcon));
+    .map((candidate) => candidateSummary(candidate, object.displayIcon, lineage));
   return {
     currentDisplay: candidates.filter((candidate) => candidate.selection.selected),
-    eligible: candidates.filter((candidate) => !candidate.selection.selected
-      && !candidate.superseded && candidate.currency.status === "current"),
+    eligible: candidates.filter((candidate) =>
+      !candidate.selection.selected && candidate.automaticallyEligible),
     historical: candidates.filter((candidate) => !candidate.selection.selected
-      && (candidate.superseded || candidate.currency.status !== "current")),
+      && !candidate.automaticallyEligible),
   };
 }
 
@@ -510,6 +544,7 @@ class CatalogItemQuery {
     }
     const effective = entry.object.effectiveValue || {};
     const identity = identityFacts(entry.object);
+    const iconLineage = this.database.listIconCandidateLineage(entry.summary.itemId);
     const chainId = entry.summary.identity.mergeChainId;
     const chainMembers = chainId == null ? [] : snapshot.entries
       .filter((candidate) => candidate.summary.identity.mergeChainId === chainId)
@@ -573,7 +608,17 @@ class CatalogItemQuery {
           manualProtection: entry.object.displayIcon?.manualProtection === true,
           protectedEmpty: entry.object.displayIcon?.protectedEmpty === true,
         },
-        candidates: candidateGroups(entry.object),
+        candidates: candidateGroups(entry.object, iconLineage),
+        selectionHistory: (entry.object.displayIcon?.history || []).map((entry) => ({
+          action: entry.action,
+          actor: entry.actor,
+          note: entry.note,
+          revision: Number(entry.revision),
+          objectRevision: Number(entry.objectRevision),
+          previousCandidateId: entry.previousCandidateId,
+          candidateId: entry.candidateId,
+          createdAt: entry.createdAt,
+        })),
       },
       review: {
         ...entry.summary.review,

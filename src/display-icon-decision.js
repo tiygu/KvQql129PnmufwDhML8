@@ -338,6 +338,12 @@ class DisplayIconDecision {
         if (!candidate) {
           throw Object.assign(new Error(`icon candidate not found: ${command.candidateId}`), { statusCode: 404 });
         }
+        if (candidate.currency_status === "stale" && command.confirmStale !== true) {
+          throw Object.assign(new Error("stale icon evidence requires explicit confirmation"), {
+            code: "STALE_ICON_CONFIRMATION_REQUIRED",
+            statusCode: 409,
+          });
+        }
       } else if (command.kind === "automatic") {
         candidate = this._automaticCandidates(object.id)[0] || null;
       } else if (command.kind !== "revoke") {
@@ -359,7 +365,11 @@ class DisplayIconDecision {
         previousCandidateId,
         action: automatic
           ? "automatic-control-return"
-          : command.kind === "select" ? "manual-select" : "manual-revoke",
+          : command.kind === "select"
+            ? candidate.currency_status === "stale"
+              ? "manual-select-stale-confirmed"
+              : "manual-select"
+            : "manual-revoke",
         actor: String(command.actor).trim(),
         note: String(command.note).trim(),
         decisionRevision: after.revision,

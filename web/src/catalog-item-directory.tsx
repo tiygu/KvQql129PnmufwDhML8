@@ -191,6 +191,13 @@ export function CatalogItemDirectory({
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
   const [detailErrorCode, setDetailErrorCode] = useState("");
+  const [iconActor, setIconActor] = useState("本地操作者");
+  const [iconReason, setIconReason] = useState("");
+  const [iconMutationBusy, setIconMutationBusy] = useState(false);
+  const [iconMessage, setIconMessage] = useState("");
+  const [pendingStaleCandidate, setPendingStaleCandidate] = useState<any>(null);
+  const selectedItemIdRef = useRef(selectedItemId);
+  const staleConfirmationRef = useRef<HTMLDialogElement | null>(null);
   const directoryRequestId = useRef(0);
   const detailHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const focusDetailAfterLoad = useRef(!!initialNavigationState.current?.focusDetail);
@@ -223,6 +230,14 @@ export function CatalogItemDirectory({
     page?.catalogQueryRevision || publishedQueryRevision,
   );
   queryIdentityRef.current = queryIdentity;
+  selectedItemIdRef.current = selectedItemId;
+
+  useEffect(() => {
+    const dialog = staleConfirmationRef.current;
+    if (!dialog) return;
+    if (pendingStaleCandidate && !dialog.open) dialog.showModal();
+    if (!pendingStaleCandidate && dialog.open) dialog.close();
+  }, [pendingStaleCandidate]);
   activeQueryRevision.current = page?.catalogQueryRevision || publishedQueryRevision;
   if (page) visibleResultCount.current = page.items.length;
   const currentQueryInput = (
@@ -562,6 +577,148 @@ export function CatalogItemDirectory({
     writeCatalogItemDeepLink(null);
   };
 
+  const displayIconInput = (targetDetail = detail) => ({
+    objectId: targetDetail.summary.itemId,
+    actor: iconActor.trim(),
+    note: iconReason.trim(),
+    expectedDisplayIconRevision: targetDetail.displayIcon.selection.revision,
+  });
+
+  const validateDisplayIconInput = () => {
+    if (iconActor.trim() && iconReason.trim()) return true;
+    setIconMessage("Display icon changes require an operator and a reason.");
+    return false;
+  };
+
+  const refreshDisplayIconDetail = async (itemId: string) => {
+    const updated = await controlApi.getCatalogItem(itemId);
+    if (selectedItemIdRef.current === itemId) setDetail(updated);
+    return updated;
+  };
+
+  const runDisplayIconMutation = async (
+    mutate: (input: any) => Promise<any>,
+    successMessage: string | ((updated: any) => string),
+    {
+      clearStaleConfirmation = false,
+      errorMessage = "Display icon selection failed.",
+    } = {},
+  ) => {
+    if (!validateDisplayIconInput()) return;
+    const targetDetail = detail;
+    const itemId = targetDetail.summary.itemId;
+    const input = displayIconInput(targetDetail);
+    setIconMutationBusy(true);
+    setIconMessage("");
+    try {
+      await mutate(input);
+      const updated = await refreshDisplayIconDetail(itemId);
+      if (selectedItemIdRef.current !== itemId) return;
+      if (clearStaleConfirmation) setPendingStaleCandidate(null);
+      setIconReason("");
+      setIconMessage(typeof successMessage === "function"
+        ? successMessage(updated)
+        : successMessage);
+    } catch (error: any) {
+      await refreshDisplayIconDetail(itemId).catch(() => null);
+      if (selectedItemIdRef.current === itemId) {
+        setIconMessage(error.message || errorMessage);
+      }
+    } finally {
+      setIconMutationBusy(false);
+    }
+  };
+
+  const commitDisplayIconSelection = async (candidate: any, staleConfirmed = false) => {
+    await runDisplayIconMutation(
+      (input) => controlApi.selectCatalogIcon({
+        ...input,
+        candidateId: candidate.candidateId,
+        confirmStale: staleConfirmed,
+      }),
+      candidate.currency.status === "stale"
+        ? "Stale evidence is now the protected manual display choice; Item Identity facts were unchanged."
+        : "The display icon selection was updated independently of Item Identity.",
+      { clearStaleConfirmation: true },
+    );
+  };
+
+  const selectDisplayIconCandidate = async (candidate: any, staleConfirmed = false) => {
+    if (!validateDisplayIconInput()) return;
+    if (candidate.currency.status === "stale" && !staleConfirmed) {
+      setPendingStaleCandidate(candidate);
+      setIconMessage("Confirm the stale evidence warning before changing the display choice.");
+      return;
+    }
+    await commitDisplayIconSelection(candidate, staleConfirmed);
+  };
+
+  const revokeDisplayIcon = async () => {
+    await runDisplayIconMutation(
+      (input) => controlApi.revokeCatalogIcon(input),
+      "Protected empty: automatic candidates will not fill this display.",
+      { errorMessage: "Display icon revocation failed." },
+    );
+  };
+
+  const returnDisplayIconToAutomatic = async () => {
+    await runDisplayIconMutation(
+      (input) => controlApi.returnCatalogIconToAutomatic(input),
+      (updated) => {
+        const selected = updated.displayIcon.candidates.currentDisplay[0];
+        return selected
+          ? `Automatic control selected candidate ${selected.candidateId} from existing eligible evidence; no icon harvest was started.`
+          : "Automatic control was restored, but no eligible candidate is available; the display remains empty and no icon harvest was started.";
+      },
+      { errorMessage: "Returning display control to automatic failed." },
+    );
+  };
+
+  const renderDisplayIconCandidate = (candidate: any) => (
+    <article
+      className="display-icon-candidate"
+      data-candidate-id={candidate.candidateId}
+      key={candidate.candidateId}
+    >
+      <div className={`display-icon-candidate-asset ${candidate.asset.available ? "available" : "unavailable"}`}>
+        {candidate.asset.available
+          ? <img src={candidate.asset.url} alt=""/>
+          : <ImageIcon aria-label="Image asset unavailable"/>}
+      </div>
+      <div className="display-icon-candidate-body">
+        <strong>{candidate.sourceType}</strong>
+        <span>{new Date(candidate.acquiredAt).toLocaleString()}</span>
+        <div className="display-icon-status-grid">
+          <span>Currency: {candidate.currency.status}</span>
+          <span>Selection: {candidate.selection.selected
+            ? candidate.selection.origin || "selected"
+            : "not selected"}</span>
+          <span>Lineage: {candidate.lineage.status}</span>
+          <span>Asset: {candidate.asset.available ? "available" : "unavailable"}</span>
+        </div>
+        {candidate.lineage.replacedByCandidateIds.length > 0 && (
+          <p>Replaced by candidate {candidate.lineage.replacedByCandidateIds.join(", ")}.</p>
+        )}
+        {candidate.lineage.replacesCandidateIds.length > 0 && (
+          <p>Replaces candidate {candidate.lineage.replacesCandidateIds.join(", ")}.</p>
+        )}
+        <details>
+          <summary>Technical fields</summary>
+          <pre>{JSON.stringify(candidate.technical, null, 2)}</pre>
+        </details>
+      </div>
+      {!candidate.selection.selected && (
+        <button
+          aria-label={`Select candidate ${candidate.candidateId}`}
+          disabled={iconMutationBusy}
+          onClick={() => void selectDisplayIconCandidate(candidate)}
+        >
+          Select
+        </button>
+      )}
+    </article>
+  );
+
   return <section ref={directoryRef} className="catalog-review-workspace">
     <div className="catalog-directory-toolbar" role="search">
       <label>
@@ -710,6 +867,145 @@ export function CatalogItemDirectory({
                   <div><span>目录状态</span><strong>{detail.summary.catalogState.status}</strong></div>
                   <div><span>图标证据</span><strong>{detail.summary.displayIcon.state === "missing" ? "缺失" : detail.summary.displayIcon.freshness}</strong></div>
                 </div>
+                <section className="display-icon-management" aria-label="Display Icon Selection">
+                  <div className="display-icon-management-head">
+                    <div>
+                      <span className="eyebrow">Independent presentation decision</span>
+                      <h3>Display Icon Selection</h3>
+                      <p>Currency, selection, lineage, and image availability are independent facts.</p>
+                    </div>
+                    <strong>Revision {detail.displayIcon.selection.revision}</strong>
+                  </div>
+                  <div className="display-icon-decision-form">
+                    <label>
+                      <span>Operator</span>
+                      <input
+                        aria-label="Display icon operator"
+                        value={iconActor}
+                        onChange={(event) => setIconActor(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      <span>Reason</span>
+                      <input
+                        aria-label="Display icon reason"
+                        value={iconReason}
+                        onChange={(event) => setIconReason(event.target.value)}
+                      />
+                    </label>
+                    <button
+                      disabled={iconMutationBusy
+                        || detail.displayIcon.candidates.currentDisplay.length === 0}
+                      onClick={() => void revokeDisplayIcon()}
+                    >
+                      Revoke to protected empty
+                    </button>
+                    <button
+                      disabled={iconMutationBusy
+                        || !detail.displayIcon.selection.manualProtection}
+                      onClick={() => void returnDisplayIconToAutomatic()}
+                    >
+                      Return to automatic
+                    </button>
+                  </div>
+                  {detail.displayIcon.selection.protectedEmpty && (
+                    <p className="display-icon-protected-empty">
+                      Protected empty: automatic candidates will not fill this display.
+                    </p>
+                  )}
+                  {detail.displayIcon.selection.manualProtection
+                    && detail.displayIcon.candidates.currentDisplay.some(
+                      (candidate: any) => !candidate.asset.available,
+                    ) && (
+                      <p className="display-icon-asset-warning" role="alert">
+                        <AlertTriangle/>
+                        <span>The manual display choice is preserved, but its image asset is unavailable.</span>
+                      </p>
+                    )}
+                  {iconMessage && <p className="display-icon-message" role="status">{iconMessage}</p>}
+                  <section className="display-icon-group display-icon-current">
+                    <h3>Current Display</h3>
+                    <p>The explicit display choice, even when stale, superseded, or temporarily unavailable.</p>
+                    <div>
+                      {detail.displayIcon.candidates.currentDisplay.length
+                        ? detail.displayIcon.candidates.currentDisplay.map(renderDisplayIconCandidate)
+                        : <span className="display-icon-group-empty">No display candidate is selected.</span>}
+                    </div>
+                  </section>
+                  <section className="display-icon-group display-icon-eligible">
+                    <h3>Eligible Candidates</h3>
+                    <p>Current, non-superseded evidence with a readable asset and a passing quality gate.</p>
+                    <div>
+                      {detail.displayIcon.candidates.eligible.length
+                        ? detail.displayIcon.candidates.eligible.map(renderDisplayIconCandidate)
+                        : <span className="display-icon-group-empty">No eligible candidate is available.</span>}
+                    </div>
+                  </section>
+                  <section className="display-icon-group display-icon-historical">
+                    <h3>Historical Evidence</h3>
+                    <p>Retained stale, superseded, unavailable, or quality-rejected evidence.</p>
+                    <div>
+                      {detail.displayIcon.candidates.historical.length
+                        ? detail.displayIcon.candidates.historical.map(renderDisplayIconCandidate)
+                        : <span className="display-icon-group-empty">No historical evidence is retained.</span>}
+                    </div>
+                  </section>
+                  <details className="display-icon-audit">
+                    <summary>Display Icon Selection audit</summary>
+                    {detail.displayIcon.selectionHistory.length
+                      ? [...detail.displayIcon.selectionHistory].reverse().map((entry: any) => (
+                        <article key={`${entry.revision}-${entry.action}`}>
+                          <strong>{entry.action}</strong>
+                          <span>{entry.actor} · revision {entry.revision}</span>
+                          <span>candidate {entry.previousCandidateId ?? "empty"} → {entry.candidateId ?? "empty"}</span>
+                          <p>{entry.note}</p>
+                        </article>
+                      ))
+                      : <p>No display selection actions have been recorded.</p>}
+                  </details>
+                  <dialog
+                    ref={staleConfirmationRef}
+                    onCancel={(event) => {
+                      event.preventDefault();
+                      setPendingStaleCandidate(null);
+                    }}
+                    onClose={() => setPendingStaleCandidate(null)}
+                    className="display-icon-stale-confirmation"
+                    role="alertdialog"
+                    aria-modal="true"
+                    aria-label="Confirm stale icon selection"
+                  >
+                    {pendingStaleCandidate && (
+                      <>
+                      <AlertTriangle/>
+                      <div>
+                        <strong>Stale evidence is excluded from automatic selection.</strong>
+                        <p>
+                          Selecting candidate {pendingStaleCandidate.candidateId} creates a protected
+                          manual display choice. Its currency and the Item Identity remain unchanged.
+                        </p>
+                        <p>Recorded reason: {iconReason}</p>
+                      </div>
+                      <button
+                        disabled={iconMutationBusy}
+                        onClick={() => void selectDisplayIconCandidate(
+                          pendingStaleCandidate,
+                          true,
+                        )}
+                      >
+                        Confirm stale selection
+                      </button>
+                      <button
+                        className="ghost-btn"
+                        disabled={iconMutationBusy}
+                        onClick={() => setPendingStaleCandidate(null)}
+                      >
+                        Cancel
+                      </button>
+                      </>
+                    )}
+                  </dialog>
+                </section>
                 <section className="directory-relationships">
                   <h3>合成链成员</h3>
                   <div>{detail.relationships.mergeChain.members.length
@@ -738,7 +1034,7 @@ export function CatalogItemDirectory({
                     </div>)
                     : <p>没有已知产出关系。</p>}
                 </section>
-                <p className="directory-readonly-note">浏览详情不会提交裁决、改变展示图标或进入编辑状态。</p>
+                <p className="directory-readonly-note">Semantic facts stay read-only here; Display Icon Selection is managed as an independent audited presentation decision.</p>
               </>}
       </div>
     </> : children}

@@ -897,6 +897,13 @@ class AutomationRuntime {
     return result;
   }
 
+  returnCatalogIconSelectionToAutomatic(itemId, input) {
+    this.database.returnIconSelectionToAutomatic(String(itemId), input);
+    const result = this.getCatalogObject("item-identity", String(itemId));
+    this._emitDisplayIconUpdated(result.objectId, result.displayIcon.revision);
+    return result;
+  }
+
   async uploadCatalogIcon(itemId, {
     dataBase64,
     mimeType,

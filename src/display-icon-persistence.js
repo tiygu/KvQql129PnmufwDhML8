@@ -51,10 +51,15 @@ function recordDisplayIconHistory(database, object, {
 function displayIconManualProtection(database, objectId, selectionOrigin) {
   const latestControl = database.prepare(`SELECT action FROM catalog_icon_selection_history
     WHERE object_id=? AND action IN (
-      'manual-select','manual-revoke','automatic-control-return'
+      'manual-select','manual-select-stale-confirmed','manual-revoke',
+      'automatic-control-return'
     ) ORDER BY id DESC LIMIT 1`).get(objectId);
   return latestControl
-    ? ["manual-select", "manual-revoke"].includes(latestControl.action)
+    ? [
+      "manual-select",
+      "manual-select-stale-confirmed",
+      "manual-revoke",
+    ].includes(latestControl.action)
     : selectionOrigin === "manual";
 }
 
