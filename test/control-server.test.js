@@ -192,6 +192,14 @@ test("control server 按需排队图标任务并提供内容哈希资源", async
   const iconPath = path.join(root, "icon.png");
   fs.writeFileSync(iconPath, "png-fixture");
   const runtime = createRuntime();
+  let catalogQueryRevision = "catalog-query-1";
+  runtime.getCatalogQueryRevision = () => catalogQueryRevision;
+  const selectCatalogIcon = runtime.selectCatalogIcon;
+  runtime.selectCatalogIcon = (...args) => {
+    const result = selectCatalogIcon(...args);
+    catalogQueryRevision = "catalog-query-2";
+    return result;
+  };
   const hash = "a".repeat(64);
   runtime.getCatalogIconAsset = (requestedHash) => requestedHash === hash ? { hash, mimeType: "image/png", filePath: iconPath } : null;
   const server = createControlServer({ runtime, publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
@@ -210,8 +218,14 @@ test("control server 按需排队图标任务并提供内容哈希资源", async
     const icon = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/${hash}`);
     assert.equal(icon.headers.get("content-type"), "image/png");
     assert.equal(await icon.text(), "png-fixture");
+    const revisionUpdate = waitForEvent(
+      client,
+      (event) => event.type === "catalog-query-updated",
+      "catalog query revision",
+    );
     const selected = await fetch(`http://127.0.0.1:${port}/api/catalog/icon/select`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ objectId: "i", candidateId: 4, actor: "operator", note: "best", expectedDisplayIconRevision: 3 }) });
     const selectedObject = await selected.json();
+    assert.equal((await revisionUpdate.promise).catalogQueryRevision, "catalog-query-2");
     assert.equal(selectedObject.revision, 3);
     assert.equal(selectedObject.displayIcon.revision, 4);
     assert.equal(selectedObject.selectedIcon.id, 4);
@@ -231,25 +245,41 @@ test("control server broadcasts runtime events to every connected page", async (
   fs.writeFileSync(path.join(root, "public", "index.html"), "ok");
   const server = createControlServer({ runtime: createRuntime(), publicRoot: path.join(root, "public"), dataDir: path.join(root, "data") });
   const port = await listen(server);
-  const client = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const clients = [
+    new WebSocket(`ws://127.0.0.1:${port}/ws`),
+    new WebSocket(`ws://127.0.0.1:${port}/ws`),
+  ];
   try {
-    await new Promise((resolve, reject) => {
+    await Promise.all(clients.map((client) => new Promise((resolve, reject) => {
       client.once("open", resolve);
       client.once("error", reject);
-    });
-    await new Promise((resolve, reject) => {
+    })));
+    const expected = {
+      type: "automation-status",
+      statusRevision: 17,
+      phase: "running",
+      running: true,
+      paused: false,
+      safeBoundaryReached: false,
+      sessionKind: "bounded",
+      sessionId: 9,
+      boundaryBusy: false,
+      boundaryOwner: null,
+      safeBoundaryAvailable: false,
+    };
+    const received = clients.map((client) => new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("event timeout")), 2000);
       client.on("message", (raw) => {
         const event = JSON.parse(String(raw));
         if (event.type !== "automation-status") return;
         clearTimeout(timer);
-        assert.equal(event.running, true);
-        resolve();
+        resolve(event);
       });
-      server.broadcast({ type: "automation-status", running: true });
-    });
+    }));
+    server.broadcast(expected);
+    assert.deepEqual(await Promise.all(received), [expected, expected]);
   } finally {
-    client.close();
+    for (const client of clients) client.close();
     await server.close();
     fs.rmSync(root, { recursive: true, force: true });
   }

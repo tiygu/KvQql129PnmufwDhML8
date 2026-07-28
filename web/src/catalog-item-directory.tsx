@@ -2,8 +2,11 @@ import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 
 import { AlertTriangle, Copy, History, Image as ImageIcon } from "lucide-react";
 import {
   controlApi,
+  type CatalogCursor,
   type CatalogItemFilterName,
+  type CatalogItemQueryPage,
   type CatalogItemQueryInput,
+  type CatalogQueryRevision,
   type CatalogItemSort,
   type CatalogItemSortDirection,
 } from "./control-api";
@@ -84,7 +87,9 @@ export function CatalogItemDirectory({
   const [sort, setSort] = useState<CatalogItemSort>("display-title");
   const [direction, setDirection] = useState<CatalogItemSortDirection>("asc");
   const [filters, setFilters] = useState<CatalogFilters>(emptyFilters);
-  const [page, setPage] = useState<any>(null);
+  const [page, setPage] = useState<CatalogItemQueryPage | null>(null);
+  const [publishedQueryRevision, setPublishedQueryRevision] =
+    useState<CatalogQueryRevision | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(initialItemId.current);
@@ -109,7 +114,7 @@ export function CatalogItemDirectory({
   });
   const queryIdentityRef = useRef(queryIdentity);
   queryIdentityRef.current = queryIdentity;
-  const currentQueryInput = (cursor: string | null = null): CatalogItemQueryInput => ({
+  const currentQueryInput = (cursor: CatalogCursor | null = null): CatalogItemQueryInput => ({
     query: search,
     scope: "all",
     pageSize: 200,
@@ -145,6 +150,15 @@ export function CatalogItemDirectory({
     return () => globalThis.removeEventListener?.("popstate", restoreDeepLink);
   }, []);
 
+  useEffect(() => controlApi.onEvent((event) => {
+    if (!["catalog-query-updated", "control-connected"].includes(event?.type)) return;
+    const revision = event.catalogQueryRevision || null;
+    if (!revision) return;
+    setPage((current) =>
+      current?.catalogQueryRevision === revision ? current : null);
+    setPublishedQueryRevision((current) => current === revision ? current : revision);
+  }), []);
+
   useEffect(() => {
     const requestId = ++directoryRequestId.current;
     if (!directoryMode) {
@@ -166,7 +180,15 @@ export function CatalogItemDirectory({
       if (active && directoryRequestId.current === requestId) setLoading(false);
     });
     return () => { active = false; };
-  }, [directoryMode, refreshRevision, search, sort, direction, filterSignature]);
+  }, [
+    directoryMode,
+    refreshRevision,
+    publishedQueryRevision,
+    search,
+    sort,
+    direction,
+    filterSignature,
+  ]);
 
   useEffect(() => {
     if (!directoryMode || !selectedItemId) {
@@ -190,7 +212,7 @@ export function CatalogItemDirectory({
       if (active) setDetailLoading(false);
     });
     return () => { active = false; };
-  }, [directoryMode, refreshRevision, selectedItemId]);
+  }, [directoryMode, refreshRevision, publishedQueryRevision, selectedItemId]);
 
   const selectItem = (itemId: string, { push = false } = {}) => {
     setSelectedItemId(itemId);

@@ -67,12 +67,38 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
   const diagnosticsDir = path.resolve(dataDir || path.join(__dirname, "..", "data"), "diagnostics");
   const clients = new Set();
   let dashboardPromise = null;
+  let lastCatalogQueryRevision = null;
 
-  function broadcast(event) {
+  function currentCatalogQueryRevision() {
+    if (typeof runtime.getCatalogQueryRevision !== "function") return null;
+    try {
+      return runtime.getCatalogQueryRevision();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function send(event) {
     const payload = JSON.stringify(event);
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) client.send(payload);
     }
+  }
+
+  function publishCatalogQueryRevisionIfChanged() {
+    const catalogQueryRevision = currentCatalogQueryRevision();
+    if (catalogQueryRevision && catalogQueryRevision !== lastCatalogQueryRevision) {
+      lastCatalogQueryRevision = catalogQueryRevision;
+      send({ type: "catalog-query-updated", catalogQueryRevision });
+    }
+    return catalogQueryRevision;
+  }
+
+  lastCatalogQueryRevision = currentCatalogQueryRevision();
+
+  function broadcast(event) {
+    publishCatalogQueryRevisionIfChanged();
+    send(event);
   }
 
   function dashboard() {
@@ -192,18 +218,21 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         const body = await readJson(req);
         if (!body.objectId || !Number.isInteger(Number(body.candidateId)) || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-selection-request" });
         const object = runtime.selectCatalogIcon(String(body.objectId), Number(body.candidateId), { actor: body.actor, note: body.note, expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision) });
+        publishCatalogQueryRevisionIfChanged();
         return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/icon/revoke") {
         const body = await readJson(req);
         if (!body.objectId || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-revoke-request" });
         const object = runtime.revokeCatalogIconSelection(String(body.objectId), { actor: body.actor, note: body.note, expectedDisplayIconRevision: Number(body.expectedDisplayIconRevision) });
+        publishCatalogQueryRevisionIfChanged();
         return writeJson(res, 200, object);
       }
       if (route === "POST /api/catalog/icon/upload") {
         const body = await readJson(req);
         if (!body.objectId || !body.dataBase64 || !body.mimeType || !body.actor || !body.note || !Number.isInteger(Number(body.expectedDisplayIconRevision))) return writeJson(res, 400, { ok: false, error: "invalid-icon-upload-request" });
         const object = await runtime.uploadCatalogIcon(String(body.objectId), body);
+        publishCatalogQueryRevisionIfChanged();
         return writeJson(res, 200, object);
       }
       if (route === "GET /api/catalog/object") {
@@ -319,7 +348,11 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         broadcast({ type: "catalog-review-updated", objectType: object.objectType, objectId: object.objectId, revision: object.revision, reviewStatus: object.reviewStatus });
         return writeJson(res, 200, object);
       }
-      if (route === "POST /api/catalog/refresh") return writeJson(res, 200, await runtime.refreshCatalogFromRuntime());
+      if (route === "POST /api/catalog/refresh") {
+        const result = await runtime.refreshCatalogFromRuntime();
+        publishCatalogQueryRevisionIfChanged();
+        return writeJson(res, 200, result);
+      }
       if (route === "POST /api/catalog/scan") {
         const body = await readJson(req);
         if (body.itemIds != null && !Array.isArray(body.itemIds)) return writeJson(res, 400, { ok: false, error: "invalid-active-catalog-scan-request" });
@@ -369,7 +402,12 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
   const wss = new WebSocket.Server({ noServer: true });
   wss.on("connection", (client) => {
     clients.add(client);
-    client.send(JSON.stringify({ type: "control-connected", at: new Date().toISOString() }));
+    const catalogQueryRevision = currentCatalogQueryRevision();
+    client.send(JSON.stringify({
+      type: "control-connected",
+      at: new Date().toISOString(),
+      catalogQueryRevision,
+    }));
     client.on("close", () => clients.delete(client));
     client.on("error", () => clients.delete(client));
   });

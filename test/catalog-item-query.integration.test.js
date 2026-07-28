@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const WebSocket = require("ws");
 const { AutomationRuntime } = require("../src/automation-runtime");
 const { createControlServer } = require("../src/control-server");
 const { CatalogItemQuery } = require("../src/catalog-item-query");
@@ -16,6 +17,39 @@ async function listen(server) {
     server.httpServer.listen(0, "127.0.0.1", resolve);
   });
   return server.httpServer.address().port;
+}
+
+function waitForWebSocketEvent(client, type, label = type) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      client.off("message", onMessage);
+      client.off("error", onError);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (raw) => {
+      let event;
+      try {
+        event = JSON.parse(String(raw));
+      } catch (error) {
+        cleanup();
+        reject(error);
+        return;
+      }
+      if (event.type !== type) return;
+      cleanup();
+      resolve(event);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`${label} timeout`));
+    }, 2000);
+    client.on("message", onMessage);
+    client.on("error", onError);
+  });
 }
 
 function observeIdentity(runtime, objectId, payload, sourceRef = `${objectId}.json`) {
@@ -60,7 +94,7 @@ async function withFixture(run) {
   });
   const port = await listen(server);
   try {
-    await run({ runtime, baseUrl: `http://127.0.0.1:${port}` });
+    await run({ runtime, server, baseUrl: `http://127.0.0.1:${port}` });
   } finally {
     await server.close();
     await runtime.close();
@@ -279,6 +313,193 @@ test("物品目录搜索、游标和只读详情保持同一 Catalog Query Revis
 
     const restartedQuery = new CatalogItemQuery(runtime.database);
     assert.notEqual(restartedQuery.list({ query: "星光花", pageSize: 1 }).catalogQueryRevision, first.catalogQueryRevision);
+  });
+});
+
+test("目录查询公开默认与最大 page size 并拒绝越界值", async () => {
+  await withFixture(async ({ runtime, baseUrl }) => {
+    const baselineTotal = runtime.listCatalogItems({ pageSize: 200 }).total;
+    for (let index = 0; index < 51; index += 1) {
+      activateIdentity(runtime, `page-size-${String(index).padStart(2, "0")}`, {
+        itemId: `page-size-${String(index).padStart(2, "0")}`,
+        name: `Page Size ${String(index).padStart(2, "0")}`,
+        level: 1,
+        type: "fixture",
+      });
+    }
+
+    const defaultResponse = await fetch(`${baseUrl}/api/catalog/items`);
+    assert.equal(defaultResponse.status, 200);
+    const defaultPage = await defaultResponse.json();
+    assert.equal(defaultPage.pageSize, 50);
+    assert.equal(defaultPage.total, baselineTotal + 51);
+    assert.equal(defaultPage.returnedCount, 50);
+    assert.equal(defaultPage.hasMore, true);
+    assert.equal(typeof defaultPage.nextCursor, "string");
+
+    const maximumResponse = await fetch(`${baseUrl}/api/catalog/items?pageSize=200`);
+    assert.equal(maximumResponse.status, 200);
+    assert.equal((await maximumResponse.json()).pageSize, 200);
+
+    const oversizedResponse = await fetch(`${baseUrl}/api/catalog/items?pageSize=201`);
+    assert.equal(oversizedResponse.status, 400);
+    assert.deepEqual(await oversizedResponse.json(), {
+      ok: false,
+      error: "catalog-query-invalid-page-size",
+      code: "CATALOG_QUERY_INVALID_PAGE_SIZE",
+      minimum: 1,
+      maximum: 200,
+    });
+  });
+});
+
+test("目录游标绑定规范化筛选而不是筛选参数的传输顺序", async () => {
+  await withFixture(async ({ runtime, baseUrl }) => {
+    for (const [itemId, level] of [
+      ["normalized-filter-a", 1],
+      ["normalized-filter-b", 2],
+      ["normalized-filter-c", 1],
+    ]) {
+      activateIdentity(runtime, itemId, {
+        itemId,
+        name: itemId,
+        level,
+        type: "flower",
+      });
+    }
+
+    const firstResponse = await fetch(
+      `${baseUrl}/api/catalog/items?q=normalized-filter&level=1&level=2&pageSize=1`,
+    );
+    assert.equal(firstResponse.status, 200);
+    const first = await firstResponse.json();
+    assert.equal(first.hasMore, true);
+
+    const secondResponse = await fetch(
+      `${baseUrl}/api/catalog/items?q=normalized-filter&level=2&level=1&level=1&pageSize=1&cursor=${encodeURIComponent(first.nextCursor)}`,
+    );
+    assert.equal(secondResponse.status, 200);
+    const second = await secondResponse.json();
+    assert.equal(second.catalogQueryRevision, first.catalogQueryRevision);
+    assert.equal(second.items.length, 1);
+    assert.notEqual(second.items[0].itemId, first.items[0].itemId);
+  });
+});
+
+test("Catalog Query Revision 只随完整物品目录投影变化", async () => {
+  await withFixture(async ({ runtime }) => {
+    activateIdentity(runtime, "revision-projection-item", {
+      itemId: "revision-projection-item",
+      name: "Revision Projection Item",
+      level: 1,
+      type: "flower",
+    });
+    const before = runtime.listCatalogItems();
+    const recreated = new CatalogItemQuery(runtime.database).list();
+    assert.equal(recreated.catalogQueryRevision, before.catalogQueryRevision);
+
+    runtime.database.observeCatalogObject({
+      objectType: "production-profile",
+      objectId: "revision-unrelated-producer",
+      payload: {
+        producerItemId: "revision-unrelated-producer",
+        energyCost: 1,
+        drops: [],
+      },
+      sourceType: "runtime-capture",
+      sourceRef: "revision-unrelated-producer.json",
+      countDuplicate: false,
+    });
+
+    const after = runtime.listCatalogItems();
+    assert.equal(after.catalogQueryRevision, before.catalogQueryRevision);
+    assert.deepEqual(after.items, before.items);
+  });
+});
+
+test("每个控制台通过 WebSocket 收到 Catalog Query Revision 更新并在重连时取得当前 revision", async () => {
+  await withFixture(async ({ runtime, server, baseUrl }) => {
+    const item = activateIdentity(runtime, "revision-websocket-item", {
+      itemId: "revision-websocket-item",
+      name: "Revision WebSocket Item",
+      level: 1,
+      type: "flower",
+    });
+    const initialRevision = runtime.listCatalogItems().catalogQueryRevision;
+    const websocketUrl = `${baseUrl.replace("http:", "ws:")}/ws`;
+    const clients = [new WebSocket(websocketUrl), new WebSocket(websocketUrl)];
+
+    try {
+      const connected = clients.map((client) =>
+        waitForWebSocketEvent(client, "control-connected"));
+      await Promise.all(clients.map((client) => new Promise((resolve, reject) => {
+        client.once("open", resolve);
+        client.once("error", reject);
+      })));
+      const connectionEvents = await Promise.all(connected);
+      assert.deepEqual(
+        connectionEvents.map((event) => event.catalogQueryRevision),
+        [initialRevision, initialRevision],
+      );
+
+      const updatedEvents = clients.map((client) =>
+        waitForWebSocketEvent(client, "catalog-query-updated"));
+      const paused = runtime.database.setCatalogObjectDisposition(
+        "item-identity",
+        "revision-websocket-item",
+        "paused",
+        { reason: "revision websocket test", expectedRevision: item.revision },
+      );
+      server.broadcast({ type: "catalog-test-tick" });
+
+      const updated = await Promise.all(updatedEvents);
+      assert.equal(updated.every((event) => event.catalogQueryRevision !== initialRevision), true);
+      assert.equal(new Set(updated.map((event) => event.catalogQueryRevision)).size, 1);
+
+      const reconnected = new WebSocket(websocketUrl);
+      try {
+        const reconnectEventPromise =
+          waitForWebSocketEvent(reconnected, "control-connected", "reconnect revision");
+        await new Promise((resolve, reject) => {
+          reconnected.once("open", resolve);
+          reconnected.once("error", reject);
+        });
+        const reconnectEvent = await reconnectEventPromise;
+        assert.equal(reconnectEvent.catalogQueryRevision, updated[0].catalogQueryRevision);
+
+        const secondUpdatedEvents = clients.map((client) =>
+          waitForWebSocketEvent(client, "catalog-query-updated", "existing client revision"));
+        runtime.database.setCatalogObjectDisposition(
+          "item-identity",
+          "revision-websocket-item",
+          "enabled",
+          { reason: "revision reconnect test", expectedRevision: paused.revision },
+        );
+        const newestConnection = new WebSocket(websocketUrl);
+        try {
+          const newestConnectionEventPromise =
+            waitForWebSocketEvent(newestConnection, "control-connected", "newest connection");
+          await new Promise((resolve, reject) => {
+            newestConnection.once("open", resolve);
+            newestConnection.once("error", reject);
+          });
+          const newestConnectionEvent = await newestConnectionEventPromise;
+          server.broadcast({ type: "catalog-test-tick" });
+          const secondUpdated = await Promise.all(secondUpdatedEvents);
+          assert.equal(
+            secondUpdated.every((event) =>
+              event.catalogQueryRevision === newestConnectionEvent.catalogQueryRevision),
+            true,
+          );
+        } finally {
+          newestConnection.close();
+        }
+      } finally {
+        reconnected.close();
+      }
+    } finally {
+      for (const client of clients) client.close();
+    }
   });
 });
 

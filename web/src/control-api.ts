@@ -1,4 +1,13 @@
-type ControlEventListener = (event: any) => void;
+declare const catalogCursorBrand: unique symbol;
+declare const catalogQueryRevisionBrand: unique symbol;
+export type CatalogCursor = string & { readonly [catalogCursorBrand]: true };
+export type CatalogQueryRevision = string & { readonly [catalogQueryRevisionBrand]: true };
+export type ControlEvent = {
+  type: string;
+  catalogQueryRevision?: CatalogQueryRevision;
+  [name: string]: any;
+};
+type ControlEventListener = (event: ControlEvent) => void;
 export type CatalogItemFilterName =
   | "status"
   | "disposition"
@@ -14,13 +23,23 @@ export type CatalogItemQueryInput = {
   query?: string;
   scope?: "all" | "pending";
   pageSize?: number;
-  cursor?: string | null;
+  cursor?: CatalogCursor | null;
   sort?: CatalogItemSort;
   direction?: CatalogItemSortDirection;
   filters?: CatalogItemFilters;
 };
 
-async function request(path: string, options: RequestInit = {}) {
+export type CatalogItemQueryPage = {
+  catalogQueryRevision: CatalogQueryRevision;
+  total: number;
+  returnedCount: number;
+  pageSize: number;
+  hasMore: boolean;
+  nextCursor: CatalogCursor | null;
+  items: any[];
+};
+
+async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(path, {
     cache: "no-store",
     ...options,
@@ -32,7 +51,7 @@ async function request(path: string, options: RequestInit = {}) {
     const error = Object.assign(new Error(payload?.error || `HTTP ${response.status}`), { status: response.status, payload });
     throw error;
   }
-  return payload;
+  return payload as T;
 }
 
 function post(path: string, body: any = {}) {
@@ -109,7 +128,7 @@ export const controlApi = {
     for (const [name, values] of Object.entries(input.filters || {})) {
       for (const value of values || []) search.append(name, value);
     }
-    return request(`/api/catalog/items?${search.toString()}`);
+    return request<CatalogItemQueryPage>(`/api/catalog/items?${search.toString()}`);
   },
   getCatalogItem: (itemId: string) => request(`/api/catalog/items/${encodeURIComponent(itemId)}`),
   getCatalogObject: (objectType: string, objectId: string) => request(`/api/catalog/object?type=${encodeURIComponent(objectType)}&id=${encodeURIComponent(objectId)}`),

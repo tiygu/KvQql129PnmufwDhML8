@@ -514,6 +514,10 @@ class AutomationRuntime {
     return this.catalogItemQuery.list(input);
   }
 
+  getCatalogQueryRevision() {
+    return this.catalogItemQuery.revision();
+  }
+
   getCatalogItem(itemId) {
     return this.catalogItemQuery.detail(itemId);
   }

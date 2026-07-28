@@ -275,3 +275,88 @@ test("complete-directory controls preserve server order and restore pending quer
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test("two consoles keep independent directory views and converge on a published query revision", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-directory-multi-console-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  activateIdentity(runtime, "console-alpha-one", "Console Alpha One", 1);
+  activateIdentity(runtime, "console-beta-one", "Console Beta One", 1);
+  runtime.dashboard = async () => ({
+    connected: false,
+    connectionError: "browser fixture",
+    running: false,
+    paused: false,
+    state: runtime.lastState,
+    plan: { status: "ready", plans: [], recommended: null },
+    catalog: runtime.getCatalogView().stats,
+    catalogView: runtime.getCatalogView({ includeRepositoryObjects: false }),
+    actions: [],
+    sessions: [],
+    resourceSamples: [],
+    connectionRoute: { listening: false, managed: false },
+    runtimeControl: { mocked: true },
+  });
+  const server = createControlServer({
+    runtime,
+    publicRoot: path.join(__dirname, "..", "public"),
+    dataDir,
+  });
+  const port = await listen(server);
+  const browser = await chromium.launch({ headless: true });
+  const alphaPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  const betaPage = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  let betaQueryRequests = 0;
+  betaPage.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/catalog/items") betaQueryRequests += 1;
+  });
+
+  try {
+    await Promise.all([
+      alphaPage.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" }),
+      betaPage.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" }),
+    ]);
+    await Promise.all([
+      alphaPage.getByRole("button", { name: "图鉴" }).click(),
+      betaPage.getByRole("button", { name: "图鉴" }).click(),
+    ]);
+    await Promise.all([
+      alphaPage.getByRole("button", { name: /全部物品/ }).click(),
+      betaPage.getByRole("button", { name: /全部物品/ }).click(),
+    ]);
+
+    const alphaSearch = alphaPage.getByRole("searchbox", { name: "搜索全部物品" });
+    const betaSearch = betaPage.getByRole("searchbox", { name: "搜索全部物品" });
+    await alphaSearch.fill("console-alpha");
+    await betaSearch.fill("console-beta");
+    await alphaPage.getByRole("button", { name: /Console Alpha One.*console-alpha-one/ }).waitFor();
+    await betaPage.getByRole("button", { name: /Console Beta One.*console-beta-one/ }).waitFor();
+    const betaRequestsBeforeUpdate = betaQueryRequests;
+
+    activateIdentity(runtime, "console-alpha-two", "Console Alpha Two", 2);
+    server.broadcast({ type: "catalog-test-tick" });
+
+    await alphaPage.getByRole("button", { name: /Console Alpha Two.*console-alpha-two/ }).waitFor();
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 2000;
+      const check = () => {
+        if (betaQueryRequests > betaRequestsBeforeUpdate) return resolve();
+        if (Date.now() >= deadline) return reject(new Error("second console did not reconcile"));
+        setTimeout(check, 20);
+      };
+      check();
+    });
+    assert.equal(await alphaSearch.inputValue(), "console-alpha");
+    assert.equal(await betaSearch.inputValue(), "console-beta");
+    assert.equal(await alphaPage.locator(".catalog-directory-list .directory-copy-id").count(), 2);
+    assert.equal(await betaPage.locator(".catalog-directory-list .directory-copy-id").count(), 1);
+  } finally {
+    await browser.close();
+    await server.close();
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});

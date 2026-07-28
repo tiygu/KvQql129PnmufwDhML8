@@ -7,6 +7,15 @@ const { canonicalJson } = require("./canonical-json");
 const DEFAULT_PAGE_SIZE = 50;
 const MAX_PAGE_SIZE = 200;
 const UNNAMED_ITEM_TITLE = "未命名物品";
+const FILTER_NAMES = [
+  "status",
+  "disposition",
+  "reviewAction",
+  "iconFreshness",
+  "mergeChainId",
+  "level",
+  "itemType",
+];
 const SEARCH_FIELDS = [
   ["itemId", 0],
   ["confirmedName", 1],
@@ -285,6 +294,16 @@ function matchesNullable(value, accepted) {
     : String(value) === candidate);
 }
 
+function normalizeFilters(filters = {}) {
+  return Object.fromEntries(FILTER_NAMES.map((name) => [
+    name,
+    [...new Set((Array.isArray(filters[name]) ? filters[name] : [])
+      .map((value) => String(value).trim())
+      .filter(Boolean))]
+      .sort((left, right) => left.localeCompare(right, "en")),
+  ]));
+}
+
 function normalizeOptions(input = {}) {
   const scope = input.scope || "all";
   if (!["all", "pending"].includes(scope)) {
@@ -326,7 +345,7 @@ function normalizeOptions(input = {}) {
     sort,
     direction,
     cursor: input.cursor || null,
-    filters: input.filters || {},
+    filters: normalizeFilters(input.filters),
   };
 }
 
@@ -367,15 +386,14 @@ function orderingTuple(entry, options) {
 class CatalogItemQuery {
   constructor(database) {
     this.database = database;
-    this.revisionSalt = crypto.randomUUID();
     this.cachedSnapshot = null;
   }
 
   _snapshot() {
-    const latestRevision = `${this.revisionSalt}:${this.database.getCatalogQueryRevision()}`;
-    if (this.cachedSnapshot?.revision === latestRevision) return this.cachedSnapshot;
+    const latestSourceRevision = this.database.getCatalogQueryRevision();
+    if (this.cachedSnapshot?.sourceRevision === latestSourceRevision) return this.cachedSnapshot;
     const snapshot = this.database.transaction(() => {
-      const revision = `${this.revisionSalt}:${this.database.getCatalogQueryRevision()}`;
+      const sourceRevision = this.database.getCatalogQueryRevision();
       const objects = this.database.listCatalogObjects({ objectType: "item-identity" })
         .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
         .filter(Boolean);
@@ -387,6 +405,9 @@ class CatalogItemQuery {
           search: searchDocument(object, summary),
         };
       });
+      const projectionRevision = crypto.createHash("sha256").update(canonicalJson(
+        entries.map(({ summary, search }) => ({ summary, search })),
+      )).digest("hex");
       const relations = this.database.listCatalogObjects({ objectType: "merge-relation" })
         .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
         .filter(Boolean);
@@ -394,7 +415,8 @@ class CatalogItemQuery {
         .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
         .filter(Boolean);
       return {
-        revision,
+        sourceRevision,
+        revision: `catalog-query-v1:${projectionRevision}`,
         entries,
         byItemId: new Map(entries.map((entry) => [entry.summary.itemId, entry])),
         relations,
@@ -403,6 +425,10 @@ class CatalogItemQuery {
     });
     this.cachedSnapshot = snapshot;
     return snapshot;
+  }
+
+  revision() {
+    return this._snapshot().revision;
   }
 
   list(input = {}) {
@@ -574,15 +600,10 @@ class CatalogItemQuery {
       cursor: searchParams.get("cursor"),
       sort: searchParams.get("sort") || null,
       direction: searchParams.get("direction") || null,
-      filters: {
-        status: queryValues(searchParams, "status"),
-        disposition: queryValues(searchParams, "disposition"),
-        reviewAction: queryValues(searchParams, "reviewAction"),
-        iconFreshness: queryValues(searchParams, "iconFreshness"),
-        mergeChainId: queryValues(searchParams, "mergeChainId"),
-        level: queryValues(searchParams, "level"),
-        itemType: queryValues(searchParams, "itemType"),
-      },
+      filters: Object.fromEntries(FILTER_NAMES.map((name) => [
+        name,
+        queryValues(searchParams, name),
+      ])),
     };
   }
 }
