@@ -288,6 +288,101 @@ test("uniform screenshot backgrounds become transparent contour evidence", () =>
   assert.ok(evidence.composite > 0.8);
 });
 
+test("clipped control-console chrome never becomes an automatic display icon", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-clipped-chrome-"));
+  const database = new AutomationDatabase(path.join(root, "automation.db"));
+  database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId: "10100210",
+    payload: { itemId: "10100210", level: 2 },
+    sourceType: "runtime",
+  });
+  const chromeFragment = image(64, 64, (x, y) => {
+    if (x >= 12 && x < 64 && y >= 10 && y < 14 && (x + y) % 3 !== 0) return [70, 70, 70, 255];
+    if (x >= 12 && x < 18 && y >= 42 && y < 51) return [255, 135, 30, 255];
+    if (x >= 25 && x < 64 && y >= 43 && y < 47 && (x + y) % 4 !== 0) return [245, 105, 20, 255];
+    return [254, 251, 248, 255];
+  });
+  const target = {
+    observedItemId: "10100210",
+    runtimeSource: "board-item-view",
+    captureEligibility: "eligible",
+    bounds: { x: 0, y: 0, width: 64, height: 64 },
+    viewport: { width: 64, height: 64 },
+    devicePixelRatio: 1,
+  };
+  const service = new IconEvidenceService({
+    database,
+    cacheDir: path.join(root, "cache"),
+    screenshotFrameDelayMs: 0,
+    resolveSpriteFrame: async () => {
+      throw new Error("SpriteFrame resource not found for item 10100210");
+    },
+    resolveScreenshotBounds: async () => target,
+    captureScreenshot: async () => chromeFragment,
+  });
+  try {
+    service.request("10100210");
+    await service.waitForIdle();
+    assert.equal(service.getTask(1).status, "complete");
+    assert.equal(database.getSelectedIconCandidate("10100210"), null);
+    const [candidate] = database.listIconCandidates("10100210");
+    assert.equal(candidate.crop.backgroundRemoval.applied, true);
+    assert.equal(candidate.crop.backgroundRemoval.foreground.touchesEdge, true);
+    assert.equal(candidate.similarity.qualityGate.status, "rejected");
+    assert.ok(candidate.similarity.qualityGate.reasons.includes("foreground-clipped"));
+  } finally {
+    database.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup cleanup invalidates legacy automatic screenshots without foreground completeness evidence", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "icon-legacy-foreground-"));
+  const file = path.join(dataDir, "legacy-screenshot.png");
+  fs.writeFileSync(file, image(2, 2, () => [255, 120, 20, 255]));
+  let runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  try {
+    runtime.database.observeCatalogObject({
+      objectType: "item-identity",
+      objectId: "legacy-clipped-screenshot",
+      payload: { itemId: "legacy-clipped-screenshot" },
+      sourceType: "runtime",
+    });
+    runtime.database.saveIconCandidate({
+      itemId: "legacy-clipped-screenshot",
+      cacheKey: "legacy-clipped-screenshot",
+      sourceType: "screenshot-runtime",
+      crop: { backgroundRemoval: { applied: true } },
+      similarity: { qualityGate: { status: "eligible", reasons: [], stability: 1 } },
+      asset: {
+        hash: "c".repeat(64),
+        mimeType: "image/png",
+        width: 2,
+        height: 2,
+        byteSize: fs.statSync(file).size,
+        filePath: file,
+      },
+    });
+    assert.ok(runtime.database.getSelectedIconCandidate("legacy-clipped-screenshot"));
+    await runtime.close();
+
+    runtime = new AutomationRuntime({
+      rootDir: path.resolve(__dirname, ".."),
+      dataDir,
+      manageConnectionRoute: false,
+    });
+    assert.equal(runtime.database.getSelectedIconCandidate("legacy-clipped-screenshot"), null);
+  } finally {
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("manual icon selection outranks later automatic candidates and revoke retains history", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "icon-choice-"));
   const database = new AutomationDatabase(path.join(root, "automation.db"));

@@ -338,6 +338,8 @@ class AutomationRuntime {
     const invalidatedDisplayIcons = this.database.invalidateAutomaticIconSelections((candidate) => {
       if (candidate.sourceType === "screenshot-runtime") {
         return candidate.crop?.backgroundRemoval?.applied === true
+          && candidate.crop?.backgroundRemoval?.foreground?.touchesEdge === false
+          && Number(candidate.crop?.backgroundRemoval?.foreground?.largestComponentFraction || 0) >= 0.5
           && candidate.similarity?.qualityGate?.status === "eligible";
       }
       if (candidate.sourceType !== "cocos-runtime-resource"

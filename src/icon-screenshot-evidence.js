@@ -9,6 +9,62 @@ function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function foregroundGeometry(data, width, height) {
+  let minimumX = width;
+  let minimumY = height;
+  let maximumX = -1;
+  let maximumY = -1;
+  let pixelCount = 0;
+  for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) {
+    if (data[(y * width + x) * 4 + 3] < 32) continue;
+    minimumX = Math.min(minimumX, x);
+    minimumY = Math.min(minimumY, y);
+    maximumX = Math.max(maximumX, x);
+    maximumY = Math.max(maximumY, y);
+    pixelCount += 1;
+  }
+  if (!pixelCount) return { bounds: null, pixelCount: 0, touchesEdge: true };
+  const visited = new Uint8Array(width * height);
+  const componentSizes = [];
+  for (let pixel = 0; pixel < width * height; pixel += 1) {
+    if (visited[pixel] || data[pixel * 4 + 3] < 32) continue;
+    let componentSize = 0;
+    const pending = [pixel];
+    visited[pixel] = 1;
+    while (pending.length) {
+      const current = pending.pop();
+      componentSize += 1;
+      const x = current % width;
+      const y = Math.floor(current / width);
+      const neighbors = [
+        x > 0 ? current - 1 : -1,
+        x + 1 < width ? current + 1 : -1,
+        y > 0 ? current - width : -1,
+        y + 1 < height ? current + width : -1,
+      ];
+      for (const neighbor of neighbors) {
+        if (neighbor < 0 || visited[neighbor] || data[neighbor * 4 + 3] < 32) continue;
+        visited[neighbor] = 1;
+        pending.push(neighbor);
+      }
+    }
+    componentSizes.push(componentSize);
+  }
+  const largestComponent = Math.max(...componentSizes);
+  return {
+    bounds: {
+      x: minimumX,
+      y: minimumY,
+      width: maximumX - minimumX + 1,
+      height: maximumY - minimumY + 1,
+    },
+    componentCount: componentSizes.length,
+    largestComponentFraction: Number((largestComponent / pixelCount).toFixed(6)),
+    pixelCount,
+    touchesEdge: minimumX === 0 || minimumY === 0 || maximumX === width - 1 || maximumY === height - 1,
+  };
+}
+
 function removeUniformBackground(source, width, height) {
   const data = Buffer.from(source);
   const border = [];
@@ -16,20 +72,25 @@ function removeUniformBackground(source, width, height) {
   for (let y = 1; y + 1 < height; y += 1) { border.push((y * width * 4), ((y * width + width - 1) * 4)); }
   const background = [0, 1, 2].map((channel) => border.reduce((sum, offset) => sum + data[offset + channel], 0) / Math.max(1, border.length));
   const borderVariance = border.reduce((sum, offset) => sum + Math.sqrt((data[offset] - background[0]) ** 2 + (data[offset + 1] - background[1]) ** 2 + (data[offset + 2] - background[2]) ** 2), 0) / Math.max(1, border.length);
-  if (borderVariance > 18) return { data, applied: false, background: null };
+  if (borderVariance > 18) return { data, applied: false, background: null, foreground: null };
   const distances = [];
   for (let pixel = 0; pixel < width * height; pixel += 1) {
     const offset = pixel * 4;
     distances.push(Math.sqrt((data[offset] - background[0]) ** 2 + (data[offset + 1] - background[1]) ** 2 + (data[offset + 2] - background[2]) ** 2));
   }
   const foregroundFraction = distances.filter((distance) => distance > 32).length / distances.length;
-  if (foregroundFraction < 0.04 || foregroundFraction > 0.92) return { data, applied: false, background: null };
+  if (foregroundFraction < 0.04 || foregroundFraction > 0.92) return { data, applied: false, background: null, foreground: null };
   distances.forEach((distance, pixel) => {
     const offset = pixel * 4;
     const mask = clamp((distance - 10) / 38, 0, 1);
     data[offset + 3] = Math.round(data[offset + 3] * mask);
   });
-  return { data, applied: true, background: background.map((channel) => Math.round(channel)) };
+  return {
+    data,
+    applied: true,
+    background: background.map((channel) => Math.round(channel)),
+    foreground: foregroundGeometry(data, width, height),
+  };
 }
 
 function cropScreenshot(screenshotBody, target) {
@@ -60,7 +121,11 @@ function cropScreenshot(screenshotBody, target) {
     observedItemId: String(target.observedItemId),
     pixelCrop: { x, y, width, height },
     scale: { x: scaleX, y: scaleY, devicePixelRatio: Number(target.devicePixelRatio || scaleX) },
-    backgroundRemoval: { applied: normalized.applied, estimatedRgb: normalized.background },
+    backgroundRemoval: {
+      applied: normalized.applied,
+      estimatedRgb: normalized.background,
+      foreground: normalized.foreground,
+    },
   };
 }
 

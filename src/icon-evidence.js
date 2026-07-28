@@ -336,6 +336,10 @@ class IconEvidenceService {
     const qualityReasons = [];
     if (processed.similarity.frameSelection.acceptedFrameIndexes.length < Math.max(2, Math.ceil(frames.length * 2 / 3))) qualityReasons.push("unstable-frames");
     if (processed.crop.backgroundRemoval?.applied !== true) qualityReasons.push("background-not-isolated");
+    if (processed.crop.backgroundRemoval?.applied === true
+      && processed.crop.backgroundRemoval?.foreground?.touchesEdge !== false) qualityReasons.push("foreground-clipped");
+    if (processed.crop.backgroundRemoval?.applied === true
+      && Number(processed.crop.backgroundRemoval?.foreground?.largestComponentFraction || 0) < 0.5) qualityReasons.push("foreground-fragmented");
     if (targets.some((target) => target.captureEligibility === "transformed-board-item")) qualityReasons.push("transformed-board-item");
     const qualityGate = { status: qualityReasons.length ? "rejected" : "eligible", reasons: qualityReasons, stability };
     const { candidate, decisionChange } = this.database.saveIconCandidateWithDecision({
