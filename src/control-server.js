@@ -61,6 +61,44 @@ function readJson(req) {
   });
 }
 
+function catalogDirectoryContextPage(runtime, searchParams) {
+  const query = CatalogItemQuery.fromSearchParams(searchParams);
+  const requestedLoadedCount = Number(searchParams.get("loadedCount") || 0);
+  const loadedCount = Number.isSafeInteger(requestedLoadedCount) && requestedLoadedCount > 0
+    ? requestedLoadedCount
+    : 0;
+  const selectedItemId = searchParams.get("selectedItemId");
+  let page = runtime.listCatalogItems(query);
+  if (!query.cursor && loadedCount > page.items.length) {
+    while (page.hasMore && page.nextCursor && page.items.length < loadedCount) {
+      const next = runtime.listCatalogItems({ ...query, cursor: page.nextCursor });
+      page = {
+        ...next,
+        returnedCount: Number(page.returnedCount || 0) + Number(next.returnedCount || 0),
+        items: [...page.items, ...next.items],
+      };
+    }
+  }
+  if (!selectedItemId) return page;
+
+  let membershipPage = query.cursor
+    ? runtime.listCatalogItems({ ...query, cursor: null })
+    : page;
+  let selectionInResults = membershipPage.items.some(
+    (item) => item.itemId === selectedItemId,
+  );
+  while (!selectionInResults && membershipPage.hasMore && membershipPage.nextCursor) {
+    membershipPage = runtime.listCatalogItems({
+      ...query,
+      cursor: membershipPage.nextCursor,
+    });
+    selectionInResults = membershipPage.items.some(
+      (item) => item.itemId === selectedItemId,
+    );
+  }
+  return { ...page, selectionInResults };
+}
+
 function createControlServer({ runtime, publicRoot, dataDir } = {}) {
   if (!runtime) throw new TypeError("runtime is required");
   const staticRoot = path.resolve(publicRoot || path.join(__dirname, "..", "public"));
@@ -170,7 +208,7 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "GET /api/dashboard") return writeJson(res, 200, await dashboard());
       if (route === "GET /api/catalog") return writeJson(res, 200, runtime.getCatalogView());
       if (route === "GET /api/catalog/items") {
-        return writeJson(res, 200, runtime.listCatalogItems(CatalogItemQuery.fromSearchParams(requestUrl.searchParams)));
+        return writeJson(res, 200, catalogDirectoryContextPage(runtime, requestUrl.searchParams));
       }
       const catalogItemMatch = /^\/api\/catalog\/items\/([^/]+)$/.exec(requestUrl.pathname);
       if ((req.method || "GET") === "GET" && catalogItemMatch) {

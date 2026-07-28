@@ -34,6 +34,17 @@
   font-size: .72rem;
 }
 
+.directory-selection-note strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text);
+}
+
+.catalog-directory-detail h2:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
 @media (max-width: 1100px) {
   .catalog-directory-query-controls {
     grid-template-columns: repeat(2, minmax(150px, 1fr));

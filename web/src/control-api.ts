@@ -27,6 +27,8 @@ export type CatalogItemQueryInput = {
   sort?: CatalogItemSort;
   direction?: CatalogItemSortDirection;
   filters?: CatalogItemFilters;
+  loadedCount?: number;
+  selectedItemId?: string | null;
 };
 
 export type CatalogItemQueryPage = {
@@ -37,6 +39,7 @@ export type CatalogItemQueryPage = {
   hasMore: boolean;
   nextCursor: CatalogCursor | null;
   items: any[];
+  selectionInResults?: boolean;
 };
 
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
@@ -125,6 +128,8 @@ export const controlApi = {
     if (input.cursor) search.set("cursor", input.cursor);
     if (input.sort) search.set("sort", input.sort);
     if (input.direction) search.set("direction", input.direction);
+    if (input.loadedCount) search.set("loadedCount", String(input.loadedCount));
+    if (input.selectedItemId) search.set("selectedItemId", input.selectedItemId);
     for (const [name, values] of Object.entries(input.filters || {})) {
       for (const value of values || []) search.append(name, value);
     }

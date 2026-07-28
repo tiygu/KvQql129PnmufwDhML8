@@ -57,6 +57,44 @@ function activateIdentityPayload(runtime, objectId, payload) {
   runtime.catalogGate.evaluateObject("item-identity", objectId);
 }
 
+async function createBrowserDirectoryFixture(runtime, dataDir, viewport) {
+  runtime.dashboard = async () => ({
+    connected: false,
+    connectionError: "browser fixture",
+    running: false,
+    paused: false,
+    state: runtime.lastState,
+    plan: { status: "ready", plans: [], recommended: null },
+    catalog: runtime.getCatalogView().stats,
+    catalogView: runtime.getCatalogView({ includeRepositoryObjects: false }),
+    actions: [],
+    sessions: [],
+    resourceSamples: [],
+    connectionRoute: { listening: false, managed: false },
+    runtimeControl: { mocked: true },
+  });
+  const server = createControlServer({
+    runtime,
+    publicRoot: path.join(__dirname, "..", "public"),
+    dataDir,
+  });
+  const port = await listen(server);
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport });
+  return {
+    browser,
+    page,
+    port,
+    server,
+    async close() {
+      await browser.close();
+      await server.close();
+      await runtime.close();
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    },
+  };
+}
+
 test("Catalog Review Workspace 明确切换全部物品且只在显式选择后打开只读详情", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-directory-browser-"));
   const runtime = new AutomationRuntime({
@@ -145,6 +183,34 @@ test("Catalog Review Workspace 明确切换全部物品且只在显式选择后�
     await server.close();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("invalid itemId deep link renders an explicit not-found selection state", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-not-found-browser-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  const fixture = await createBrowserDirectoryFixture(
+    runtime,
+    dataDir,
+    { width: 1280, height: 800 },
+  );
+  const { page, port } = fixture;
+
+  try {
+    await page.goto(`http://127.0.0.1:${port}/?itemId=deleted-item`, { waitUntil: "networkidle" });
+    const notFound = page.locator("[data-selection-status=\"not-found\"]");
+    await notFound.waitFor();
+    await notFound.getByText("deleted-item", { exact: true }).waitFor();
+    assert.match(page.url(), /[?&]itemId=deleted-item(?:&|$)/);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.locator("[data-selection-status=\"not-found\"]").waitFor();
+  } finally {
+    await fixture.close();
   }
 });
 
@@ -273,6 +339,121 @@ test("complete-directory controls preserve server order and restore pending quer
     await server.close();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("relationship history restores query, pagination, list scroll, and keyboard focus", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-history-browser-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  activateIdentityPayload(runtime, "history-origin", {
+    name: "History Item Origin",
+    level: 1,
+    type: "flower",
+    chainId: "history-chain",
+  });
+  activateIdentityPayload(runtime, "history-target", {
+    name: "History Item Target",
+    level: 2,
+    type: "generator",
+    chainId: "history-chain",
+  });
+  activateIdentityPayload(runtime, "history-late", {
+    name: "ZZZ History Item Late",
+    level: 3,
+    type: "flower",
+    chainId: "history-chain",
+  });
+  for (let index = 0; index < 205; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    observeIdentityPayload(runtime, `history-filler-${suffix}`, {
+      name: `History Item Filler ${suffix}`,
+      level: 1,
+      type: "flower",
+      chainId: `history-filler-chain-${suffix}`,
+    });
+  }
+  const fixture = await createBrowserDirectoryFixture(
+    runtime,
+    dataDir,
+    { width: 1280, height: 900 },
+  );
+  const { page, port, server } = fixture;
+
+  try {
+    await page.goto(`http://127.0.0.1:${port}/?itemId=history-origin`, { waitUntil: "networkidle" });
+    await page.getByRole("heading", { name: "History Item Origin" }).waitFor();
+
+    const lateRelation = page.getByRole("button", { name: /ZZZ History Item Late/ });
+    await lateRelation.click();
+    await page.getByRole("heading", { name: "ZZZ History Item Late" }).waitFor();
+    assert.equal(await page.locator("[data-selection-status=\"out-of-results\"]").count(), 0);
+    await page.goBack();
+    await page.getByRole("heading", { name: "History Item Origin" }).waitFor();
+
+    const search = page.locator(".catalog-directory-toolbar input[type=search]");
+    const sort = page.locator(".catalog-directory-query-controls select").filter({ has: page.locator("option[value=\"chain-level\"]") });
+    const direction = page.locator(".catalog-directory-query-controls select[aria-label=\"排序方向\"]");
+    const itemType = page.locator(".catalog-directory-query-controls input[aria-label=\"物品类型筛选\"]");
+    await search.fill("item");
+    await sort.selectOption("chain-level");
+    await direction.selectOption("desc");
+    await itemType.fill("flower");
+
+    const loadMore = page.locator(".directory-load-more");
+    await loadMore.waitFor();
+    await loadMore.click();
+    await page.locator(".catalog-directory-list .directory-copy-id[title=\"history-origin\"]").waitFor();
+    assert.equal(await page.locator(".catalog-directory-list .directory-copy-id").count(), 207);
+
+    const list = page.locator(".catalog-directory-list .review-queue-list");
+    await list.evaluate((element) => { element.scrollTop = 200; });
+    server.broadcast({
+      type: "control-connected",
+      catalogQueryRevision: runtime.getCatalogQueryRevision(),
+    });
+    await page.waitForTimeout(50);
+    await list.evaluate((element) => { element.scrollTop = 320; });
+    const originalScrollTop = await list.evaluate((element) => element.scrollTop);
+
+    activateIdentityPayload(runtime, "history-refresh", {
+      name: "History Item Refresh",
+      level: 1,
+      type: "flower",
+      chainId: "history-refresh-chain",
+    });
+    server.broadcast({ type: "catalog-test-tick" });
+    await page.locator(".catalog-directory-list .directory-copy-id[title=\"history-refresh\"]").waitFor();
+    assert.equal(await list.evaluate((element) => element.scrollTop), originalScrollTop);
+
+    const relationTarget = page.getByRole("button", { name: /History Item Target/ });
+    await relationTarget.focus();
+    await relationTarget.press("Enter");
+    const targetHeading = page.getByRole("heading", { name: "History Item Target" });
+    await targetHeading.waitFor();
+    await page.locator("[data-selection-status=\"out-of-results\"]").waitFor();
+    assert.equal(await page.locator(".catalog-directory-detail input, .catalog-directory-detail textarea").count(), 0);
+    assert.equal(await targetHeading.evaluate((element) => element === document.activeElement), true);
+    assert.equal(await list.evaluate((element) => element.scrollTop), originalScrollTop);
+
+    await page.reload({ waitUntil: "networkidle" });
+    await page.getByRole("heading", { name: "History Item Target" }).waitFor();
+    await page.locator("[data-selection-status=\"out-of-results\"]").waitFor();
+
+    await page.goBack();
+    await page.getByRole("heading", { name: "History Item Origin" }).waitFor();
+    assert.equal(await search.inputValue(), "item");
+    assert.equal(await sort.inputValue(), "chain-level");
+    assert.equal(await direction.inputValue(), "desc");
+    assert.equal(await itemType.inputValue(), "flower");
+    assert.equal(await page.locator(".catalog-directory-list .directory-copy-id").count(), 208);
+    assert.equal(await list.evaluate((element) => element.scrollTop), originalScrollTop);
+    assert.equal(await relationTarget.evaluate((element) => element === document.activeElement), true);
+  } finally {
+    await fixture.close();
   }
 });
 

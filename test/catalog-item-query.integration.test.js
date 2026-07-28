@@ -316,6 +316,40 @@ test("物品目录搜索、游标和只读详情保持同一 Catalog Query Revis
   });
 });
 
+test("目录上下文请求在 Node 侧恢复分页深度并判定已选项是否仍在结果集", async () => {
+  await withFixture(async ({ runtime, baseUrl }) => {
+    for (let index = 0; index < 5; index += 1) {
+      activateIdentity(runtime, `context-item-${index}`, {
+        itemId: `context-item-${index}`,
+        name: `Context Item ${index}`,
+        level: index + 1,
+        type: index === 4 ? "generator" : "flower",
+        chainId: "context-chain",
+      });
+    }
+
+    const expanded = await fetch(
+      `${baseUrl}/api/catalog/items?q=context-item&pageSize=2&loadedCount=5&selectedItemId=context-item-4`,
+    ).then((response) => response.json());
+    assert.equal(expanded.returnedCount, 5);
+    assert.equal(expanded.items.length, 5);
+    assert.equal(expanded.hasMore, false);
+    assert.equal(expanded.selectionInResults, true);
+
+    const firstPage = await fetch(
+      `${baseUrl}/api/catalog/items?q=context-item&pageSize=2&selectedItemId=context-item-4`,
+    ).then((response) => response.json());
+    assert.equal(firstPage.items.length, 2);
+    assert.equal(firstPage.hasMore, true);
+    assert.equal(firstPage.selectionInResults, true);
+
+    const excluded = await fetch(
+      `${baseUrl}/api/catalog/items?q=context-item&pageSize=2&itemType=flower&selectedItemId=context-item-4`,
+    ).then((response) => response.json());
+    assert.equal(excluded.selectionInResults, false);
+  });
+});
+
 test("目录查询公开默认与最大 page size 并拒绝越界值", async () => {
   await withFixture(async ({ runtime, baseUrl }) => {
     const baselineTotal = runtime.listCatalogItems({ pageSize: 200 }).total;
