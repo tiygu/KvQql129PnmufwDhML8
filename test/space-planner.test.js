@@ -186,6 +186,30 @@ test("Item Opportunity Value saturates exact demand and permits merging true sur
   assert.equal(result.score.opportunityLoss, 0);
 });
 
+test("runtime task-need hints reserve only the required count and leave surplus copies mergeable", () => {
+  const input = fixture({
+    grids: [
+      { itemId: "p", produceCount: 20, energyCost: 1 },
+      { itemId: "x1", taskNeed: true },
+      { itemId: "x1", taskNeed: true },
+      { itemId: "x1", taskNeed: true },
+      { itemId: "b1" },
+    ],
+    empty: 0,
+  });
+  input.state.board.width = 5;
+  input.state.board.requiredItemCounts.x1 = 1;
+
+  const normalized = normalizePlannerState(input);
+  const surplus = normalized.board.grids.filter((grid) => grid.itemId === "x1");
+  const result = planDeterministicOrder(normalized, "o");
+
+  assert.equal(surplus.filter((grid) => grid.protected).length, 1);
+  assert.equal(result.status, "planned");
+  assert.equal(result.nextAction.type, "merge");
+  assert.equal(result.nextAction.itemId, "x1");
+});
+
 test("small deterministic merge fixtures preserve units and never create negative capacity", () => {
   for (let pairs = 1; pairs <= 6; pairs += 1) {
     const grids = Array.from({ length: pairs * 2 }, () => ({ itemId: "b1" }));

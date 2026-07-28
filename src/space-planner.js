@@ -34,12 +34,16 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
   const capacity = Math.max(occupied + empty, Number.isFinite(dimensions) ? dimensions : 0);
   const explicitProtected = new Set((protectionRules.itemIds || []).map(String));
   const gridFacts = sourceGrids.map((grid) => ({ grid, reasons: grid.itemId ? gridUnavailabilityReasons(grid) : [] }));
-  const taskNeedCounts = new Map();
-  for (const { grid, reasons } of gridFacts) if (grid.taskNeed && grid.itemId && reasons.length === 0) taskNeedCounts.set(String(grid.itemId), (taskNeedCounts.get(String(grid.itemId)) || 0) + 1);
-  const remainingRequired = new Map(Object.entries(state.board?.requiredItemCounts || {}).map(([itemId, count]) => [String(itemId), Math.max(0, (Number(count) || 0) - (taskNeedCounts.get(String(itemId)) || 0))]));
+  // Runtime taskNeed is an item-identity hint: it can be present on every
+  // matching grid, while requiredItemCounts is the authoritative number of
+  // copies that must remain reserved. Allocate reservations as we walk the
+  // executable grids instead of protecting every taskNeed-marked duplicate.
+  const remainingRequired = new Map(Object.entries(state.board?.requiredItemCounts || {}).map(([itemId, count]) => [String(itemId), Math.max(0, Number(count) || 0)]));
   const grids = gridFacts.map(({ grid, reasons }) => {
     const itemId = String(grid.itemId || "");
-    const requiredReservation = reasons.length === 0 && !grid.taskNeed && (remainingRequired.get(itemId) || 0) > 0;
+    const taskNeedReservation = reasons.length === 0 && !!grid.taskNeed && (remainingRequired.get(itemId) || 0) > 0;
+    if (taskNeedReservation) remainingRequired.set(itemId, Math.max(0, (remainingRequired.get(itemId) || 0) - 1));
+    const requiredReservation = reasons.length === 0 && !taskNeedReservation && !grid.taskNeed && (remainingRequired.get(itemId) || 0) > 0;
     if (requiredReservation) remainingRequired.set(itemId, Math.max(0, (remainingRequired.get(itemId) || 0) - 1));
     return {
       index: Number(grid.index), itemId, empty: !itemId || !!grid.empty,
@@ -53,7 +57,7 @@ function normalizePlannerState({ state, catalog, protectionRules = {} }) {
       productionModeSwitchEntry: grid.productionModeSwitchEntry ? { ...grid.productionModeSwitchEntry } : { status: "unknown", method: null },
       executable: !itemId || reasons.length === 0,
       unavailableReasons: reasons,
-      protected: !!grid.taskNeed || requiredReservation || explicitProtected.has(itemId),
+      protected: taskNeedReservation || requiredReservation || explicitProtected.has(itemId),
     };
   });
   const mapRequirement = (state.mapMission?.requirements || []).find((requirement) => Number(requirement.resourceType) === 1);
