@@ -25,25 +25,25 @@ function observeIdentity(database, objectId = "item-1", name = "候选物品") {
   });
 }
 
-test("图鉴 Schema v3 迁移会先备份且重复启动保持幂等", () => withDirectory((dir) => {
+test("图鉴 Schema v4 迁移会先备份且重复启动保持幂等", () => withDirectory((dir) => {
   const filePath = path.join(dir, "catalog.db");
   let database = new AutomationDatabase(filePath);
-  database.db.exec("PRAGMA user_version=2; DELETE FROM schema_migrations WHERE version=3;");
+  database.db.exec("PRAGMA user_version=3; DELETE FROM schema_migrations WHERE version=4;");
   database.close();
 
   database = new AutomationDatabase(filePath);
   const status = database.getCatalogSchemaStatus();
-  const backupPath = `${filePath}.pre-v3.bak`;
+  const backupPath = `${filePath}.pre-v4.bak`;
 
-  assert.equal(status.currentVersion, 3);
-  assert.deepEqual(status.migrations.map((migration) => migration.version), [1, 2, 3]);
+  assert.equal(status.currentVersion, 4);
+  assert.deepEqual(status.migrations.map((migration) => migration.version), [1, 2, 3, 4]);
   assert.equal(status.preMigrationBackupPath, backupPath);
   assert.equal(fs.existsSync(backupPath), true);
   const backupStat = fs.statSync(backupPath);
   database.close();
 
   database = new AutomationDatabase(filePath);
-  assert.equal(database.getCatalogSchemaStatus().currentVersion, 3);
+  assert.equal(database.getCatalogSchemaStatus().currentVersion, 4);
   assert.equal(fs.statSync(backupPath).mtimeMs, backupStat.mtimeMs);
   database.close();
 }));

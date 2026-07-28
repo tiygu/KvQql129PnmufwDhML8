@@ -2,6 +2,17 @@
 
 const fs = require("node:fs");
 const { canonicalJson } = require("./canonical-json");
+const {
+  displayIconManualProtection,
+  recordDisplayIconHistory,
+  setDisplayIconSelection,
+} = require("./display-icon-persistence");
+const {
+  automaticCandidateEligible,
+  automaticCandidatePriority,
+  evaluateIconEvidenceCurrency,
+  provenanceForNewCandidate,
+} = require("./icon-evidence-currency");
 
 function parseJson(value) {
   return value == null ? null : JSON.parse(value);
@@ -22,11 +33,23 @@ class DisplayIconDecision {
       assetHash: row.asset_hash,
       cacheKey: row.cache_key,
       sourceType: row.source_type,
+      provenance: {
+        producer: row.producer || null,
+        reconstructionVersion: row.reconstruction_version || null,
+        qualityContractVersion: row.quality_contract_version || null,
+      },
+      currency: {
+        status: row.currency_status,
+        reason: row.currency_reason,
+        policyVersion: row.currency_policy_version,
+        evaluatedAt: row.currency_evaluated_at,
+      },
       resourceUrl: row.resource_url,
       runtimeIdentifier: row.runtime_identifier,
       textureUuid: row.texture_uuid,
       crop: parseJson(row.crop_json),
       selected: !!row.selected,
+      superseded: !!row.superseded,
       similarity: parseJson(row.similarity_json) || {},
       rankScore: Number(row.rank_score),
       selectionOrigin: row.selection_origin || null,
@@ -56,7 +79,11 @@ class DisplayIconDecision {
     return `SELECT candidate.*,object.object_id AS object_key,
       asset.mime_type,asset.width,asset.height,asset.byte_size,asset.file_path,
       CASE WHEN decision.selected_candidate_id=candidate.id THEN 1 ELSE 0 END AS selected,
-      CASE WHEN decision.selected_candidate_id=candidate.id THEN decision.selection_origin ELSE NULL END AS selection_origin
+      CASE WHEN decision.selected_candidate_id=candidate.id THEN decision.selection_origin ELSE NULL END AS selection_origin,
+      EXISTS(
+        SELECT 1 FROM catalog_icon_candidate_lineage lineage
+        WHERE lineage.predecessor_candidate_id=candidate.id
+      ) AS superseded
       FROM catalog_icon_candidates candidate
       JOIN catalog_repository_objects object ON object.id=candidate.object_id
       JOIN catalog_icon_assets asset ON asset.hash=candidate.asset_hash
@@ -78,6 +105,17 @@ class DisplayIconDecision {
       WHERE candidate.object_id=? ORDER BY candidate.id`).all(repositoryObjectId).map((row) => this._candidate(row));
   }
 
+  _automaticCandidates(repositoryObjectId) {
+    return this.db.prepare(`${this._candidateSelect()}
+      WHERE candidate.object_id=?`).all(repositoryObjectId)
+      .map((candidate) => ({
+        ...candidate,
+        file_path: this.resolveAssetPath(candidate.asset_hash, candidate.file_path),
+      }))
+      .filter(automaticCandidateEligible)
+      .sort(automaticCandidatePriority);
+  }
+
   selected(repositoryObjectId) {
     const candidate = this._candidate(this.db.prepare(`${this._candidateSelect()}
       WHERE candidate.object_id=? AND decision.selected_candidate_id=candidate.id
@@ -87,6 +125,13 @@ class DisplayIconDecision {
 
   readByObjectId(repositoryObjectId) {
     const decision = this.db.prepare("SELECT * FROM catalog_icon_decisions WHERE object_id=?").get(repositoryObjectId);
+    const selectedCandidate = decision?.selected_candidate_id == null
+      ? null
+      : this._candidate(this.db.prepare(`${this._candidateSelect()}
+        WHERE candidate.id=? AND candidate.object_id=?`).get(
+        decision.selected_candidate_id,
+        repositoryObjectId,
+      ));
     const history = this.db.prepare(`SELECT history.*,candidate.asset_hash,previous.asset_hash AS previous_asset_hash
       FROM catalog_icon_selection_history history
       LEFT JOIN catalog_icon_candidates candidate ON candidate.id=history.candidate_id
@@ -106,6 +151,11 @@ class DisplayIconDecision {
     }));
     return {
       revision: Number(decision?.revision || 1),
+      selectionOrigin: decision?.selection_origin || null,
+      manualProtection: decision?.selection_origin === "manual",
+      protectedEmpty: decision?.selection_origin === "manual"
+        && decision?.selected_candidate_id == null,
+      selectedCandidate,
       selectedIcon: this.selected(repositoryObjectId),
       candidates: this.candidates(repositoryObjectId),
       history,
@@ -132,47 +182,6 @@ class DisplayIconDecision {
     throw conflict;
   }
 
-  _setSelection(object, candidateId, selectionOrigin, now) {
-    const before = this._ensure(object, now);
-    this.db.prepare(`UPDATE catalog_icon_decisions
-      SET selected_candidate_id=?,selection_origin=?,revision=revision+1,updated_at=?
-      WHERE object_id=?`).run(candidateId, selectionOrigin, now, object.id);
-    this.db.prepare("UPDATE catalog_icon_candidates SET selected=0,selection_origin=NULL WHERE object_id=?").run(object.id);
-    if (candidateId != null) {
-      this.db.prepare("UPDATE catalog_icon_candidates SET selected=1,selection_origin=? WHERE id=?")
-        .run(selectionOrigin, candidateId);
-    }
-    return {
-      before,
-      after: this.db.prepare("SELECT * FROM catalog_icon_decisions WHERE object_id=?").get(object.id),
-    };
-  }
-
-  _recordHistory(object, {
-    candidateId = null,
-    previousCandidateId = null,
-    action,
-    actor,
-    note,
-    decisionRevision,
-    createdAt,
-  }) {
-    this.db.prepare(`INSERT INTO catalog_icon_selection_history(
-      object_id,candidate_id,previous_candidate_id,action,actor,note,
-      object_revision,decision_revision,created_at
-    ) VALUES(?,?,?,?,?,?,?,?,?)`).run(
-      object.id,
-      candidateId,
-      previousCandidateId,
-      action,
-      actor,
-      note,
-      Number(object.revision),
-      Number(decisionRevision),
-      createdAt,
-    );
-  }
-
   observeCandidate({
     itemId,
     cacheKey,
@@ -184,6 +193,9 @@ class DisplayIconDecision {
     similarity = {},
     rankScore = 1,
     autoSelect = true,
+    producer = null,
+    reconstructionVersion = null,
+    qualityContractVersion = null,
     asset,
   }) {
     if (!asset?.hash || !asset.mimeType || !Number.isInteger(Number(asset.width))
@@ -194,37 +206,86 @@ class DisplayIconDecision {
       const object = this._object(itemId);
       if (!object) throw new Error(`catalog object not found: item-identity/${itemId}`);
       const now = new Date().toISOString();
+      const provenance = provenanceForNewCandidate({
+        sourceType,
+        producer,
+        reconstructionVersion,
+        qualityContractVersion,
+      });
+      const currency = evaluateIconEvidenceCurrency({
+        sourceType,
+        producer: provenance.producer,
+        reconstructionVersion: provenance.reconstructionVersion,
+        qualityContractVersion: provenance.qualityContractVersion,
+      });
       this.db.prepare(`INSERT INTO catalog_icon_assets(hash,mime_type,width,height,byte_size,file_path,created_at)
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(hash) DO NOTHING`)
         .run(String(asset.hash), String(asset.mimeType), Number(asset.width), Number(asset.height),
           Number(asset.byteSize), String(asset.filePath), now);
       const decision = this._ensure(object, now);
-      const manualPreference = this.db.prepare(`SELECT action FROM catalog_icon_selection_history
-        WHERE object_id=? AND action IN ('manual-select','manual-revoke') ORDER BY id DESC LIMIT 1`).get(object.id);
+      const manualPreference = displayIconManualProtection(
+        this.db,
+        object.id,
+        decision.selection_origin,
+      );
       const selected = decision.selected_candidate_id == null
         ? null
         : this.db.prepare("SELECT * FROM catalog_icon_candidates WHERE id=?").get(decision.selected_candidate_id);
-      const shouldSelect = autoSelect && !manualPreference
-        && (!selected || Number(rankScore) >= Number(selected.rank_score));
       this.db.prepare(`INSERT INTO catalog_icon_candidates(
-        object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,
+        object_id,asset_hash,cache_key,source_type,producer,reconstruction_version,
+        quality_contract_version,currency_status,currency_reason,currency_policy_version,
+        currency_evaluated_at,resource_url,runtime_identifier,texture_uuid,
         crop_json,similarity_json,rank_score,selection_origin,selected,created_at
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,0,?)
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,0,?)
       ON CONFLICT(object_id,cache_key) DO UPDATE SET
-        asset_hash=excluded.asset_hash,source_type=excluded.source_type,
-        resource_url=excluded.resource_url,runtime_identifier=excluded.runtime_identifier,
-        texture_uuid=excluded.texture_uuid,crop_json=excluded.crop_json,
-        similarity_json=excluded.similarity_json,rank_score=excluded.rank_score`)
-        .run(object.id, String(asset.hash), String(cacheKey), String(sourceType), resourceUrl,
-          runtimeIdentifier, textureUuid, canonicalJson(crop || {}), canonicalJson(similarity || {}),
-          Number(rankScore), now);
+        asset_hash=excluded.asset_hash,
+        resource_url=excluded.resource_url,
+        runtime_identifier=excluded.runtime_identifier,
+        texture_uuid=excluded.texture_uuid,
+        crop_json=excluded.crop_json,
+        similarity_json=excluded.similarity_json,
+        rank_score=excluded.rank_score`)
+        .run(
+          object.id,
+          String(asset.hash),
+          String(cacheKey),
+          String(sourceType),
+          provenance.producer,
+          provenance.reconstructionVersion,
+          provenance.qualityContractVersion,
+          currency.status,
+          currency.reason,
+          currency.policyVersion,
+          now,
+          resourceUrl,
+          runtimeIdentifier,
+          textureUuid,
+          canonicalJson(crop || {}),
+          canonicalJson(similarity || {}),
+          Number(rankScore),
+          now,
+        );
       const candidate = this.db.prepare(
         "SELECT * FROM catalog_icon_candidates WHERE object_id=? AND cache_key=?",
       ).get(object.id, String(cacheKey));
+      const automaticCandidates = this._automaticCandidates(object.id);
+      const eligibleCandidate = automaticCandidates.find((entry) => entry.id === candidate.id);
+      const eligibleSelected = selected
+        ? automaticCandidates.find((entry) => entry.id === selected.id)
+        : null;
+      const shouldSelect = autoSelect && !manualPreference && eligibleCandidate
+        && (!eligibleSelected
+          || automaticCandidatePriority(eligibleCandidate, eligibleSelected) < 0);
       let decisionChange = null;
       if (shouldSelect && Number(decision.selected_candidate_id) !== Number(candidate.id)) {
-        const { after } = this._setSelection(object, candidate.id, "automatic", now);
-        this._recordHistory(object, {
+        const { after } = setDisplayIconSelection(
+          this.db,
+          object,
+          candidate.id,
+          "automatic",
+          now,
+        );
+        recordDisplayIconHistory(this.db, object, {
           candidateId: candidate.id,
           previousCandidateId: decision.selected_candidate_id == null
             ? null
@@ -277,17 +338,28 @@ class DisplayIconDecision {
         if (!candidate) {
           throw Object.assign(new Error(`icon candidate not found: ${command.candidateId}`), { statusCode: 404 });
         }
+      } else if (command.kind === "automatic") {
+        candidate = this._automaticCandidates(object.id)[0] || null;
       } else if (command.kind !== "revoke") {
         throw new TypeError(`unsupported display icon decision: ${command.kind}`);
       }
       const previousCandidateId = decision.selected_candidate_id == null
         ? null
         : Number(decision.selected_candidate_id);
-      const { after } = this._setSelection(object, candidate?.id ?? null, command.kind === "select" ? "manual" : null, now);
-      this._recordHistory(object, {
+      const automatic = command.kind === "automatic";
+      const { after } = setDisplayIconSelection(
+        this.db,
+        object,
+        candidate?.id ?? null,
+        automatic ? (candidate ? "automatic" : null) : "manual",
+        now,
+      );
+      recordDisplayIconHistory(this.db, object, {
         candidateId: candidate?.id ?? null,
         previousCandidateId,
-        action: command.kind === "select" ? "manual-select" : "manual-revoke",
+        action: automatic
+          ? "automatic-control-return"
+          : command.kind === "select" ? "manual-select" : "manual-revoke",
         actor: String(command.actor).trim(),
         note: String(command.note).trim(),
         decisionRevision: after.revision,
@@ -309,8 +381,8 @@ class DisplayIconDecision {
         if (isEligible(candidate)) continue;
         const object = this._object(candidate.itemId);
         const now = new Date().toISOString();
-        const { after } = this._setSelection(object, null, null, now);
-        this._recordHistory(object, {
+        const { after } = setDisplayIconSelection(this.db, object, null, null, now);
+        recordDisplayIconHistory(this.db, object, {
           previousCandidateId: candidate.id,
           action: "automatic-invalidate",
           actor: "runtime-quality-gate",

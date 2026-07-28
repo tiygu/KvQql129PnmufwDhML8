@@ -7,6 +7,7 @@ const { DatabaseSync } = require("node:sqlite");
 const { canonicalJson } = require("./canonical-json");
 const { CATALOG_OBJECT_TYPES } = require("./catalog-domain");
 const { DisplayIconDecision } = require("./display-icon-decision");
+const { migrateIconEvidenceCurrency } = require("./icon-evidence-currency");
 const { createDistributionState, updateDistributionState, replaceTheory, projectPlanningDistribution } = require("./production-distributions");
 
 const CATALOG_VERSION_STATES = new Set(["observed", "provisional", "active"]);
@@ -15,7 +16,7 @@ const CATALOG_DISPOSITIONS = new Set(["enabled", "paused", "rejected"]);
 const CATALOG_EVIDENCE_DISPOSITIONS = new Set(["eligible", "paused", "rejected"]);
 const CATALOG_RULING_DECISIONS = new Set(["confirm", "modify", "revoke"]);
 const CATALOG_RELEASE_ENTRY_MODES = new Set(["full-snapshot", "legacy-advanced"]);
-const CURRENT_CATALOG_SCHEMA_VERSION = 3;
+const CURRENT_CATALOG_SCHEMA_VERSION = 4;
 const CURRENT_CATALOG_REVIEW_SCHEMA_VERSION = 2;
 const UNSAFE_FIELD_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 const ITEM_IDENTITY_PRESENTATION_FIELDS = new Set([
@@ -212,7 +213,7 @@ class AutomationDatabase {
     }
     this.preMigrationBackupPath = fs.existsSync(backupPath) ? backupPath : null;
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-    this.migrate();
+    this.transaction(() => this.migrate());
     this.displayIconDecision = new DisplayIconDecision({
       db: this.db,
       transaction: (work) => this.transaction(work),
@@ -406,6 +407,13 @@ class AutomationDatabase {
         asset_hash TEXT NOT NULL,
         cache_key TEXT NOT NULL,
         source_type TEXT NOT NULL,
+        producer TEXT,
+        reconstruction_version TEXT,
+        quality_contract_version TEXT,
+        currency_status TEXT NOT NULL DEFAULT 'unknown',
+        currency_reason TEXT NOT NULL DEFAULT 'not-evaluated',
+        currency_policy_version TEXT NOT NULL DEFAULT '',
+        currency_evaluated_at TEXT,
         resource_url TEXT,
         runtime_identifier TEXT,
         texture_uuid TEXT,
@@ -442,6 +450,30 @@ class AutomationDatabase {
         updated_at TEXT NOT NULL,
         FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
         FOREIGN KEY(selected_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS catalog_icon_currency_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_id INTEGER NOT NULL,
+        candidate_id INTEGER NOT NULL,
+        previous_status TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(object_id) REFERENCES catalog_repository_objects(id) ON DELETE RESTRICT,
+        FOREIGN KEY(candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS catalog_icon_candidate_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        predecessor_candidate_id INTEGER NOT NULL,
+        successor_candidate_id INTEGER NOT NULL,
+        relation TEXT NOT NULL DEFAULT 'replaced-by',
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(predecessor_candidate_id,successor_candidate_id,relation),
+        FOREIGN KEY(predecessor_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT,
+        FOREIGN KEY(successor_candidate_id) REFERENCES catalog_icon_candidates(id) ON DELETE RESTRICT
       );
       CREATE TABLE IF NOT EXISTS automation_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT, mode TEXT NOT NULL, started_at TEXT NOT NULL,
@@ -501,6 +533,9 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_candidates_asset ON catalog_icon_candidates(asset_hash);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_catalog_icon_candidates_one_selected ON catalog_icon_candidates(object_id) WHERE selected=1;
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_selection_history_object ON catalog_icon_selection_history(object_id,id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_icon_currency_history_candidate ON catalog_icon_currency_history(candidate_id,id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_predecessor ON catalog_icon_candidate_lineage(predecessor_candidate_id,id);
+      CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_successor ON catalog_icon_candidate_lineage(successor_candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);
@@ -511,6 +546,13 @@ class AutomationDatabase {
     if (!iconCandidateColumns.has("similarity_json")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN similarity_json TEXT NOT NULL DEFAULT '{}'");
     if (!iconCandidateColumns.has("rank_score")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN rank_score REAL NOT NULL DEFAULT 1");
     if (!iconCandidateColumns.has("selection_origin")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN selection_origin TEXT");
+    if (!iconCandidateColumns.has("producer")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN producer TEXT");
+    if (!iconCandidateColumns.has("reconstruction_version")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN reconstruction_version TEXT");
+    if (!iconCandidateColumns.has("quality_contract_version")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN quality_contract_version TEXT");
+    if (!iconCandidateColumns.has("currency_status")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN currency_status TEXT NOT NULL DEFAULT 'unknown'");
+    if (!iconCandidateColumns.has("currency_reason")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN currency_reason TEXT NOT NULL DEFAULT 'not-evaluated'");
+    if (!iconCandidateColumns.has("currency_policy_version")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN currency_policy_version TEXT NOT NULL DEFAULT ''");
+    if (!iconCandidateColumns.has("currency_evaluated_at")) this.db.exec("ALTER TABLE catalog_icon_candidates ADD COLUMN currency_evaluated_at TEXT");
     const iconHistoryColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_icon_selection_history)").all().map((column) => column.name));
     if (!iconHistoryColumns.has("decision_revision")) {
       this.db.exec("ALTER TABLE catalog_icon_selection_history ADD COLUMN decision_revision INTEGER NOT NULL DEFAULT 1");
@@ -530,6 +572,7 @@ class AutomationDatabase {
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(1,'sqlite-catalog-repository',?)").run(migratedAt);
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(2,'full-snapshot-compatibility',?)").run(migratedAt);
     this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(3,'independent-display-icon-decision',?)").run(migratedAt);
+    this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(4,'item-icon-evidence-currency',?)").run(migratedAt);
     this.db.exec(`INSERT OR IGNORE INTO catalog_icon_decisions(
       object_id,selected_candidate_id,revision,selection_origin,updated_at
     )
@@ -543,6 +586,11 @@ class AutomationDatabase {
     LEFT JOIN catalog_icon_candidates selected
       ON selected.object_id=object.id AND selected.selected=1
     WHERE object.object_type='item-identity'`);
+    migrateIconEvidenceCurrency(this.db, migratedAt, {
+      assetAvailable: (_filePath, candidate) => fs.existsSync(
+        this._resolveIconAssetPath(candidate.asset_hash, candidate.file_path),
+      ),
+    });
     this.db.exec(`PRAGMA user_version=${CURRENT_CATALOG_SCHEMA_VERSION}`);
     this.db.exec("UPDATE catalog_repository_objects SET candidate_version_id=NULL WHERE status='active' AND active_version_id IS NOT NULL AND candidate_version_id IS NOT NULL");
   }
@@ -1765,6 +1813,15 @@ class AutomationDatabase {
     });
   }
 
+  returnIconSelectionToAutomatic(itemId, input = {}) {
+    return this.displayIconDecision.decide(itemId, {
+      kind: "automatic",
+      actor: input.actor,
+      note: input.note,
+      expectedDisplayIconRevision: input.expectedDisplayIconRevision,
+    });
+  }
+
   findIconAcquisition(cacheKey) {
     return this.displayIconDecision.findAcquisition(cacheKey);
   }
@@ -2207,8 +2264,33 @@ class AutomationDatabase {
       if (iconCandidates.filter((candidate) => candidate.selected).length > 1) throw new TypeError(`catalog snapshot has multiple selected icons: ${identity.objectId}`);
       const iconCandidateIds = new Map();
       for (const candidate of iconCandidates) {
-        const insertedCandidate = this.db.prepare(`INSERT INTO catalog_icon_candidates(object_id,asset_hash,cache_key,source_type,resource_url,runtime_identifier,texture_uuid,crop_json,similarity_json,rank_score,selection_origin,selected,created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(repositoryObjectId, candidate.assetHash, candidate.cacheKey, candidate.sourceType, candidate.resourceUrl, candidate.runtimeIdentifier, candidate.textureUuid, canonicalJson(candidate.crop || {}), canonicalJson(candidate.similarity || {}), Number(candidate.rankScore ?? 1), candidate.selectionOrigin || null, candidate.selected ? 1 : 0, candidate.createdAt || createdAt);
+        const insertedCandidate = this.db.prepare(`INSERT INTO catalog_icon_candidates(
+          object_id,asset_hash,cache_key,source_type,producer,reconstruction_version,
+          quality_contract_version,currency_status,currency_reason,currency_policy_version,
+          currency_evaluated_at,resource_url,runtime_identifier,texture_uuid,crop_json,
+          similarity_json,rank_score,selection_origin,selected,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          repositoryObjectId,
+          candidate.assetHash,
+          candidate.cacheKey,
+          candidate.sourceType,
+          candidate.provenance?.producer ?? null,
+          candidate.provenance?.reconstructionVersion ?? null,
+          candidate.provenance?.qualityContractVersion ?? null,
+          candidate.currency?.status || "unknown",
+          candidate.currency?.reason || "not-evaluated",
+          candidate.currency?.policyVersion || "",
+          candidate.currency?.evaluatedAt || null,
+          candidate.resourceUrl,
+          candidate.runtimeIdentifier,
+          candidate.textureUuid,
+          canonicalJson(candidate.crop || {}),
+          canonicalJson(candidate.similarity || {}),
+          Number(candidate.rankScore ?? 1),
+          candidate.selectionOrigin || null,
+          candidate.selected ? 1 : 0,
+          candidate.createdAt || createdAt,
+        );
         iconCandidateIds.set(Number(candidate.id), Number(insertedCandidate.lastInsertRowid));
       }
       const selectedIcon = exported.displayIcon?.selectedIcon || exported.selectedIcon
@@ -2260,6 +2342,11 @@ class AutomationDatabase {
             VALUES(?,?,?,?,?,?,?)`).run(asset.hash, asset.mimeType, Number(asset.width), Number(asset.height), Number(asset.byteSize), filePath, asset.createdAt);
         }
         for (const exported of snapshot.objects) this._restoreCatalogObjectSnapshot(exported);
+        migrateIconEvidenceCurrency(this.db, new Date().toISOString(), {
+          assetAvailable: (_filePath, candidate) => fs.existsSync(
+            this._resolveIconAssetPath(candidate.asset_hash, candidate.file_path),
+          ),
+        });
         for (const conflict of snapshot.conflicts || []) {
           const detailsJson = canonicalJson(conflict.details || {});
           const fingerprint = conflict.fingerprint || crypto.createHash("sha256").update(detailsJson).digest("hex");

@@ -401,12 +401,11 @@ test("manual icon selection outranks later automatic candidates and revoke retai
     const object = database.getCatalogObject("item-identity", "i1");
     assert.deepEqual(object.iconSelectionHistory.map((entry) => entry.action), [
       "automatic-select",
-      "automatic-select",
       "manual-select",
       "manual-revoke",
     ]);
     assert.equal(object.iconCandidates.length, 3);
-    assert.equal(second.selected, true);
+    assert.equal(second.selected, false);
   } finally {
     database.close();
     fs.rmSync(root, { recursive: true, force: true });

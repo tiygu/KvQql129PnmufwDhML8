@@ -140,7 +140,7 @@ test("展示图标命令原子校验独立 revision 与候选归属", () => with
   );
 }));
 
-test("Schema v3 从旧候选选择回填展示图标决定", () => {
+test("旧候选选择在当前 Schema 中回填展示图标决定", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "display-icon-migration-"));
   const filePath = path.join(root, "automation.db");
   const iconPath = path.join(root, "icon.png");
@@ -169,7 +169,7 @@ test("Schema v3 从旧候选选择回填展示图标决定", () => {
 
     database = new AutomationDatabase(filePath);
     const object = database.getCatalogObject("item-identity", "legacy-item");
-    assert.equal(database.getCatalogSchemaStatus().currentVersion, 3);
+    assert.equal(database.getCatalogSchemaStatus().currentVersion, 4);
     assert.equal(object.displayIcon.revision, 2);
     assert.equal(object.displayIcon.selectedIcon.id, candidate.id);
   } finally {
