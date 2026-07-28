@@ -41,6 +41,22 @@ function activateIdentity(runtime, objectId, name, level) {
   runtime.catalogGate.evaluateObject("item-identity", objectId);
 }
 
+function observeIdentityPayload(runtime, objectId, payload) {
+  runtime.database.observeCatalogObject({
+    objectType: "item-identity",
+    objectId,
+    payload: { itemId: objectId, ...payload },
+    sourceType: "runtime-capture",
+    sourceRef: `${objectId}.json`,
+    countDuplicate: false,
+  });
+}
+
+function activateIdentityPayload(runtime, objectId, payload) {
+  observeIdentityPayload(runtime, objectId, payload);
+  runtime.catalogGate.evaluateObject("item-identity", objectId);
+}
+
 test("Catalog Review Workspace 明确切换全部物品且只在显式选择后打开只读详情", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-directory-browser-"));
   const runtime = new AutomationRuntime({
@@ -124,6 +140,134 @@ test("Catalog Review Workspace 明确切换全部物品且只在显式选择后�
     await search.fill("browser-directory-two");
     await page.getByRole("button", { name: /浏览花二.*browser-directory-two/ }).waitFor();
     assert.equal(await page.getByRole("button", { name: /浏览花一.*browser-directory-one/ }).count(), 0);
+  } finally {
+    await browser.close();
+    await server.close();
+    await runtime.close();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("complete-directory controls preserve server order and restore pending query state after search", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-search-browser-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  activateIdentityPayload(runtime, "aurora", {
+    name: "Different Name",
+    level: null,
+    type: "generator",
+    chainId: null,
+  });
+  activateIdentityPayload(runtime, "rank-prefix", {
+    name: "Aurora Bloom",
+    level: 2,
+    type: "flower",
+    chainId: "rank-chain",
+  });
+  activateIdentityPayload(runtime, "rank-substring", {
+    name: "Night Aurora",
+    level: 1,
+    type: "flower",
+    chainId: "other-chain",
+  });
+  for (let index = 0; index < 205; index += 1) {
+    const suffix = String(index).padStart(3, "0");
+    observeIdentityPayload(runtime, `filler-${suffix}`, {
+      name: `Filler ${suffix}`,
+      level: 1,
+      type: "filler",
+      chainId: "filler-chain",
+    });
+  }
+  runtime.dashboard = async () => ({
+    connected: false,
+    connectionError: "browser fixture",
+    running: false,
+    paused: false,
+    state: runtime.lastState,
+    plan: { status: "ready", plans: [], recommended: null },
+    catalog: runtime.getCatalogView().stats,
+    catalogView: runtime.getCatalogView({ includeRepositoryObjects: false }),
+    actions: [],
+    sessions: [],
+    resourceSamples: [],
+    connectionRoute: { listening: false, managed: false },
+    runtimeControl: { mocked: true },
+  });
+  const server = createControlServer({
+    runtime,
+    publicRoot: path.join(__dirname, "..", "public"),
+    dataDir,
+  });
+  const port = await listen(server);
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+
+  try {
+    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴" }).click();
+
+    const pendingScope = page.getByRole("button", { name: /待处理/ });
+    const allScope = page.getByRole("button", { name: /全部物品/ });
+    const search = page.getByRole("searchbox", { name: "搜索全部物品" });
+    const sort = page.getByLabel("目录排序");
+    const direction = page.getByLabel("排序方向");
+    const itemType = page.getByLabel("物品类型筛选");
+
+    await allScope.click();
+    await sort.selectOption("chain-level");
+    await direction.selectOption("desc");
+    await itemType.fill("flower, generator");
+    await pendingScope.click();
+    assert.match(await pendingScope.getAttribute("class") || "", /active/);
+
+    await search.fill("aurora");
+    await page.getByRole("button", { name: /Different Name.*aurora/ }).waitFor();
+    assert.equal(await sort.inputValue(), "relevance");
+    assert.equal(await direction.inputValue(), "asc");
+    const serverSearch = await page.evaluate(async () =>
+      fetch("/api/catalog/items?q=aurora&sort=relevance&direction=asc&itemType=flower&itemType=generator&pageSize=200")
+        .then((response) => response.json()));
+    const renderedSearchIds = await page.locator(".catalog-directory-list .directory-copy-id")
+      .evaluateAll((buttons) => buttons.map((button) => button.getAttribute("title")));
+    assert.deepEqual(renderedSearchIds, serverSearch.items.map((item) => item.itemId));
+    assert.equal(await page.getByText("匹配：Item ID").count(), 1);
+
+    await itemType.fill("flower");
+    await search.fill("");
+    assert.match(await pendingScope.getAttribute("class") || "", /active/);
+    assert.equal(await sort.inputValue(), "chain-level");
+    assert.equal(await direction.inputValue(), "desc");
+    assert.equal(await itemType.inputValue(), "flower, generator");
+
+    await allScope.click();
+    const serverFiltered = await page.evaluate(async () =>
+      fetch("/api/catalog/items?sort=chain-level&direction=desc&itemType=flower&itemType=generator&pageSize=200")
+        .then((response) => response.json()));
+    await page.getByRole("button", { name: /Aurora Bloom.*rank-prefix/ }).waitFor();
+    const renderedFilteredIds = await page.locator(".catalog-directory-list .directory-copy-id")
+      .evaluateAll((buttons) => buttons.map((button) => button.getAttribute("title")));
+    assert.deepEqual(renderedFilteredIds, serverFiltered.items.map((item) => item.itemId));
+
+    await itemType.fill("");
+    const loadMore = page.getByRole("button", { name: "加载更多" });
+    await loadMore.waitFor();
+    let releaseLoadMore;
+    const loadMoreGate = new Promise((resolve) => { releaseLoadMore = resolve; });
+    await page.route("**/api/catalog/items?**", async (route) => {
+      const requestUrl = new URL(route.request().url());
+      if (requestUrl.searchParams.has("cursor")) await loadMoreGate;
+      await route.continue();
+    });
+    await loadMore.click();
+    await itemType.fill("not-a-type");
+    await page.getByText("没有符合条件的 Item Identity").waitFor();
+    releaseLoadMore();
+    await page.waitForTimeout(200);
+    assert.equal(await page.locator(".catalog-directory-list .directory-copy-id").count(), 0);
   } finally {
     await browser.close();
     await server.close();

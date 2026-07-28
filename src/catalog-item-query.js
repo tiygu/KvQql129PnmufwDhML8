@@ -178,16 +178,18 @@ function candidateGroups(object) {
 
 function searchDocument(object, summary) {
   const candidates = object.displayIcon?.candidates || [];
-  const selectedId = object.displayIcon?.selectedCandidate?.id;
-  const selected = candidates.find((candidate) => Number(candidate.id) === Number(selectedId));
   const iconIdentifiers = (candidate) => [
     nullableText(candidate?.runtimeIdentifier),
     nullableText(candidate?.resourceUrl),
   ].filter(Boolean);
+  const currentCandidates = candidates.filter((candidate) =>
+    candidate.superseded !== true && candidate.currency?.status === "current");
+  const historicalCandidates = candidates.filter((candidate) =>
+    candidate.superseded === true || candidate.currency?.status !== "current");
   const currentIdentifiers = new Set([
     nullableText(object.effectiveValue?.iconResourceIdentifier),
     nullableText(object.effectiveValue?.iconResource),
-    ...iconIdentifiers(selected),
+    ...currentCandidates.flatMap(iconIdentifiers),
   ].filter(Boolean));
   const historicSemanticIdentifiers = [
     ...(object.versions || []).flatMap((version) => [
@@ -204,14 +206,12 @@ function searchDocument(object, summary) {
     confirmedName: [summary.identity.confirmedName].filter(Boolean),
     candidateName: [summary.identity.candidateName].filter(Boolean),
     currentIconIdentifier: [
-      ...iconIdentifiers(selected),
+      ...currentCandidates.flatMap(iconIdentifiers),
       nullableText(object.effectiveValue?.iconResourceIdentifier),
       nullableText(object.effectiveValue?.iconResource),
     ].filter(Boolean),
     historicalIconIdentifier: [
-      ...candidates
-        .filter((candidate) => Number(candidate.id) !== Number(selectedId))
-        .flatMap(iconIdentifiers),
+      ...historicalCandidates.flatMap(iconIdentifiers),
       ...historicSemanticIdentifiers,
     ],
     mergeChainId: [summary.identity.mergeChainId].filter(Boolean),
@@ -280,7 +280,9 @@ function queryValues(searchParams, name) {
 
 function matchesNullable(value, accepted) {
   if (!accepted.length) return true;
-  return accepted.some((candidate) => candidate === "unknown" ? value == null : String(value) === candidate);
+  return accepted.some((candidate) => candidate === "unknown"
+    ? value == null || String(value) === "unknown"
+    : String(value) === candidate);
 }
 
 function normalizeOptions(input = {}) {

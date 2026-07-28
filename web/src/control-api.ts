@@ -1,4 +1,24 @@
 type ControlEventListener = (event: any) => void;
+export type CatalogItemFilterName =
+  | "status"
+  | "disposition"
+  | "reviewAction"
+  | "iconFreshness"
+  | "mergeChainId"
+  | "level"
+  | "itemType";
+export type CatalogItemFilters = Partial<Record<CatalogItemFilterName, string[]>>;
+export type CatalogItemSort = "relevance" | "display-title" | "chain-level" | "updated-at";
+export type CatalogItemSortDirection = "asc" | "desc";
+export type CatalogItemQueryInput = {
+  query?: string;
+  scope?: "all" | "pending";
+  pageSize?: number;
+  cursor?: string | null;
+  sort?: CatalogItemSort;
+  direction?: CatalogItemSortDirection;
+  filters?: CatalogItemFilters;
+};
 
 async function request(path: string, options: RequestInit = {}) {
   const response = await fetch(path, {
@@ -78,12 +98,17 @@ async function exportCatalog() {
 export const controlApi = {
   getDashboard: () => request("/api/dashboard"),
   getCatalog: () => request("/api/catalog"),
-  getCatalogItems: (input: { query?: string; scope?: "all" | "pending"; pageSize?: number; cursor?: string | null } = {}) => {
+  getCatalogItems: (input: CatalogItemQueryInput = {}) => {
     const search = new URLSearchParams();
     if (input.query) search.set("q", input.query);
     if (input.scope) search.set("scope", input.scope);
     if (input.pageSize != null) search.set("pageSize", String(input.pageSize));
     if (input.cursor) search.set("cursor", input.cursor);
+    if (input.sort) search.set("sort", input.sort);
+    if (input.direction) search.set("direction", input.direction);
+    for (const [name, values] of Object.entries(input.filters || {})) {
+      for (const value of values || []) search.append(name, value);
+    }
     return request(`/api/catalog/items?${search.toString()}`);
   },
   getCatalogItem: (itemId: string) => request(`/api/catalog/items/${encodeURIComponent(itemId)}`),

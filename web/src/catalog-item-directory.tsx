@@ -1,6 +1,50 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { AlertTriangle, Copy, History, Image as ImageIcon } from "lucide-react";
-import { controlApi } from "./control-api";
+import {
+  controlApi,
+  type CatalogItemFilterName,
+  type CatalogItemQueryInput,
+  type CatalogItemSort,
+  type CatalogItemSortDirection,
+} from "./control-api";
+import "./catalog-item-directory.css";
+
+type CatalogFilters = Record<CatalogItemFilterName, string[]>;
+
+const filterControls: Array<{
+  name: CatalogItemFilterName;
+  label: string;
+  placeholder: string;
+}> = [
+  { name: "status", label: "目录状态筛选", placeholder: "active, provisional, observed" },
+  { name: "disposition", label: "处置状态筛选", placeholder: "enabled, paused" },
+  { name: "reviewAction", label: "审核动作筛选", placeholder: "review, unknown" },
+  { name: "iconFreshness", label: "图标时效筛选", placeholder: "current, stale, missing, unknown" },
+  { name: "mergeChainId", label: "合成链筛选", placeholder: "链标识或 unknown" },
+  { name: "level", label: "等级筛选", placeholder: "1, 2, unknown" },
+  { name: "itemType", label: "物品类型筛选", placeholder: "flower, generator, unknown" },
+];
+
+const emptyFilters = (): CatalogFilters => Object.fromEntries(
+  filterControls.map(({ name }) => [name, []]),
+) as CatalogFilters;
+
+const matchedFieldLabels: Record<string, string> = {
+  itemId: "Item ID",
+  confirmedName: "确认名称",
+  candidateName: "候选名称",
+  currentIconIdentifier: "当前图标标识",
+  historicalIconIdentifier: "历史图标标识",
+  mergeChainId: "合成链标识",
+};
+
+function parseFilterValues(value: string) {
+  return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+function formatFilterValues(values: string[]) {
+  return values.join(", ");
+}
 
 function deepLinkedCatalogItemId() {
   try { return new URLSearchParams(globalThis.location?.search || "").get("itemId"); }
@@ -37,6 +81,9 @@ export function CatalogItemDirectory({
   const initialItemId = useRef(deepLinkedCatalogItemId());
   const [scope, setScope] = useState<"pending" | "all">(initialItemId.current ? "all" : "pending");
   const [search, setSearch] = useState("");
+  const [sort, setSort] = useState<CatalogItemSort>("display-title");
+  const [direction, setDirection] = useState<CatalogItemSortDirection>("asc");
+  const [filters, setFilters] = useState<CatalogFilters>(emptyFilters);
   const [page, setPage] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -44,12 +91,48 @@ export function CatalogItemDirectory({
   const [detail, setDetail] = useState<any>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
+  const directoryRequestId = useRef(0);
+  const preSearchState = useRef<{
+    scope: "pending" | "all";
+    sort: CatalogItemSort;
+    direction: CatalogItemSortDirection;
+    filters: CatalogFilters;
+  } | null>(null);
   const directoryMode = scope === "all" || search.trim().length > 0;
+  const filterSignature = JSON.stringify(filters);
+  const queryIdentity = JSON.stringify({
+    scope,
+    query: search,
+    sort,
+    direction,
+    filters,
+  });
+  const queryIdentityRef = useRef(queryIdentity);
+  queryIdentityRef.current = queryIdentity;
+  const currentQueryInput = (cursor: string | null = null): CatalogItemQueryInput => ({
+    query: search,
+    scope: "all",
+    pageSize: 200,
+    cursor,
+    sort,
+    direction,
+    filters,
+  });
 
   useEffect(() => {
     if (!forcePendingKey) return;
+    const previous = preSearchState.current;
+    preSearchState.current = null;
     setScope("pending");
     setSearch("");
+    if (previous) {
+      setSort(previous.sort);
+      setDirection(previous.direction);
+      setFilters(previous.filters);
+    } else if (sort === "relevance") {
+      setSort("display-title");
+      setDirection("asc");
+    }
   }, [forcePendingKey]);
 
   useEffect(() => {
@@ -63,23 +146,27 @@ export function CatalogItemDirectory({
   }, []);
 
   useEffect(() => {
-    if (!directoryMode) return;
+    const requestId = ++directoryRequestId.current;
+    if (!directoryMode) {
+      setLoading(false);
+      return;
+    }
     let active = true;
     setPage(null);
     setLoading(true);
     setError("");
-    controlApi.getCatalogItems({ query: search, scope: "all", pageSize: 200 }).then((value) => {
-      if (active) setPage(value);
+    controlApi.getCatalogItems(currentQueryInput()).then((value) => {
+      if (active && directoryRequestId.current === requestId) setPage(value);
     }).catch((requestError: any) => {
-      if (active) {
+      if (active && directoryRequestId.current === requestId) {
         setPage(null);
         setError(requestError.message || "完整物品目录加载失败");
       }
     }).finally(() => {
-      if (active) setLoading(false);
+      if (active && directoryRequestId.current === requestId) setLoading(false);
     });
     return () => { active = false; };
-  }, [directoryMode, refreshRevision, search]);
+  }, [directoryMode, refreshRevision, search, sort, direction, filterSignature]);
 
   useEffect(() => {
     if (!directoryMode || !selectedItemId) {
@@ -110,6 +197,54 @@ export function CatalogItemDirectory({
     writeCatalogItemDeepLink(itemId, { push });
   };
 
+  const restorePreSearchState = (nextScope?: "pending" | "all") => {
+    const previous = preSearchState.current;
+    preSearchState.current = null;
+    if (previous) {
+      setScope(nextScope || previous.scope);
+      setSort(previous.sort);
+      setDirection(previous.direction);
+      setFilters(previous.filters);
+    } else if (nextScope) {
+      setScope(nextScope);
+    }
+  };
+
+  const changeSearch = (value: string) => {
+    const hadQuery = search.trim().length > 0;
+    const hasQuery = value.trim().length > 0;
+    if (!hadQuery && hasQuery) {
+      preSearchState.current = {
+        scope,
+        sort,
+        direction,
+        filters: Object.fromEntries(
+          Object.entries(filters).map(([name, values]) => [name, [...values]]),
+        ) as CatalogFilters,
+      };
+      setScope("all");
+      setSort("relevance");
+      setDirection("asc");
+    } else if (hadQuery && !hasQuery) {
+      restorePreSearchState();
+    }
+    setSearch(value);
+  };
+
+  const showPending = () => {
+    setSearch("");
+    restorePreSearchState("pending");
+  };
+
+  const changeSort = (value: CatalogItemSort) => {
+    setSort(value);
+    if (value === "relevance") setDirection("asc");
+  };
+
+  const changeFilter = (name: CatalogItemFilterName, value: string) => {
+    setFilters((current) => ({ ...current, [name]: parseFilterValues(value) }));
+  };
+
   const moveRowFocus = (event: KeyboardEvent<HTMLButtonElement>) => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     event.preventDefault();
@@ -121,33 +256,46 @@ export function CatalogItemDirectory({
 
   const loadMore = async () => {
     if (!page?.nextCursor || loading) return;
+    const requestId = ++directoryRequestId.current;
+    const requestIdentity = queryIdentity;
+    const requestCursor = page.nextCursor;
+    const requestRevision = page.catalogQueryRevision;
     setLoading(true);
     setError("");
     try {
-      const next = await controlApi.getCatalogItems({
-        query: search,
-        scope: "all",
-        pageSize: 200,
-        cursor: page.nextCursor,
+      const next = await controlApi.getCatalogItems(currentQueryInput(requestCursor));
+      if (directoryRequestId.current !== requestId
+        || queryIdentityRef.current !== requestIdentity) return;
+      setPage((current: any) => {
+        if (!current || current.catalogQueryRevision !== requestRevision
+          || current.nextCursor !== requestCursor) return current;
+        return {
+          ...next,
+          returnedCount: Number(current.returnedCount || 0) + Number(next.returnedCount || 0),
+          items: [...(current.items || []), ...(next.items || [])],
+        };
       });
-      setPage((current: any) => ({
-        ...next,
-        returnedCount: Number(current?.returnedCount || 0) + Number(next.returnedCount || 0),
-        items: [...(current?.items || []), ...(next.items || [])],
-      }));
     } catch (requestError: any) {
+      if (directoryRequestId.current !== requestId
+        || queryIdentityRef.current !== requestIdentity) return;
       if (requestError.payload?.code === "CATALOG_QUERY_REVISION_CHANGED") {
         setPage(null);
         try {
-          setPage(await controlApi.getCatalogItems({ query: search, scope: "all", pageSize: 200 }));
+          const restarted = await controlApi.getCatalogItems(currentQueryInput());
+          if (directoryRequestId.current !== requestId
+            || queryIdentityRef.current !== requestIdentity) return;
+          setPage(restarted);
         } catch (reloadError: any) {
+          if (directoryRequestId.current !== requestId
+            || queryIdentityRef.current !== requestIdentity) return;
           setError(reloadError.message || "目录 revision 更新后重新加载失败");
         }
       } else {
         setError(requestError.message || "更多目录结果加载失败");
       }
     } finally {
-      setLoading(false);
+      if (directoryRequestId.current === requestId
+        && queryIdentityRef.current === requestIdentity) setLoading(false);
     }
   };
 
@@ -155,7 +303,7 @@ export function CatalogItemDirectory({
     if (!detail?.capabilities?.canEnterSemanticReview) return;
     onEnterSemanticReview(detail.summary.itemId);
     setSearch("");
-    setScope("pending");
+    restorePreSearchState("pending");
     writeCatalogItemDeepLink(null);
   };
 
@@ -167,19 +315,56 @@ export function CatalogItemDirectory({
           type="search"
           aria-label="搜索全部物品"
           value={search}
-          onChange={(event) => setSearch(event.target.value)}
+          onChange={(event) => changeSearch(event.target.value)}
           placeholder="名称、Item ID、图标资源或合成链"
         />
       </label>
       <div className="catalog-scope-switch" aria-label="目录范围">
         <button
           className={!directoryMode ? "active" : ""}
-          onClick={() => { setSearch(""); setScope("pending"); }}
+          onClick={showPending}
         >待处理 <b>{pendingCount}</b></button>
         <button className={directoryMode ? "active" : ""} onClick={() => setScope("all")}>
           全部物品 <b>{page?.total ?? itemIdentityCount}</b>
         </button>
       </div>
+    </div>
+    <div className="catalog-directory-query-controls" aria-label="目录筛选与排序">
+      <label>
+        <span>目录排序</span>
+        <select
+          aria-label="目录排序"
+          value={sort}
+          onChange={(event) => changeSort(event.target.value as CatalogItemSort)}
+        >
+          <option value="relevance" disabled={!search.trim()}>相关性</option>
+          <option value="display-title">显示名称</option>
+          <option value="chain-level">合成链与等级</option>
+          <option value="updated-at">最后相关变更</option>
+        </select>
+      </label>
+      <label>
+        <span>排序方向</span>
+        <select
+          aria-label="排序方向"
+          value={direction}
+          disabled={sort === "relevance"}
+          onChange={(event) => setDirection(event.target.value as CatalogItemSortDirection)}
+        >
+          <option value="asc">升序</option>
+          <option value="desc">降序</option>
+        </select>
+      </label>
+      {filterControls.map((control) => <label key={control.name}>
+        <span>{control.label}</span>
+        <input
+          aria-label={control.label}
+          value={formatFilterValues(filters[control.name])}
+          onChange={(event) => changeFilter(control.name, event.target.value)}
+          placeholder={control.placeholder}
+        />
+      </label>)}
+      <p>不同筛选字段按 AND 组合；同一输入内以逗号分隔的值按 OR 组合；使用 unknown 筛选未知值。</p>
     </div>
     {directoryMode ? <>
       <div className="panel review-queue catalog-directory-list">
@@ -213,7 +398,7 @@ export function CatalogItemDirectory({
                 <span className="directory-row-state">
                   <i>{item.catalogState.status}</i>
                 </span>
-                {item.matchedFields?.length > 0 && <small className="directory-match-reason">匹配：{item.matchedFields.join("、")}</small>}
+                {item.matchedFields?.length > 0 && <small className="directory-match-reason">匹配：{item.matchedFields.map((field: string) => matchedFieldLabels[field] || field).join("、")}</small>}
               </button>
               <button
                 className="directory-copy-id"

@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -313,5 +314,142 @@ test("pending scope is distinct and search always targets the complete directory
     const searched = await fetch(`${baseUrl}/api/catalog/items?q=directory-clear`);
     assert.equal(searched.status, 200);
     assert.equal((await searched.json()).items[0].itemId, "directory-clear");
+  });
+});
+
+test("search ranks deterministically, composes filters, and distinguishes current from historical icon identifiers", async () => {
+  await withFixture(async ({ runtime, baseUrl }) => {
+    activateIdentity(runtime, "rank-prefix", {
+      itemId: "rank-prefix",
+      name: "Aurora Bloom",
+      level: 2,
+      type: "flower",
+      chainId: "rank-chain",
+    });
+    activateIdentity(runtime, "aurora", {
+      itemId: "aurora",
+      name: "Different Name",
+      level: null,
+      type: "generator",
+      chainId: null,
+    });
+    activateIdentity(runtime, "icon-search", {
+      itemId: "icon-search",
+      name: "Icon Search",
+      level: 4,
+      type: "flower",
+      chainId: "rank-chain",
+    });
+    for (const itemId of ["rank-tie-b", "rank-tie-a"]) {
+      activateIdentity(runtime, itemId, {
+        itemId,
+        name: "Stable Tie",
+        level: 3,
+        type: "tie",
+        chainId: "tie-chain",
+      });
+    }
+
+    const saveCandidate = (cacheKey, sourceType, runtimeIdentifier) => {
+      const body = Buffer.from(cacheKey);
+      const hash = crypto.createHash("sha256").update(body).digest("hex");
+      const filePath = path.join(runtime.dataDir, `${hash}.png`);
+      fs.writeFileSync(filePath, body);
+      return runtime.database.saveIconCandidate({
+        itemId: "icon-search",
+        cacheKey,
+        sourceType,
+        runtimeIdentifier,
+        rankScore: 1,
+        autoSelect: false,
+        asset: {
+          hash,
+          mimeType: "image/png",
+          width: 1,
+          height: 1,
+          byteSize: body.length,
+          filePath,
+        },
+      });
+    };
+    const currentCandidate = saveCandidate(
+      "current-eligible",
+      "manual-upload",
+      "current-unselected-icon",
+    );
+    const staleCandidate = saveCandidate(
+      "historical-ineligible",
+      "legacy-unknown-source",
+      "historical-icon",
+    );
+    assert.equal(currentCandidate.currency.status, "current");
+    assert.equal(staleCandidate.currency.status, "stale");
+
+    const ranked = await fetch(`${baseUrl}/api/catalog/items?q=aurora`).then((response) => response.json());
+    assert.deepEqual(
+      ranked.items.slice(0, 2).map((item) => item.itemId),
+      ["aurora", "rank-prefix"],
+    );
+    assert.deepEqual(ranked.items[0].matchedFields, ["itemId"]);
+    assert.deepEqual(ranked.items[1].matchedFields, ["candidateName"]);
+
+    const normalized = await fetch(
+      `${baseUrl}/api/catalog/items?q=${encodeURIComponent("ＡＵＲＯＲＡ   ＢＬＯＯＭ")}`,
+    ).then((response) => response.json());
+    assert.equal(normalized.items[0].itemId, "rank-prefix");
+    assert.deepEqual(normalized.items[0].matchedFields, ["candidateName"]);
+
+    const filtered = await fetch(
+      `${baseUrl}/api/catalog/items?status=active&status=provisional&status=observed&itemType=flower&itemType=generator&level=unknown&level=2&sort=chain-level&direction=desc`,
+    ).then((response) => response.json());
+    assert.deepEqual(
+      filtered.items.map((item) => item.itemId),
+      ["rank-prefix", "aurora"],
+    );
+
+    for (const direction of ["asc", "desc"]) {
+      const tied = await fetch(
+        `${baseUrl}/api/catalog/items?itemType=tie&sort=chain-level&direction=${direction}`,
+      ).then((response) => response.json());
+      assert.deepEqual(
+        tied.items.map((item) => item.itemId),
+        ["rank-tie-a", "rank-tie-b"],
+      );
+    }
+
+    const current = await fetch(`${baseUrl}/api/catalog/items?q=current-unselected-icon`)
+      .then((response) => response.json());
+    assert.equal(current.items[0].itemId, "icon-search");
+    assert.deepEqual(current.items[0].matchedFields, ["currentIconIdentifier"]);
+
+    const historical = await fetch(`${baseUrl}/api/catalog/items?q=historical-icon`)
+      .then((response) => response.json());
+    assert.equal(historical.items[0].itemId, "icon-search");
+    assert.deepEqual(historical.items[0].matchedFields, ["historicalIconIdentifier"]);
+    assert.equal(runtime.database.getSelectedIconCandidate("icon-search"), null);
+
+    runtime.database.selectIconCandidate("icon-search", currentCandidate.id, {
+      actor: "catalog-query-test",
+      note: "exercise the explicit unknown icon-freshness filter",
+      expectedDisplayIconRevision: runtime.database.getCatalogObject(
+        "item-identity",
+        "icon-search",
+      ).displayIcon.revision,
+    });
+    runtime.database.db.prepare(
+      "UPDATE catalog_icon_candidates SET currency_status='unknown' WHERE id=?",
+    ).run(currentCandidate.id);
+    const unknownFreshness = await fetch(
+      `${baseUrl}/api/catalog/items?iconFreshness=unknown`,
+    ).then((response) => response.json());
+    assert.deepEqual(
+      unknownFreshness.items.map((item) => item.itemId),
+      ["icon-search"],
+    );
+
+    const empty = await fetch(`${baseUrl}/api/catalog/items?status=not-a-status`)
+      .then((response) => response.json());
+    assert.equal(empty.total, 0);
+    assert.deepEqual(empty.items, []);
   });
 });
