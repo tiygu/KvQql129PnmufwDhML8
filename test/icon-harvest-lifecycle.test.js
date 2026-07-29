@@ -100,7 +100,7 @@ test("cancelling a parent is revisioned, observable, idempotent, and preserves s
   const item = runtime.database.listCatalogObjects({ objectType: "item-identity" })[0];
 
   try {
-    runtime.running = true;
+    runtime.sessionSupervisor.adoptSession({ kind: "test-fixture" });
     const first = runtime.createIconHarvestJob({
       scope: { type: "item", itemId: item.objectId },
       idempotencyKey: "cancel-parent-a",
@@ -164,7 +164,7 @@ test("cancelling a parent is revisioned, observable, idempotent, and preserves s
     assert.equal(cancelledSecond.state, "cancelled");
     assert.equal(runtime.iconService.getTask(second.taskId).status, "cancelled");
   } finally {
-    runtime.running = false;
+    runtime.sessionSupervisor.finish();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
@@ -235,7 +235,7 @@ test("two consoles resolve cancel and retry races by revision and reconnect from
   const publicRoot = path.join(dataDir, "public");
   fs.mkdirSync(publicRoot);
   fs.writeFileSync(path.join(publicRoot, "index.html"), "ok");
-  runtime.running = true;
+  runtime.sessionSupervisor.adoptSession({ kind: "test-fixture" });
   const server = createControlServer({ runtime, publicRoot, dataDir });
   runtime.onEvent = (event) => server.broadcast(event);
   const port = await listen(server);
@@ -314,7 +314,7 @@ test("two consoles resolve cancel and retry races by revision and reconnect from
   } finally {
     consoleA.close();
     consoleB.close();
-    runtime.running = false;
+    runtime.sessionSupervisor.finish();
     await server.close();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });

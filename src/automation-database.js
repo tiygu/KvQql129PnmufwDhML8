@@ -29,6 +29,31 @@ const ITEM_IDENTITY_PRESENTATION_FIELDS = new Set([
   "iconSelectionHistory",
 ]);
 
+function ensureLegacyIconHarvestJobColumns(database) {
+  const columns = new Set(
+    database.prepare("PRAGMA table_info(icon_harvest_jobs)").all()
+      .map((column) => column.name),
+  );
+  if (!columns.size) return;
+  const addColumn = (name, definition) => {
+    if (!columns.has(name)) database.exec(`ALTER TABLE icon_harvest_jobs ADD COLUMN ${name} ${definition}`);
+  };
+  addColumn("scope_type", "TEXT NOT NULL DEFAULT 'legacy'");
+  addColumn("scope_key", "TEXT NOT NULL DEFAULT ''");
+  addColumn("idempotency_key", "TEXT NOT NULL DEFAULT ''");
+  addColumn("request_fingerprint", "TEXT NOT NULL DEFAULT ''");
+  addColumn("retry_of_job_id", "TEXT");
+  addColumn("revision", "INTEGER NOT NULL DEFAULT 1");
+  addColumn("started_at", "TEXT");
+  addColumn("completed_at", "TEXT");
+  addColumn("updated_at", "TEXT NOT NULL DEFAULT ''");
+  database.exec(`UPDATE icon_harvest_jobs SET
+    scope_key=CASE WHEN scope_key='' THEN id ELSE scope_key END,
+    idempotency_key=CASE WHEN idempotency_key='' THEN 'legacy:' || id ELSE idempotency_key END,
+    request_fingerprint=CASE WHEN request_fingerprint='' THEN 'legacy:' || id ELSE request_fingerprint END,
+    updated_at=CASE WHEN updated_at='' THEN created_at ELSE updated_at END`);
+}
+
 function parseJson(value) {
   return value == null ? null : JSON.parse(value);
 }
@@ -208,21 +233,28 @@ class AutomationDatabase {
     const existedBeforeOpen = fs.existsSync(this.filePath) && fs.statSync(this.filePath).size > 0;
     this.db = new DatabaseSync(this.filePath);
     this.transactionDepth = 0;
-    const backupPath = `${this.filePath}.pre-v${CURRENT_CATALOG_SCHEMA_VERSION}.bak`;
-    const priorVersion = Number(this.db.prepare("PRAGMA user_version").get().user_version);
-    if (existedBeforeOpen && priorVersion < CURRENT_CATALOG_SCHEMA_VERSION) {
-      this.db.exec("PRAGMA wal_checkpoint(FULL)");
-      if (!fs.existsSync(backupPath)) fs.copyFileSync(this.filePath, backupPath);
+    try {
+      const backupPath = `${this.filePath}.pre-v${CURRENT_CATALOG_SCHEMA_VERSION}.bak`;
+      const priorVersion = Number(this.db.prepare("PRAGMA user_version").get().user_version);
+      if (existedBeforeOpen && priorVersion < CURRENT_CATALOG_SCHEMA_VERSION) {
+        this.db.exec("PRAGMA wal_checkpoint(FULL)");
+        if (!fs.existsSync(backupPath)) fs.copyFileSync(this.filePath, backupPath);
+      }
+      this.preMigrationBackupPath = fs.existsSync(backupPath) ? backupPath : null;
+      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
+      this.transaction(() => this.migrate());
+      this.displayIconDecision = new DisplayIconDecision({
+        db: this.db,
+        transaction: (work) => this.transaction(work),
+        objectResult: (row) => this._catalogObjectResult(row),
+        resolveAssetPath: (hash, storedFilePath) => this._resolveIconAssetPath(hash, storedFilePath),
+      });
+    } catch (error) {
+      try {
+        this.db.close();
+      } catch {}
+      throw error;
     }
-    this.preMigrationBackupPath = fs.existsSync(backupPath) ? backupPath : null;
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
-    this.transaction(() => this.migrate());
-    this.displayIconDecision = new DisplayIconDecision({
-      db: this.db,
-      transaction: (work) => this.transaction(work),
-      objectResult: (row) => this._catalogObjectResult(row),
-      resolveAssetPath: (hash, storedFilePath) => this._resolveIconAssetPath(hash, storedFilePath),
-    });
   }
 
   transaction(work) {
@@ -243,6 +275,7 @@ class AutomationDatabase {
   }
 
   migrate() {
+    ensureLegacyIconHarvestJobColumns(this.db);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS merge_chains (
         id TEXT PRIMARY KEY, title_key TEXT, min_level INTEGER, max_level INTEGER,
@@ -585,6 +618,10 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_currency_history_candidate ON catalog_icon_currency_history(candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_predecessor ON catalog_icon_candidate_lineage(predecessor_candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_successor ON catalog_icon_candidate_lineage(successor_candidate_id,id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_icon_harvest_jobs_idempotency ON icon_harvest_jobs(idempotency_key);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_jobs_updated ON icon_harvest_jobs(updated_at,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_acquisitions_job ON icon_harvest_acquisitions(job_id,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_commands_job ON icon_harvest_commands(job_id,created_at);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);

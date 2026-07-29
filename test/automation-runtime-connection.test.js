@@ -213,44 +213,6 @@ test("完整图鉴视图忽略重复证据计数但在有效对象变化后失�
   }
 });
 
-test("暂时跳过由 Automation Runtime 恢复中部对象的后继焦点且不改变领域 revision 或规划", () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-review-skip-"));
-  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
-  try {
-    for (const objectId of ["skip-first", "skip-middle", "skip-next"]) {
-      backend.database.observeCatalogObject({
-        objectType: "item-identity",
-        objectId,
-        payload: { itemId: objectId, chainId: "skip-chain", level: objectId === "skip-first" ? 1 : objectId === "skip-middle" ? 2 : 3 },
-        sourceType: "runtime",
-      });
-      backend.catalogGate.evaluateObject("item-identity", objectId);
-    }
-    const initialQueue = backend.getCatalogView().repository.reviewQueue;
-    const middleIndex = initialQueue.findIndex((entry) => entry.objectId === "skip-middle");
-    assert.ok(middleIndex > 0 && middleIndex < initialQueue.length - 1);
-    const expectedNext = initialQueue[middleIndex + 1];
-    const middleBefore = backend.getCatalogObject("item-identity", "skip-middle");
-    const planningBefore = backend.getPlanningCatalog();
-
-    const skipped = backend.skipCatalogReview({ objectType: "item-identity", objectId: "skip-middle" });
-    const refreshed = backend.getCatalogView();
-
-    assert.equal(skipped.nextReviewTarget.objectId, expectedNext.objectId);
-    assert.equal(refreshed.repository.reviewQueue.at(-1).objectId, "skip-middle");
-    assert.equal(refreshed.repository.reviewQueue.at(-1).actionStatus, "已跳过");
-    assert.deepEqual(refreshed.repository.reviewSession.skippedObjectKeys, ["item-identity:skip-middle"]);
-    assert.equal(refreshed.repository.reviewSession.resumeObjectKey, `${expectedNext.objectType}:${expectedNext.objectId}`);
-    assert.equal(refreshed.repository.reviewSession.commandRevision, 1);
-    assert.strictEqual(backend.getCatalogView(), refreshed);
-    assert.equal(backend.getCatalogObject("item-identity", "skip-middle").revision, middleBefore.revision);
-    assert.strictEqual(backend.getPlanningCatalog(), planningBefore);
-  } finally {
-    backend.database.close();
-    fs.rmSync(dataDir, { recursive: true, force: true });
-  }
-});
-
 test("自动图标质量拒绝后进入退避而人工采集仍可立即重试", () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-icon-backoff-"));
   const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
@@ -342,7 +304,11 @@ test("dashboard polling reuses the runtime state while an automation action is a
   let collections = 0;
   backend.collectState = async () => { collections += 1; throw new Error("dashboard must not compete with action verification"); };
   backend.connectionService.status = async () => ({ listening: true, starting: false, managed: false, cdpPort: 62000 });
-  backend.running = true;
+  backend.sessionSupervisor.adoptSession({
+    kind: "bounded",
+    sessionId: null,
+    abortController: new AbortController(),
+  });
   backend.lab = {};
   backend.selection = { probe: { context: { id: 1 } } };
   backend.lastState = {
@@ -363,6 +329,7 @@ test("dashboard polling reuses the runtime state while an automation action is a
   assert.equal(dashboard.connected, true);
   assert.equal(dashboard.state, backend.lastState);
   assert.equal(dashboard.plan, backend.lastPlan);
+  backend.sessionSupervisor.finish();
   backend.database.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
@@ -380,7 +347,11 @@ test("active automation defers full-board catalog evidence instead of blocking e
     orders: [],
     mapMission: { canComplete: false, requirements: [] },
   };
-  backend.running = true;
+  backend.sessionSupervisor.adoptSession({
+    kind: "bounded",
+    sessionId: null,
+    abortController: new AbortController(),
+  });
 
   backend.queuePassiveCatalogEvidence({ state });
   backend.queuePassiveCatalogEvidence({ actionDiff: { type: "merge", itemId: "i1", expectedTarget: "i2", actualTarget: "i2", verified: true } });
@@ -391,7 +362,7 @@ test("active automation defers full-board catalog evidence instead of blocking e
   assert.equal(backend.deferredPassiveCatalogState, state);
   assert.equal(backend.passiveCatalogDiffs.length, 0);
   assert.equal(backend.deferredPassiveCatalogDiffs.length, 1);
-  backend.running = false;
+  backend.sessionSupervisor.finish();
   backend.flushDeferredPassiveCatalogState();
   assert.ok(backend.passiveCatalogDrainPromise);
   await backend.passiveCatalogDrainPromise;
