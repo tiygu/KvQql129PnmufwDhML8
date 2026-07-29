@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
@@ -11,13 +12,28 @@ const { AutomationDatabase } = require("../src/automation-database");
 
 const LEGACY_CREATED_AT = "2026-07-01T00:00:00.000Z";
 
-function withDirectory(run) {
+async function withDirectory(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "icon-evidence-migration-"));
+  let result;
+  let failure = null;
   try {
-    return run(directory);
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
+    result = await run(directory);
+  } catch (error) {
+    failure = error;
   }
+  try {
+    await fsp.rm(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 50,
+    });
+  } catch (cleanupError) {
+    if (!failure) throw cleanupError;
+    failure.cleanupError = cleanupError;
+  }
+  if (failure) throw failure;
+  return result;
 }
 
 function createLegacyV3Database(filePath) {
@@ -310,6 +326,19 @@ test("全新数据库连续启动两次保持相同的空迁移结果", () => wi
   assert.equal(first.status.currentVersion, 4);
   assert.equal(first.status.preMigrationBackupPath, null);
   database.close();
+}));
+
+test("迁移失败会关闭 SQLite 连接并保留原始错误", () => withDirectory((directory) => {
+  const filePath = path.join(directory, "catalog.db");
+  const malformed = new DatabaseSync(filePath);
+  malformed.exec("CREATE TABLE catalog_repository_objects(id INTEGER); PRAGMA user_version=3;");
+  malformed.close();
+
+  assert.throws(
+    () => new AutomationDatabase(filePath),
+    /no such column/,
+  );
+  fs.renameSync(filePath, path.join(directory, "closed-catalog.db"));
 }));
 
 test("新证据固化来源契约且重复写入只更新可变采集字段", () => withDirectory((directory) => {

@@ -30,6 +30,8 @@ const { mergeRelationWaitingForObservation } = require("./catalog-review-state")
 const { canonicalJson } = require("./canonical-json");
 const { CatalogItemQuery } = require("./catalog-item-query");
 const { IconHarvestJobService } = require("./icon-harvest-jobs");
+const { AutomationSessionSupervisor } = require("./automation-session-supervisor");
+const { CatalogReviewOperator } = require("./catalog-review-operator");
 
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -244,6 +246,46 @@ function meaningfulSnapshotDifferences(before, after) {
 }
 
 class AutomationRuntime {
+  get running() {
+    return this.sessionSupervisor?.snapshot().running ?? false;
+  }
+
+  get sessionKind() {
+    return this.sessionSupervisor?.snapshot().sessionKind ?? null;
+  }
+
+  get activeSessionId() {
+    return this.sessionSupervisor?.snapshot().sessionId ?? null;
+  }
+
+  get activeRunPromise() {
+    return this.sessionSupervisor?.backgroundPromise ?? null;
+  }
+
+  get abortController() {
+    return this.sessionSupervisor?.abortController ?? null;
+  }
+
+  get idleSession() {
+    return this.sessionSupervisor?.idleSession ?? null;
+  }
+
+  get actionBoundaryPending() {
+    return this.sessionSupervisor?.snapshot().boundaryBusy ?? false;
+  }
+
+  get pauseGate() {
+    return this.sessionSupervisor?.pauseGate ?? null;
+  }
+
+  get catalogReviewReplanner() {
+    return this.catalogReviewOperator?.replanner ?? null;
+  }
+
+  set catalogReviewReplanner(replanner) {
+    if (this.catalogReviewOperator) this.catalogReviewOperator.replanner = replanner;
+  }
+
   constructor({ rootDir = path.resolve(__dirname, ".."), dataDir = null, url = null, onEvent = null, manageConnectionRoute = true, runtimeControl = null } = {}) {
     this.rootDir = rootDir;
     this.url = url;
@@ -261,16 +303,7 @@ class AutomationRuntime {
     this.planningCatalogCache = new Map();
     this.catalogProjectionCache = new Map();
     this.catalogViewCache = new Map();
-    this.catalogReviewSession = { revision: 0, commandRevision: 0, skippedObjectKeys: [], resumeObjectKey: null };
     this.iconEvidenceRetryAt = new Map();
-    this.running = false;
-    this.abortController = null;
-    this.pauseGate = new PauseGate();
-    this.activeSessionId = null;
-    this.activeRunPromise = null;
-    this.idleSession = null;
-    this.sessionKind = null;
-    this.actionBoundaryPending = false;
     this.passiveCatalogState = null;
     this.deferredPassiveCatalogState = null;
     this.deferredPassiveCatalogDiffs = [];
@@ -291,6 +324,11 @@ class AutomationRuntime {
       unavailable.statusCode = 500;
       throw unavailable;
     }
+    this.sessionSupervisor = new AutomationSessionSupervisor({
+      database: this.database,
+      pauseGate: new PauseGate(),
+      onEvent: (type, payload) => this.emit(type, payload),
+    });
     this.connectionService = new ConnectionService({ rootDir, dataDir: this.dataDir, onEvent: (event) => this.emit("connection-route", event) });
     const bundledCatalogPath = path.join(rootDir, "captures", "item-catalog.json");
     const persistedCatalogPath = path.join(this.dataDir, "item-catalog.json");
@@ -334,6 +372,18 @@ class AutomationRuntime {
       throw empty;
     }
     this.catalogGate = new CatalogReviewGate(this.database);
+    this.catalogReviewOperator = new CatalogReviewOperator({
+      database: this.database,
+      catalogGate: this.catalogGate,
+      getSettings: () => this.getSettings(),
+      getState: () => this.lastState,
+      getPlanningCatalog: (options) => this.getPlanningCatalog(options),
+      publishPlan: (plan) => {
+        this.lastPlan = plan;
+      },
+      invalidateCatalogView: () => this.catalogViewCache.clear(),
+      onEvent: (type, payload) => this.emit(type, payload),
+    });
     this.catalogItemQuery = new CatalogItemQuery(this.database);
     this.iconHarvestJobs = new IconHarvestJobService({
       database: this.database,
@@ -380,7 +430,17 @@ class AutomationRuntime {
         await this.connect(signal);
         return captureCdpScreenshot({ client: this.lab.client, signal });
       },
-      isSafeBoundary: () => !this.running && !this.actionBoundaryPending,
+      isSafeBoundary: () => this.sessionSupervisor.snapshot().safeBoundaryAvailable,
+      withRuntimeBoundary: async (owner, work) => {
+        const result = await this.sessionSupervisor.withSafeBoundary(owner, work);
+        if (result?.reason === "automation-action-boundary-busy") {
+          const error = new Error("icon acquisition deferred until automation reaches an idle boundary");
+          error.code = "ICON_ACQUISITION_DEFERRED";
+          error.reason = "automation-safe-boundary";
+          throw error;
+        }
+        return result;
+      },
       onEvent: (event) => {
         const itemId = String(event.itemId || "");
         this.iconHarvestJobs.handleAcquisitionEvent(event);
@@ -454,7 +514,7 @@ class AutomationRuntime {
   getCatalogView({ includeRepositoryObjects = true } = {}) {
     const executionMode = this.getSettings().mode;
     const revision = includeRepositoryObjects ? this.database.getCatalogUiRevision() : this.database.getCatalogPresentationRevision();
-    const cacheKey = `${revision}:${executionMode}:${includeRepositoryObjects ? `full:${this.catalogReviewSession.revision}` : "summary"}`;
+    const cacheKey = `${revision}:${executionMode}:${includeRepositoryObjects ? `full:${this.catalogReviewOperator.reviewRevision}` : "summary"}`;
     const cached = this.catalogViewCache.get(cacheKey);
     if (cached) return cached;
     const semanticRevision = this.database.getCatalogSemanticRevision();
@@ -476,21 +536,9 @@ class AutomationRuntime {
     if (includeRepositoryObjects) {
       repository.objects = this.database.listCatalogObjects();
       repository.conflicts = this.database.listCatalogConflicts();
-      const reviewQueue = this.database.getCatalogReviewQueue().map((entry) => {
-        if (entry.objectType !== "merge-relation") return entry;
-        const relation = this.database.getCatalogObject(entry.objectType, entry.objectId);
-        const candidate = relation?.algorithmCandidate || relation?.effectiveValue || {};
-        const target = candidate.mergeTarget == null ? null : this.database.getCatalogObject("item-identity", candidate.mergeTarget);
-        const waiting = mergeRelationWaitingForObservation({ relationCandidate: candidate, relationEvidence: relation?.evidence || [], targetIdentity: target });
-        return waiting.waiting ? { ...entry, actionStatus: "等待更多线索", waitingForMoreClues: waiting } : entry;
-      });
-      repository.reviewQueue = this.projectCatalogReviewQueue(reviewQueue);
-      repository.reviewSession = {
-        revision: this.catalogReviewSession.revision,
-        commandRevision: this.catalogReviewSession.commandRevision,
-        skippedObjectKeys: [...this.catalogReviewSession.skippedObjectKeys],
-        resumeObjectKey: this.catalogReviewSession.resumeObjectKey,
-      };
+      const reviewProjection = this.catalogReviewOperator.getReviewProjection();
+      repository.reviewQueue = reviewProjection.reviewQueue;
+      repository.reviewSession = reviewProjection.reviewSession;
       repository.laterQueue = this.database.getCatalogCompletenessQueue();
       repository.productionDistributionReviews = this.database.listProductionDistributionReviewEvents();
       repository.uncertainProductionActions = this.database.listUncertainProductionActions();
@@ -510,7 +558,7 @@ class AutomationRuntime {
     };
     for (const key of this.catalogViewCache.keys()) if (!key.startsWith(`${revision}:`)) this.catalogViewCache.delete(key);
     const resolvedCacheKey = includeRepositoryObjects
-      ? `${revision}:${executionMode}:full:${this.catalogReviewSession.revision}`
+      ? `${revision}:${executionMode}:full:${this.catalogReviewOperator.reviewRevision}`
       : cacheKey;
     this.catalogViewCache.set(resolvedCacheKey, result);
     return result;
@@ -529,190 +577,15 @@ class AutomationRuntime {
   }
 
   projectCatalogReviewQueue(reviewQueue) {
-    const entriesByKey = new Map(reviewQueue.map((entry) => [`${entry.objectType}:${entry.objectId}`, entry]));
-    const skippedObjectKeys = this.catalogReviewSession.skippedObjectKeys.filter((key) => entriesByKey.has(key));
-    if (skippedObjectKeys.length !== this.catalogReviewSession.skippedObjectKeys.length) {
-      const resumeObjectKey = entriesByKey.has(this.catalogReviewSession.resumeObjectKey)
-        ? this.catalogReviewSession.resumeObjectKey
-        : reviewQueue[0] ? `${reviewQueue[0].objectType}:${reviewQueue[0].objectId}` : null;
-      this.catalogReviewSession = {
-        revision: this.catalogReviewSession.revision + 1,
-        commandRevision: this.catalogReviewSession.commandRevision,
-        skippedObjectKeys,
-        resumeObjectKey,
-      };
-    }
-    const skippedSet = new Set(skippedObjectKeys);
-    return [
-      ...reviewQueue.filter((entry) => !skippedSet.has(`${entry.objectType}:${entry.objectId}`)),
-      ...skippedObjectKeys.map((key) => ({ ...entriesByKey.get(key), actionStatus: "已跳过" })),
-    ];
+    return this.catalogReviewOperator.projectCatalogReviewQueue(reviewQueue);
   }
 
-  skipCatalogReview({ objectType, objectId }) {
-    const key = `${objectType}:${objectId}`;
-    const currentQueue = this.getCatalogView({ includeRepositoryObjects: true }).repository.reviewQueue;
-    const currentIndex = currentQueue.findIndex((entry) => `${entry.objectType}:${entry.objectId}` === key);
-    if (currentIndex < 0) {
-      throw Object.assign(new Error(`catalog review target not found: ${objectType}/${objectId}`), {
-        code: "CATALOG_REVIEW_TARGET_NOT_FOUND",
-        statusCode: 404,
-      });
-    }
-    const nextObjectKey = currentQueue.length > 1
-      ? `${currentQueue[(currentIndex + 1) % currentQueue.length].objectType}:${currentQueue[(currentIndex + 1) % currentQueue.length].objectId}`
-      : null;
-    this.catalogReviewSession = {
-      revision: this.catalogReviewSession.revision + 1,
-      commandRevision: this.catalogReviewSession.commandRevision + 1,
-      skippedObjectKeys: [
-        ...this.catalogReviewSession.skippedObjectKeys.filter((candidate) => candidate !== key),
-        key,
-      ],
-      resumeObjectKey: nextObjectKey,
-    };
-    this.catalogViewCache.clear();
-    const repository = this.getCatalogView({ includeRepositoryObjects: true }).repository;
-    const nextReviewTarget = repository.reviewQueue.find((entry) => `${entry.objectType}:${entry.objectId}` === nextObjectKey) || null;
-    return {
-      ok: true,
-      reviewQueue: repository.reviewQueue,
-      reviewSession: repository.reviewSession,
-      nextReviewTarget,
-    };
+  skipCatalogReview(input) {
+    return this.catalogReviewOperator.skipCatalogReview(input);
   }
 
   getCatalogObject(objectType, objectId) {
-    const object = this.database.getCatalogObject(objectType, objectId);
-    if (!object) return object;
-    const catalogEvidenceAuditSummaries = this.database.listCatalogEvidenceAuditSummaries({ objectType, objectId });
-    const catalogAuditSummary = [object.catalogAuditSummary, catalogEvidenceAuditSummaries.at(-1)]
-      .filter(Boolean)
-      .sort((left, right) => String(left.createdAt || "").localeCompare(String(right.createdAt || "")))
-      .at(-1) || null;
-    const enrichedObject = {
-      ...object,
-      planningImpact: buildCatalogPlanningImpact(this.database, this.lastState, object),
-      catalogEvidenceAuditSummaries,
-      ...(catalogAuditSummary ? { catalogAuditSummary } : {}),
-    };
-    const iconUrl = (candidate) => candidate ? { ...candidate, url: `/api/catalog/icon/${candidate.assetHash}` } : candidate;
-    if (objectType === "item-identity") {
-      const displayIcon = {
-        ...object.displayIcon,
-        candidates: (object.displayIcon?.candidates || []).map(iconUrl),
-        selectedIcon: iconUrl(object.displayIcon?.selectedIcon),
-      };
-      return {
-        ...enrichedObject,
-        displayIcon,
-        iconCandidates: displayIcon.candidates,
-        selectedIcon: displayIcon.selectedIcon,
-        iconSelectionHistory: displayIcon.history,
-      };
-    }
-    if (objectType === "production-mode") {
-      const mode = object.effectiveValue || object.algorithmCandidate || {};
-      const producerItemId = String(mode.producerItemId || "");
-      const modeId = String(mode.modeId || "");
-      const executionMode = this.getSettings().mode;
-      const distribution = producerItemId && modeId
-        ? this.database.getProductionDistribution(producerItemId, modeId, { executionMode })
-        : null;
-      const itemIds = new Set([
-        ...(distribution?.theoreticalDistribution?.outcomes || []).map((entry) => entry.itemId),
-        ...(distribution?.observedDistribution?.outcomes || []).map((entry) => entry.itemId),
-        ...(distribution?.planningDistribution?.outcomes || []).map((entry) => entry.itemId),
-      ].map(String));
-      const items = Object.fromEntries([...itemIds].map((itemId) => {
-        const identity = this.database.getCatalogObject("item-identity", itemId);
-        const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
-        const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
-          .find((candidate) => String(candidate || "").trim());
-        const level = Number(value.level);
-        return [itemId, {
-          name: String(name || "未命名物品").trim(),
-          level: Number.isInteger(level) && level > 0 ? level : null,
-        }];
-      }));
-      return {
-        ...enrichedObject,
-        productionModeContext: {
-          producerItemId,
-          modeId,
-          energyCost: Number(mode.energyCost),
-          unlocked: mode.unlocked !== false,
-          executionMode,
-          distribution,
-          items,
-        },
-      };
-    }
-    if (objectType === "production-profile") {
-      const profile = object.effectiveValue || object.algorithmCandidate || {};
-      const describeItem = (itemId) => {
-        const identity = this.database.getCatalogObject("item-identity", String(itemId));
-        const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
-        const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
-          .find((candidate) => String(candidate || "").trim());
-        const level = Number(value.level);
-        const selectedIcon = this.database.getSelectedIconCandidate(String(itemId));
-        return {
-          itemKey: String(itemId),
-          name: String(name || "未命名物品").trim(),
-          level: Number.isInteger(level) && level > 0 ? level : null,
-          iconUrl: selectedIcon ? `/api/catalog/icon/${selectedIcon.assetHash}` : null,
-          reviewStatus: identity?.reviewStatus || "clear",
-        };
-      };
-      const productionModes = (profile.productionModes || []).map(String).map((modeId) => {
-        const mode = this.database.getCatalogObject("production-mode", `${object.objectId}:${modeId}`);
-        const value = mode?.effectiveValue || mode?.algorithmCandidate || {};
-        return {
-          modeKey: `${object.objectId}:${modeId}`,
-          modeId,
-          status: mode?.status || "observed",
-          unlocked: value.unlocked !== false,
-        };
-      });
-      return {
-        ...enrichedObject,
-        productionProfileContext: {
-          producer: describeItem(profile.producerItemId || object.objectId),
-          candidateOutputs: (profile.candidateOutputs || []).map(describeItem),
-          productionModes,
-        },
-      };
-    }
-    if (objectType !== "merge-relation") return enrichedObject;
-    const items = this.database.listCatalogObjects({ objectType: "item-identity" }).map((summary) => {
-      const identity = this.database.getCatalogObject(summary.objectType, summary.objectId);
-      const value = identity?.effectiveValue || identity?.algorithmCandidate || {};
-      const name = [value.name, value.displayName, value.title, value.description, value.descriptionKey]
-        .find((candidate) => String(candidate || "").trim());
-      const level = Number(value.level);
-      const selectedIcon = this.database.getSelectedIconCandidate(summary.objectId);
-      return {
-        objectId: summary.objectId,
-        name: String(name || "未命名物品").trim(),
-        level: Number.isInteger(level) && level > 0 ? level : null,
-        chainId: value.chainId == null ? null : String(value.chainId),
-        iconUrl: selectedIcon ? `/api/catalog/icon/${selectedIcon.assetHash}` : null,
-        reviewStatus: identity?.reviewStatus || "clear",
-      };
-    });
-    const relations = this.database.listCatalogObjects({ objectType: "merge-relation" }).map((summary) => {
-      const relation = this.database.getCatalogObject(summary.objectType, summary.objectId);
-      const value = relation?.effectiveValue || relation?.algorithmCandidate || {};
-      return {
-        objectId: summary.objectId,
-        itemId: String(value.itemId ?? summary.objectId),
-        requiredCount: Number(value.requiredCount ?? 2),
-        mergeTarget: value.mergeTarget == null || value.mergeTarget === "" ? null : String(value.mergeTarget),
-        reviewStatus: relation?.reviewStatus || "clear",
-      };
-    });
-    return { ...enrichedObject, relationContext: { items, relations } };
+    return this.catalogReviewOperator.getCatalogObject(objectType, objectId);
   }
 
   getPlanningCatalog({ includeProvisional = false, executionMode = "assisted" } = {}) {
@@ -774,6 +647,10 @@ class AutomationRuntime {
       schemaStatus: this.database.getCatalogSchemaStatus(),
       compatibilityMetrics: this.database.getCatalogCompatibilityMetrics(),
     };
+  }
+
+  beginActionBoundary(owner, options = {}) {
+    return this.sessionSupervisor.beginBoundary(owner, options);
   }
 
   acquireCatalogIcon(itemId) {
@@ -937,8 +814,8 @@ class AutomationRuntime {
     note,
     expectedDisplayIconRevision,
   }) {
-    if (this.running || this.actionBoundaryPending) throw Object.assign(new Error("icon upload requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
-    this.actionBoundaryPending = true;
+    const releaseBoundary = this.beginActionBoundary("icon-upload");
+    if (!releaseBoundary) throw Object.assign(new Error("icon upload requires an automation safe boundary"), { code: "ICON_ACQUISITION_UNSAFE_BOUNDARY", statusCode: 409 });
     try {
       const object = this.database.getCatalogObject("item-identity", String(itemId));
       if (!object) throw Object.assign(new Error(`catalog object not found: item-identity/${itemId}`), { statusCode: 404 });
@@ -964,11 +841,20 @@ class AutomationRuntime {
       this._emitDisplayIconUpdated(selected.objectId, result.displayIcon.revision);
       return result;
     } finally {
-      this.actionBoundaryPending = false;
+      releaseBoundary();
     }
   }
 
   async setCatalogObjectDisposition(objectType, objectId, disposition, reason, expectedRevision) {
+    if (this.catalogReviewOperator) {
+      return this.catalogReviewOperator.setCatalogObjectDisposition(
+        objectType,
+        objectId,
+        disposition,
+        reason,
+        expectedRevision,
+      );
+    }
     const changed = this.catalogGate.setObjectDisposition(objectType, objectId, disposition, reason, expectedRevision);
     let planningResult;
     try {
@@ -994,6 +880,17 @@ class AutomationRuntime {
   }
 
   setCatalogEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision, audit = {}) {
+    if (this.catalogReviewOperator) {
+      return this.catalogReviewOperator.setCatalogEvidenceDisposition(
+        objectType,
+        objectId,
+        evidenceId,
+        disposition,
+        reason,
+        expectedRevision,
+        audit,
+      );
+    }
     const changed = this.catalogGate.setEvidenceDisposition(objectType, objectId, evidenceId, disposition, reason, expectedRevision, audit);
     const object = {
       ...this.getCatalogObject(objectType, objectId),
@@ -1005,10 +902,12 @@ class AutomationRuntime {
   }
 
   applyCatalogRuling(input) {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.applyCatalogRuling(input);
     return this.database.applyCatalogRuling(input);
   }
 
   async adaptLegacyCatalogRuling(input, options = {}) {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.adaptLegacyCatalogRuling(input, options);
     const committed = this.database.adaptLegacyCatalogRuling(input, options);
     return this.completeCatalogReview({
       objectType: committed.objectType,
@@ -1025,6 +924,7 @@ class AutomationRuntime {
   }
 
   previewCatalogReview(input) {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.previewCatalogReview(input);
     const preview = this.database.previewCatalogReview(input);
     const current = this.getCatalogObject(preview.objectType, preview.objectId);
     const previewObject = {
@@ -1045,6 +945,7 @@ class AutomationRuntime {
   }
 
   async completeCatalogReview(input) {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.completeCatalogReview(input);
     let committed;
     try {
       committed = this.database.completeCatalogReview(input);
@@ -1085,6 +986,7 @@ class AutomationRuntime {
   }
 
   async _replanAfterCatalogReview() {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.replanAfterCatalogReview();
     const settings = this.getSettings();
     const plan = buildOptimizationPlan({
       catalog: this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode }),
@@ -1109,6 +1011,7 @@ class AutomationRuntime {
   }
 
   revokeCatalogRuling(input) {
+    if (this.catalogReviewOperator) return this.catalogReviewOperator.revokeCatalogRuling(input);
     return this.database.revokeCatalogRuling(input);
   }
 
@@ -1150,9 +1053,8 @@ class AutomationRuntime {
   }
 
   async runActiveCatalogScan({ itemIds = [] } = {}) {
-    if (this.actionBoundaryPending) throw Object.assign(new Error("another safe-boundary task is running"), { code: "ACTIVE_CATALOG_SCAN_UNSAFE_BOUNDARY", statusCode: 409 });
-    if (this.running && !this.pauseGate.paused) throw Object.assign(new Error("active catalog scan requires paused or stopped automation"), { code: "ACTIVE_CATALOG_SCAN_UNSAFE_BOUNDARY", statusCode: 409 });
-    this.actionBoundaryPending = true;
+    const releaseBoundary = this.beginActionBoundary("active-catalog-scan", { allowPaused: true });
+    if (!releaseBoundary) throw Object.assign(new Error("active catalog scan requires paused or stopped automation"), { code: "ACTIVE_CATALOG_SCAN_UNSAFE_BOUNDARY", statusCode: 409 });
     try {
       if (this.running) await this.pauseGate.waitForBoundary();
       this.iconService.interruptForAutomation();
@@ -1196,7 +1098,7 @@ class AutomationRuntime {
       this.emit("active-catalog-scan-complete", { ...result, itemIds: targets });
       return result;
     } finally {
-      this.actionBoundaryPending = false;
+      releaseBoundary();
     }
   }
 
@@ -1398,6 +1300,7 @@ class AutomationRuntime {
       resourceSamples: this.database.listResourceSamples(120),
       connectionRoute,
       runtimeControl: this.runtimeControl?.status?.() || null,
+      automationStatus: this.sessionSupervisor.snapshot(),
     };
   }
 
@@ -1501,8 +1404,8 @@ class AutomationRuntime {
       switchProductionMode: (index, modeId, request) => execute({ type: "switch-production-mode", index, modeId, request: { expectedCurrentModeId: request.expectedCurrentModeId } }, request.signal),
       reconcileBoardState: reconcileBoardObservation,
       onActionTimeout: ({ reason, timing }) => {
-        this.pauseGate.pause();
-        this.emit("automation-status", { running: true, paused: true, reason, message: "动作确认超时", timing });
+        this.sessionSupervisor.pause();
+        this.sessionSupervisor.publish({ reason, message: "动作确认超时", timing });
       },
       onEvent: recordEvent,
       allowProductionModeSwitch: options.mode !== "observation",
@@ -1529,8 +1432,8 @@ class AutomationRuntime {
     const settings = this.getSettings();
     if (settings.mode !== "assisted") return { ok: false, executed: false, reason: "sale-assisted-mode-required" };
     if (!confirmed) return { ok: false, executed: false, reason: "sale-confirmation-required" };
-    if (this.running || this.actionBoundaryPending) return { ok: false, executed: false, reason: "automation-action-boundary-busy" };
-    this.actionBoundaryPending = true;
+    const releaseBoundary = this.beginActionBoundary("assisted-sale");
+    if (!releaseBoundary) return { ok: false, executed: false, reason: "automation-action-boundary-busy" };
     try {
       this.iconService.interruptForAutomation();
       await this.iconService.waitForRuntimeIdle();
@@ -1553,13 +1456,13 @@ class AutomationRuntime {
         throw error;
       }
     } finally {
-      this.actionBoundaryPending = false;
+      releaseBoundary();
     }
   }
 
   async completeCurrentMapMission() {
-    if (this.running || this.actionBoundaryPending) throw new Error("another automation action is already entering its execution boundary");
-    this.actionBoundaryPending = true;
+    const releaseBoundary = this.beginActionBoundary("map-mission");
+    if (!releaseBoundary) throw new Error("another automation action is already entering its execution boundary");
     try {
       this.iconService.interruptForAutomation();
       await this.iconService.waitForRuntimeIdle();
@@ -1577,7 +1480,7 @@ class AutomationRuntime {
         throw error;
       }
     } finally {
-      this.actionBoundaryPending = false;
+      releaseBoundary();
     }
   }
 
@@ -1589,31 +1492,28 @@ class AutomationRuntime {
       ...options,
       mode: requestedMode == null ? "observation" : ["observation", "assisted", "automatic"].includes(requestedMode) ? requestedMode : "observation",
     };
-    if (this.running || this.actionBoundaryPending) throw new Error("自动化任务已在运行");
-    this.actionBoundaryPending = true;
-    this.running = true;
+    const reservation = this.sessionSupervisor.beginStarting("bounded", {
+      ...options,
+      sessionDatabaseKind: options.mode === "observation" ? "observation" : "automatic",
+    });
+    if (!reservation.accepted) throw new Error("自动化任务已在运行");
     try {
       this.iconService.interruptForAutomation();
       await this.iconService.waitForRuntimeIdle();
       await this.connect();
     } catch (error) {
-      this.running = false;
+      this.sessionSupervisor.failStart(error);
       throw error;
-    } finally {
-      this.actionBoundaryPending = false;
     }
     this.pauseGate.reset();
-    this.abortController = new AbortController();
-    const sessionId = this.database.startSession(options.mode === "observation" ? "observation" : "automatic", options);
-    this.sessionKind = "bounded";
-    this.activeSessionId = sessionId;
-    this.emit("automation-status", { running: true, paused: false, sessionId });
+    const sessionId = this.sessionSupervisor.snapshot().sessionId;
+    this.sessionSupervisor.attachSession(sessionId);
     let sequence = 0;
-    try {
+    return this.sessionSupervisor.runReserved(async (signal) => {
       const loop = this.createRuntime(options, sessionId, () => ++sequence);
       let result;
       try {
-        result = await loop.run({ execute: options.mode !== "observation", maxActions: options.maxActions ?? null, signal: this.abortController.signal });
+        result = await loop.run({ execute: options.mode !== "observation", maxActions: options.maxActions ?? null, signal });
       } catch (error) {
         if (error?.name !== "AbortError") throw error;
         result = { ok: false, executed: options.mode !== "observation", reason: "aborted", actions: [] };
@@ -1621,150 +1521,121 @@ class AutomationRuntime {
       if (!result.actions?.length && sequence === 0) {
         this.database.logAction({ sessionId, sequence: ++sequence, type: "boundary", reason: result.reason, ok: result.ok, details: { nextAction: result.nextAction || null } });
       }
-      this.database.endSession(sessionId, result.reason === "aborted" ? "stopped" : result.ok ? "complete" : "failed");
       return result;
-    } catch (error) {
-      this.database.logAction({
+    }, {
+      onError: (error) => this.database.logAction({
         sessionId,
         sequence: ++sequence,
         type: "error",
         reason: "automation-error",
         ok: false,
         details: buildAutomationErrorDetails(error),
-      });
-      this.database.endSession(sessionId, "error");
-      throw error;
-    } finally {
-      this.running = false;
-      this.flushDeferredPassiveCatalogState();
-      this.abortController = null;
-      this.pauseGate.reset();
-      this.activeSessionId = null;
-      this.sessionKind = null;
-      this.emit("automation-status", { running: false, paused: false, sessionId });
-    }
+      }),
+      onFinally: () => {
+        this.flushDeferredPassiveCatalogState();
+        this.pauseGate.reset();
+      },
+    });
   }
 
   startInBackground(options = {}) {
     if (this.activeRunPromise || this.running) {
       return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
     }
-    this.activeRunPromise = new Promise((resolve) => setImmediate(resolve))
-      .then(() => this.start(options))
-      .then((result) => {
-        this.emit("automation-complete", { result });
-        return result;
-      })
-      .catch((error) => {
-        this.emit("automation-error", { error: error?.message || String(error) });
-        return { ok: false, reason: "automation-error", error: error?.message || String(error) };
-      })
-      .finally(() => {
-        this.activeRunPromise = null;
-      });
+    const completion = new Promise((resolve) => setImmediate(resolve))
+      .then(() => this.start(options));
+    this.sessionSupervisor.trackBackground(completion);
     return { ok: true, accepted: true, reason: "automation-started" };
   }
 
   async startIdle(options = {}) {
-    if (this.running || this.actionBoundaryPending) throw new Error("automation task is already running");
     const settings = { ...this.getSettings(), ...options, mode: options.mode === "observation" ? "assisted" : options.mode || "assisted" };
-    this.running = true;
-    this.iconService.interruptForAutomation();
-    await this.iconService.waitForRuntimeIdle();
-    this.sessionKind = "idle";
-    this.pauseGate.reset();
-    this.abortController = new AbortController();
-    const sessionId = this.database.startSession("idle", { explicitUserAction: true, persistence: "process-local", ...settings });
-    this.activeSessionId = sessionId;
-    let idleSequence = 0;
-    this.idleSession = new IdleAutomationSession({
-      ensureConnection: (signal) => this.connect(signal),
-      collectState: (signal) => this.collectState(signal),
-      planState: (state) => buildOptimizationPlanInWorker({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }, { signal: this.abortController?.signal || null }),
-      runBoundedSession: ({ signal, freshState, freshPlan }) => this.createRuntime(settings, sessionId, () => ++idleSequence).run({
-        execute: true,
-        maxActions: null,
-        signal,
-        initialState: freshState,
-        initialPlan: freshPlan,
-      }),
-      getRuntimeCheckpoint: () => this.runtimeControl?.checkpoint?.() || null,
-      reconcileBeforeMutation: (checkpoint, signal) => this.reconcileRuntimeControlForMutation(checkpoint, signal),
-      waitIfPaused: (signal) => this.pauseGate.wait(signal),
-      onEvent: (event) => {
-        this.database.logAction({ sessionId, sequence: ++idleSequence, type: event.type, reason: event.reason, ok: event.ok, details: event });
-        this.emit(event.type, event);
-      },
+    const reservation = this.sessionSupervisor.beginStarting("idle", {
+      explicitUserAction: true,
+      persistence: "process-local",
+      ...settings,
+      sessionDatabaseKind: "idle",
     });
-    this.emit("automation-status", { running: true, paused: false, idle: true, sessionKind: "idle", sessionId });
+    if (!reservation.accepted) throw new Error("automation task is already running");
     try {
-      const result = await this.idleSession.run({ signal: this.abortController.signal });
-      this.database.endSession(sessionId, result.reason === "aborted" ? "stopped" : result.ok ? "complete" : "failed");
-      return result;
+      this.iconService.interruptForAutomation();
+      await this.iconService.waitForRuntimeIdle();
     } catch (error) {
-      this.database.logAction({
+      this.sessionSupervisor.failStart(error);
+      throw error;
+    }
+    this.pauseGate.reset();
+    const sessionId = this.sessionSupervisor.snapshot().sessionId;
+    this.sessionSupervisor.attachSession(sessionId);
+    let idleSequence = 0;
+    return this.sessionSupervisor.runReserved(async (signal) => {
+      const idleSession = new IdleAutomationSession({
+        ensureConnection: (idleSignal) => this.connect(idleSignal),
+        collectState: (idleSignal) => this.collectState(idleSignal),
+        planState: (state) => buildOptimizationPlanInWorker({ catalog: this.getPlanningCatalog({ includeProvisional: false, executionMode: settings.mode }), state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode }, { signal }),
+        runBoundedSession: ({ signal: runSignal, freshState, freshPlan }) => this.createRuntime(settings, sessionId, () => ++idleSequence).run({
+          execute: true,
+          maxActions: null,
+          signal: runSignal,
+          initialState: freshState,
+          initialPlan: freshPlan,
+        }),
+        getRuntimeCheckpoint: () => this.runtimeControl?.checkpoint?.() || null,
+        reconcileBeforeMutation: (checkpoint, idleSignal) => this.reconcileRuntimeControlForMutation(checkpoint, idleSignal),
+        waitIfPaused: (idleSignal) => this.pauseGate.wait(idleSignal),
+        onEvent: (event) => {
+          this.database.logAction({ sessionId, sequence: ++idleSequence, type: event.type, reason: event.reason, ok: event.ok, details: event });
+          this.emit(event.type, event);
+        },
+      });
+      this.sessionSupervisor.setIdleSession(idleSession);
+      return idleSession.run({ signal });
+    }, {
+      onError: (error) => this.database.logAction({
         sessionId,
         sequence: ++idleSequence,
         type: "error",
         reason: "automation-error",
         ok: false,
         details: buildAutomationErrorDetails(error),
-      });
-      this.database.endSession(sessionId, "error");
-      throw error;
-    } finally {
-      this.running = false;
-      this.flushDeferredPassiveCatalogState();
-      this.abortController = null;
-      this.idleSession = null;
-      this.pauseGate.reset();
-      this.activeSessionId = null;
-      this.sessionKind = null;
-      this.emit("automation-status", { running: false, paused: false, idle: false, sessionKind: null, sessionId });
-    }
+      }),
+      onFinally: () => {
+        this.flushDeferredPassiveCatalogState();
+        this.pauseGate.reset();
+      },
+    });
   }
 
   startIdleInBackground(options = {}) {
     if (this.activeRunPromise || this.running) return { ok: true, accepted: false, reason: "already-running", sessionId: this.activeSessionId };
     this.iconService.interruptForAutomation();
-    this.activeRunPromise = new Promise((resolve) => setImmediate(resolve))
-      .then(() => this.startIdle(options))
-      .then((result) => { this.emit("automation-complete", { result }); return result; })
-      .catch((error) => { this.emit("automation-error", { error: error?.message || String(error) }); return { ok: false, reason: "automation-error", error: error?.message || String(error) }; })
-      .finally(() => { this.activeRunPromise = null; });
+    const completion = new Promise((resolve) => setImmediate(resolve))
+      .then(() => this.startIdle(options));
+    this.sessionSupervisor.trackBackground(completion);
     return { ok: true, accepted: true, reason: "idle-automation-started" };
   }
 
   stop() {
-    if (!this.abortController) return { ok: true, alreadyStopped: true };
-    this.pauseGate.resume();
     this.idleSession?.interruptWait("stop");
-    this.abortController.abort();
-    return { ok: true, alreadyStopped: false };
+    return this.sessionSupervisor.stop();
   }
 
   pause() {
-    if (!this.running) return { ok: false, reason: "automation-not-running", paused: false };
-    const result = this.pauseGate.pause();
-    this.idleSession?.interruptWait("pause");
-    this.emit("automation-status", { running: true, paused: true });
+    const result = this.sessionSupervisor.pause();
+    if (result.ok) this.idleSession?.interruptWait("pause");
     return result;
   }
 
   resume() {
-    if (!this.running) return { ok: false, reason: "automation-not-running", paused: false };
-    if (this.actionBoundaryPending) return { ok: false, reason: "safe-boundary-task-running", paused: true };
-    const result = this.pauseGate.resume();
-    this.idleSession?.interruptWait("resume");
-    this.emit("automation-status", { running: true, paused: false });
+    const result = this.sessionSupervisor.resume();
+    if (result.ok) this.idleSession?.interruptWait("resume");
     return result;
   }
 
   async close() {
-    this.stop();
-    this.connectController?.abort();
-    await this.activeRunPromise?.catch(() => {});
     this.closing = true;
+    this.connectController?.abort();
+    await this.sessionSupervisor.close();
     await this.passiveCatalogDrainPromise?.catch(() => {});
     await this.iconService?.waitForIdle().catch(() => {});
     await this.lab?.close?.().catch(() => {});

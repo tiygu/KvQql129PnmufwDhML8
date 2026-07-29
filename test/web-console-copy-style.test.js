@@ -65,6 +65,7 @@ test("图鉴审核列表只在真正选中后加载详情，并支持同一项�
 
 test("图鉴审核以完整快照确认且普通路径无需备注，并提供证据诊断入口", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const coordinator = read("web/src/catalog-review-mutation-coordinator.ts");
   const api = read("web/src/control-api.ts");
 
   assert.match(api, /completeCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/complete",\s*input\)/);
@@ -73,13 +74,14 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, />\s*确认无误\s*</);
   assert.match(source, />\s*修改后确认\s*</);
   assert.match(source, /补充说明（选填）/);
-  assert.match(source, /snapshot,\s*actor/);
-  assert.match(source, /requestId:\s*completionRequest\.current\.requestId/);
-  assert.match(source, /controlApi\.completeCatalogReview/);
-  assert.match(source, /controlApi\.setCatalogEvidenceDisposition/);
+  assert.match(source, /type:\s*"complete-review"/);
+  assert.match(coordinator, /requestId:\s*this\.completionRequest\.requestId/);
+  assert.match(coordinator, /this\.client\.completeCatalogReview/);
+  assert.match(coordinator, /this\.client\.setCatalogEvidenceDisposition/);
+  assert.doesNotMatch(source, /controlApi\.(?:completeCatalogReview|setCatalogEvidenceDisposition)/);
   for (const label of ["采用证据", "暂停证据", "否决证据", "恢复证据"]) assert.match(source, new RegExp(label));
 
-  assert.match(source, /const\s+refreshedCatalog\s*=\s*await\s+onChanged\(\)/);
+  assert.match(coordinator, /const refreshedCatalog = await this\.refresh\(\)/);
   assert.match(source, /refreshedCatalog\?\.repository\?\.reviewQueue/);
   assert.match(source, /planningResult\.blockingReviewTarget/);
   assert.match(source, /committedReview\.reviewStatus\s*===\s*"needs-review"\s*\|\|\s*!planningRecovered/);
@@ -88,7 +90,8 @@ test("图鉴审核以完整快照确认且普通路径无需备注，并提供�
   assert.match(source, />\s*暂时跳过\s*</);
   const skipReview = source.slice(source.indexOf("const skipCurrentReview"), source.indexOf("const completeReview"));
   assert.match(api, /skipCatalogReview:\s*\(input:\s*any\)\s*=>\s*post\("\/api\/catalog\/review\/skip",\s*input\)/);
-  assert.match(skipReview, /controlApi\.skipCatalogReview/);
+  assert.match(skipReview, /type:\s*"skip-review"/);
+  assert.match(coordinator, /this\.client\.skipCatalogReview/);
   assert.match(skipReview, /await onChanged\(\)/);
 });
 
@@ -117,6 +120,7 @@ test("图鉴审核默认只展示领域摘要，原始数据和完整历史收�
 
 test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验和二次确认后提交完整快照", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const coordinator = read("web/src/catalog-review-mutation-coordinator.ts");
   const api = read("web/src/control-api.ts");
   const technicalDetail = source.slice(
     source.indexOf('<details className="technical-review-details'),
@@ -130,7 +134,8 @@ test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验�
   assert.match(source, /校验并预览影响/);
   assert.match(source, /确认提交完整快照/);
   assert.match(source, /advancedJsonDraft/);
-  assert.match(source, /controlApi\.previewCatalogReview/);
+  assert.match(source, /type:\s*"preview-review"/);
+  assert.match(coordinator, /this\.client\.previewCatalogReview/);
   assert.match(source, /meaningfulDifferences/);
   assert.match(source, /planningImpact/);
   assert.match(source, /fieldPath/);
@@ -141,7 +146,7 @@ test("高级 JSON 编辑与领域表单草稿分离，并在服务端预校验�
 test("本地审核草稿跨刷新必须明确恢复或放弃，revision 冲突保留草稿并展示最新差异", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   const server = read("src/control-server.js");
-  const runtime = read("src/automation-runtime.js");
+  const reviewOperator = read("src/catalog-review-operator.js");
 
   assert.match(source, /catalog-review-local-drafts-v1/);
   assert.match(source, /localStorage/);
@@ -155,7 +160,7 @@ test("本地审核草稿跨刷新必须明确恢复或放弃，revision 冲突�
   assert.match(source, /保留当前对象、草稿与滚动位置/);
   assert.match(source, /CATALOG_REVISION_CONFLICT/);
   assert.match(server, /error\?\.meaningfulDifferences/);
-  assert.match(runtime, /error\.meaningfulDifferences/);
+  assert.match(reviewOperator, /error\.meaningfulDifferences/);
 });
 
 test("图鉴审核展示以后再看集合，并从规划结果与版本基线生成人话解释", () => {
@@ -281,14 +286,46 @@ test("自动化启动为单击执行且不再显示持续执行确认弹窗", ()
   assert.doesNotMatch(runBody, /window\.confirm/);
 });
 
+test("多控制台 automation-status 事件按 statusRevision 丢弃旧快照", () => {
+  const source = read("web/src/App.tsx");
+  assert.match(source, /statusRevisionRef/);
+  assert.match(source, /revision\s*>=\s*statusRevisionRef\.current/);
+  assert.match(source, /automationStatus:\s*event/);
+  assert.match(source, /next\.automationStatus/);
+});
+
+test("仅运行时图标读取消费 safeBoundaryAvailable，semantic mutation 保持独立", () => {
+  const app = read("web/src/App.tsx");
+  const workspace = read("web/src/CatalogReviewWorkspace.tsx");
+  assert.match(app, /runtimeStatus=\{data\.automationStatus\}/);
+  assert.match(
+    app,
+    /disabled=\{loading \|\| data\.automationStatus\?\.safeBoundaryAvailable === false\}/,
+  );
+  assert.match(
+    workspace,
+    /runtimeStatus\?\.safeBoundaryAvailable !== false/,
+  );
+  assert.equal(
+    (workspace.match(/runtimeIconAvailability/g) || []).length,
+    3,
+  );
+  assert.doesNotMatch(
+    workspace,
+    /mutationAvailability\("semantic",\s*runtimeIconAvailability/,
+  );
+});
+
 test("图标候选无需隐藏备注前置条件并在请求完成前立即显示选中态", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
+  const coordinator = read("web/src/catalog-review-mutation-coordinator.ts");
   const selectBody = source.slice(source.indexOf("const selectIcon = async"), source.indexOf("const revokeIcon = async"));
+  const executeBody = coordinator.slice(coordinator.indexOf("async execute"), coordinator.indexOf("async retryRefresh"));
 
   assert.doesNotMatch(selectBody, /!note\.trim\(\)/);
   assert.match(selectBody, /const auditNote = note\.trim\(\) \|\| "手动更新展示图标选择"/);
-  assert.match(selectBody, /setDetail\(markIconSelected\(detail, candidateId\)\)/);
-  assert.ok(selectBody.indexOf("setDetail(markIconSelected") < selectBody.indexOf("await controlApi.selectCatalogIcon"));
+  assert.match(executeBody, /this\.publishDetail\(optimisticIcon\(before, intent\.candidateId\), lane\)/);
+  assert.ok(executeBody.indexOf("this.publishDetail(optimisticIcon") < executeBody.indexOf("await this.call(intent, before)"));
 });
 
 test("图鉴发布回退隐藏普通完整快照入口但保留旧高级诊断入口和已提交事实提示", () => {

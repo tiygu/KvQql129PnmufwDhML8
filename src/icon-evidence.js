@@ -314,6 +314,7 @@ class IconEvidenceService {
     screenshotFrameDelayMs = 60,
     onEvent = null,
     isSafeBoundary = null,
+    withRuntimeBoundary = null,
   }) {
     if (!database) throw new TypeError("database is required");
     this.database = database;
@@ -348,6 +349,10 @@ class IconEvidenceService {
     this.screenshotFrameDelayMs = boundedInteger(screenshotFrameDelayMs, 0, 0, 500);
     this.onEvent = onEvent;
     this.isSafeBoundary = typeof isSafeBoundary === "function" ? isSafeBoundary : () => true;
+    this.withRuntimeBoundary = typeof withRuntimeBoundary === "function"
+      ? withRuntimeBoundary
+      : null;
+    this.runtimeBoundaryOwner = null;
     this.runtimeQueues = new Map();
     this.runtimeParentOrder = [];
     this.runtimeParentIndex = 0;
@@ -807,7 +812,24 @@ class IconEvidenceService {
           ? signal.reason
           : Object.assign(new Error("icon acquisition aborted"), { name: "AbortError" });
       }
-      operationPromise = Promise.resolve().then(() => operation(signal));
+      const runOperation = () => operation(signal);
+      if (runtimeStage && this.withRuntimeBoundary) {
+        const owner = stage === "download-runtime-resource"
+          ? "icon-exact-read"
+          : stage === "resolve-runtime-resource"
+            ? "icon-exact-resolve"
+            : `icon-${stage}`;
+        operationPromise = Promise.resolve().then(() => this.withRuntimeBoundary(owner, async () => {
+          this.runtimeBoundaryOwner = owner;
+          try {
+            return await runOperation();
+          } finally {
+            this.runtimeBoundaryOwner = null;
+          }
+        }));
+      } else {
+        operationPromise = Promise.resolve().then(runOperation);
+      }
       return await Promise.race([operationPromise, timeout]);
     } catch (error) {
       failure = error;
@@ -1220,7 +1242,7 @@ class IconEvidenceService {
   }
 
   _assertSafeBoundary() {
-    if (this.isSafeBoundary()) return;
+    if (this.runtimeBoundaryOwner || this.isSafeBoundary()) return;
     const error = new Error(
       "icon acquisition deferred until automation reaches an idle boundary",
     );

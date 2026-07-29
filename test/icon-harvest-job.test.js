@@ -106,7 +106,7 @@ test("runtime-busy harvest jobs persist a stable queued reason until the safe bo
   );
 
   try {
-    runtime.running = true;
+    runtime.sessionSupervisor.adoptSession({ kind: "test-fixture" });
     const created = runtime.createIconHarvestJob({
       scope: { type: "item", itemId: item.objectId },
       idempotencyKey: "runtime-busy-single-item-job",
@@ -118,12 +118,12 @@ test("runtime-busy harvest jobs persist a stable queued reason until the safe bo
     assert.equal(queued.reason, "automation-runtime-busy");
     assert.equal(queued.children[0].retryable, true);
 
-    runtime.running = false;
+    runtime.sessionSupervisor.finish();
     runtime.iconService.notifySafeBoundary();
     await runtime.iconService.waitForIdle();
     assert.equal(runtime.getIconHarvestJob(created.jobId).state, "succeeded");
   } finally {
-    runtime.running = false;
+    runtime.sessionSupervisor.finish();
     await runtime.close();
     fs.rmSync(dataDir, { recursive: true, force: true });
   }

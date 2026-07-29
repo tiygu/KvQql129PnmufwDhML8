@@ -1,7 +1,13 @@
 "use strict";
 
 class PauseGate {
-  constructor() { this.paused = false; this.boundaryReached = false; this.waiters = new Set(); this.boundaryWaiters = new Set(); }
+  constructor({ onBoundaryReached = null } = {}) {
+    this.paused = false;
+    this.boundaryReached = false;
+    this.onBoundaryReached = onBoundaryReached;
+    this.waiters = new Set();
+    this.boundaryWaiters = new Set();
+  }
   pause() { this.paused = true; this.boundaryReached = false; return { ok: true, paused: true }; }
   resume() { this.paused = false; this.boundaryReached = false; for (const resolve of this.waiters) resolve(); for (const resolve of this.boundaryWaiters) resolve(); this.waiters.clear(); this.boundaryWaiters.clear(); return { ok: true, paused: false }; }
   reset() { return this.resume(); }
@@ -12,7 +18,10 @@ class PauseGate {
   async wait(signal = null) {
     if (!this.paused) return;
     if (signal?.aborted) return;
-    this.boundaryReached = true;
+    if (!this.boundaryReached) {
+      this.boundaryReached = true;
+      this.onBoundaryReached?.();
+    }
     for (const resolve of this.boundaryWaiters) resolve();
     this.boundaryWaiters.clear();
     await new Promise((resolve) => {

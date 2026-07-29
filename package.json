@@ -32,8 +32,8 @@
     "catalog:import": "node src/cli.js catalog-import",
     "plan": "node src/cli.js plan",
     "watch": "node src/cli.js watch",
-    "test": "node --test",
-    "check": "node --check run.cjs && node --check src/control-server.js && node --check src/automation-runtime.js && node --check wmpf/src/index.js && node --check wmpf/src/cdp_automation.js && npm run web:build && node --test"
+    "test": "node --test \"test/*.test.js\"",
+    "check": "node --check run.cjs && node --check src/control-server.js && node --check src/automation-runtime.js && node --check wmpf/src/index.js && node --check wmpf/src/cdp_automation.js && npm run web:build && node --test \"test/*.test.js\""
   },
   "engines": {
     "node": ">=22"

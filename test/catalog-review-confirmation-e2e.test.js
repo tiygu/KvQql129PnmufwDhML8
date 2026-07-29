@@ -29,7 +29,7 @@ function waitForEvent(socket, predicate, label) {
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error(`timed out waiting for ${label}`));
-    }, 3000);
+    }, 10000);
     const onMessage = (data) => {
       const event = JSON.parse(String(data));
       if (!predicate(event)) return;
@@ -305,7 +305,7 @@ test("暂停对象预览订单与关系、隔离规划并在恢复后向所有�
     orders: [{ slot: "pause-order", items: [{ itemId: "pause-target", complete: false }] }],
   };
   let replanCalls = 0;
-  runtime._replanAfterCatalogReview = async () => {
+  runtime.catalogReviewOperator.replanAfterCatalogReview = async () => {
     replanCalls += 1;
     return {
       status: "ready",

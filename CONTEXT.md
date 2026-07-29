@@ -32,6 +32,14 @@ _Avoid_: 等待首次规划完成后才更新按钮、仅显示启动提示文�
 从一个 **Item Identity** 的 **Item Icon Evidence** 候选中指定当前展示偏好的可追溯决定。它独立于 **Catalog Review Resolution**，更换或撤销时不改变物品的语义事实或规划资格。
 _Avoid_: 图标字段裁决、完整身份确认、图标候选选择
 
+**Icon Harvest Job（图标采集任务）**:
+操作者为一个 **Item Identity** 或一条已冻结成员范围的合成链请求的有界图标采集工作。它汇总每个物品的采集结果，但不拥有 **Item Icon Evidence**，也不改变 **Display Icon Selection** 的人工优先级。
+_Avoid_: 单物品图标任务、合成链图标任务、后台图标扫描
+
+**Item Icon Acquisition（物品图标采集单元）**:
+一个 **Icon Harvest Job** 中针对单个 **Item Identity** 的独立采集结果边界；多个任务可以共享同一来源契约下的在途采集，但各自保留自己的结果与取消语义。
+_Avoid_: 图标文件、图标候选、合成链任务
+
 ## Relationships
 
 ### Item knowledge
@@ -184,6 +192,14 @@ _Avoid_: 同时完整规划所有订单、仅改变最终排序
 用于人工辨认 **Item Identity** 的真实游戏图像及其来源记录，不是条目参与规划的必要条件。
 _Avoid_: 图标配置、物品身份
 
+**Item Icon Evidence Currency（物品图标证据时效）**:
+一条 **Item Icon Evidence** 的显式来源契约是否仍被当前采集策略接受；只由采集器、重建版本和质量契约版本判定。不可变来源契约是事实，最近一次策略评估是可重新计算的持久投影；过期证据继续保留其图像、来源和审计，只退出后续自动选择资格。
+_Avoid_: 按创建时间猜测、按像素外观猜测、删除旧图标
+
+**Item Icon Evidence Lineage（物品图标证据谱系）**:
+同一 **Item Identity** 的多次图标采集之间可追溯的替代关系。同一来源的版本演进由稳定采集身份关联；不同来源的当前合格证据也可替代留下自动选择空缺的过期证据，但不会覆盖人工展示偏好。
+_Avoid_: 覆盖旧候选、要求同一来源才能替换、按文件哈希推断来源
+
 **Merge-Chain Icon Harvest（合成链图标采集）**:
 针对一条已验证合成链，从当前已加载的运行时纹理中为全部 **Item Identity** 批量提取 **Item Icon Evidence**；该操作不产生棋盘动作，尚未加载的资源保留为明确的待补采项。
 _Avoid_: 自动合成采图、逐个点击采图
@@ -258,6 +274,26 @@ _Avoid_: 仓库拖拽、指定格取回
 - A genuine evidence conflict remains a **Semantic Review Reason** until the conflicting evidence has received an explicit human disposition; the disposition does not discard its evidence history.
 - An **Item Identity** may have multiple **Item Icon Evidence** candidates from runtime resources, screenshots, or manual input, while one candidate may have a **Display Icon Selection**.
 - A **Display Icon Selection** has its own audit history, may satisfy an icon **Catalog Completeness Gap**, and never confirms an **Item Identity** or resolves its **Semantic Review Reason**.
+- An **Item Icon Evidence** summary expresses two independent facts: **Item Icon Evidence Currency** as current or stale, and **Display Icon Selection** as manual, automatic, or absent.
+- A stale **Item Icon Evidence** summary explains the operational consequence—excluded from automatic display selection while its image and history remain—without exposing provenance-policy versions by default.
+- “Superseded” describes an **Item Icon Evidence Lineage** relationship rather than currency or selection state, so it appears only when lineage is examined.
+- Only an explicit **Item Icon Evidence Lineage** edge makes evidence superseded; a new candidate, a rank change, or a **Display Icon Selection** change does not create that relationship.
+- **Item Icon Evidence Lineage** may branch across sources and is represented by explicit replacement edges; acquisition time never creates or orders those edges implicitly.
+- Stale **Item Icon Evidence** may remain the current display under a protected manual **Display Icon Selection**; that combination never changes the containing **Item Identity**.
+- Replacing a manual **Display Icon Selection**, revoking it into a protected empty state, and explicitly returning selection to automatic control are three distinct display-icon decisions.
+- Returning a **Display Icon Selection** to automatic control atomically removes manual protection and reevaluates existing current eligible evidence; an empty result remains eligible for later automatic filling and does not start an **Icon Harvest Job**.
+- A human may deliberately create a protected **Display Icon Selection** from stale historical evidence after acknowledging that it remains ineligible for automatic selection; this does not change its currency or the containing **Item Identity**.
+- Automatic **Display Icon Selection** requires current eligible evidence, while manual selection may use any retained evidence with a readable image asset after acknowledging stale or superseded status.
+- A protected manual **Display Icon Selection** survives loss of its readable image asset: the selection remains explicit and unavailable for rendering until reacquisition or another human display-icon decision, without affecting **Item Identity** or planning eligibility.
+- **Item Icon Evidence** is presented by operational role rather than as one identity-confidence ranking: the current **Display Icon Selection**, current eligible alternatives, and retained historical evidence are distinct groups.
+- Default **Item Icon Evidence** presentation uses human-readable source, acquisition time, currency, selection state, and operational consequences; internal identifiers, provenance-policy versions, scores, hashes, and full audit history remain diagnostic detail.
+- Diagnostic presentation keeps immutable **Item Icon Evidence** provenance, recomputable **Item Icon Evidence Currency** evaluation, **Item Icon Evidence Lineage**, and **Display Icon Selection** history in separate sections.
+- Human-readable icon status always qualifies “current” by concept—current display versus current evidence currency—rather than using an unscoped “current” label.
+- Human-readable **Display Icon Selection** audit summaries state the event and operational consequence; candidate identifiers, provenance-policy versions, and lineage-edge identifiers remain in audit detail and never enter **Item Identity** review history.
+- **Item Icon Evidence Currency** is derived from explicit provenance contracts; unversioned legacy runtime-resource evidence is stale, while screenshot and manual-upload evidence are not made stale merely because they lack a runtime reconstruction version.
+- The latest **Item Icon Evidence Currency** evaluation is persisted with its policy version and is audited only when the status changes; schema migration and later policy reevaluation are idempotent metadata operations that do not read image bytes, connect to the runtime, or trigger harvesting.
+- When stale **Item Icon Evidence** holds an automatic **Display Icon Selection**, the selection is cleared and audited until a current eligible candidate succeeds; a manual selection remains authoritative with a stale-evidence warning, and a manual revocation continues to block automatic selection.
+- Any current eligible **Item Icon Evidence** for the same **Item Identity** may fill an automatic-selection gap left by stale evidence, regardless of source; **Item Icon Evidence Lineage**, candidate persistence, automatic selection, and their audit records change atomically, while manual preferences remain unchanged.
 - **Item Icon Evidence** is acquired on demand for a specific **Item Identity**; the page resource tree is evidence discovery input rather than a catalog of item identities.
 - A **Merge-Chain Icon Harvest** extracts already loaded runtime assets without selecting, synthesizing, or moving board items; unloaded chain members remain explicit icon gaps that can be retried later.
 - **Passive Catalog Collection** may run during automation, while an **Active Catalog Scan** may run only outside action execution or at an explicit safe boundary.
