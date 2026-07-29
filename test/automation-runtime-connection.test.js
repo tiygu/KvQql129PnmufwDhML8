@@ -334,6 +334,43 @@ test("dashboard polling reuses the runtime state while an automation action is a
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
+test("dashboard planning yields the control-server event loop", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-dashboard-worker-"));
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  let collections = 0;
+  backend.collectState = async () => ({
+    schemaVersion: 1,
+    collectedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, collections++)).toISOString(),
+    scene: "board",
+    resources: { coins: 0, diamonds: 0, energy: 10 },
+    board: { available: true, visible: true, width: 1, height: 1, occupied: 0, empty: 1, signature: "worker-board", grids: [], requiredItemCounts: {} },
+    warehouse: { inventoryKnowledge: { status: "unknown", slots: [], items: [], exchangeCapacity: 0 }, storeAvailability: { status: "unknown" } },
+    orders: [],
+    mapMission: { canComplete: false, requirements: [] },
+  });
+  backend.connectionService.status = async () => ({ listening: true, starting: false, managed: false, cdpPort: 62000 });
+  backend.lab = {};
+  backend.selection = { probe: { context: { id: 1 } } };
+  let settled = false;
+
+  const dashboardPromise = backend.dashboard().then((dashboard) => {
+    settled = true;
+    return dashboard;
+  });
+  const concurrentDashboardPromise = backend.dashboard();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(settled, false);
+  const [dashboard, concurrentDashboard] = await Promise.all([dashboardPromise, concurrentDashboardPromise]);
+  assert.equal(dashboard.plan.boundaryReason, "no-feasible-order");
+  assert.equal(concurrentDashboard.plan, dashboard.plan);
+  const cachedDashboard = await backend.dashboard();
+  assert.equal(cachedDashboard.plan, dashboard.plan);
+  assert.equal(backend.dashboardPlansInFlight.size, 0);
+  backend.database.close();
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
 test("active automation defers full-board catalog evidence instead of blocking every action", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-deferred-board-evidence-"));
   const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
@@ -376,7 +413,8 @@ test("active automation defers full-board catalog evidence instead of blocking e
 test("passive item evidence convergence clears stale review conflicts", async () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-passive-review-convergence-"));
   fs.writeFileSync(path.join(dataDir, "item-catalog.json"), JSON.stringify(persistedCatalogFixture()), "utf8");
-  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false });
+  const events = [];
+  const backend = new AutomationRuntime({ rootDir: path.resolve(__dirname, ".."), dataDir, manageConnectionRoute: false, onEvent: (event) => events.push(event) });
   try {
     backend.database.observeCatalogObject({
       objectType: "item-identity", objectId: "i1",
@@ -386,10 +424,15 @@ test("passive item evidence convergence clears stale review conflicts", async ()
     backend.catalogGate.evaluateObject("item-identity", "i1");
     assert.equal(backend.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), true);
 
+    events.length = 0;
     backend.queuePassiveCatalogEvidence({ state: { board: { grids: [{ index: 0, itemId: "i1", level: 1 }] }, orders: [], producers: [] } });
     await backend.passiveCatalogDrainPromise;
 
     assert.equal(backend.database.listCatalogConflicts().some((conflict) => conflict.objectId === "i1"), false);
+    const catalogUpdates = events.filter((event) => event.type === "catalog-state-updated");
+    assert.equal(catalogUpdates.length, 1);
+    assert.equal(catalogUpdates[0].batch, true);
+    assert.ok(catalogUpdates[0].objects.length >= 2);
   } finally {
     await backend.close(); fs.rmSync(dataDir, { recursive: true, force: true });
   }

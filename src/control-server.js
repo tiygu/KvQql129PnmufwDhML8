@@ -99,12 +99,14 @@ function catalogDirectoryContextPage(runtime, searchParams) {
   return { ...page, selectionInResults };
 }
 
-function createControlServer({ runtime, publicRoot, dataDir } = {}) {
+function createControlServer({ runtime, publicRoot, dataDir, dashboardCacheMs = 8_000 } = {}) {
   if (!runtime) throw new TypeError("runtime is required");
   const staticRoot = path.resolve(publicRoot || path.join(__dirname, "..", "public"));
   const diagnosticsDir = path.resolve(dataDir || path.join(__dirname, "..", "data"), "diagnostics");
   const clients = new Set();
   let dashboardPromise = null;
+  let dashboardSnapshot = null;
+  let dashboardRefreshedAt = 0;
   let lastCatalogQueryRevision = null;
 
   function currentCatalogQueryRevision() {
@@ -139,13 +141,27 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
     send(event);
   }
 
-  function dashboard() {
+  function refreshDashboard() {
     if (!dashboardPromise) {
-      dashboardPromise = runtime.dashboard().finally(() => {
-        dashboardPromise = null;
-      });
+      dashboardPromise = runtime.dashboard()
+        .then((snapshot) => {
+          dashboardSnapshot = snapshot;
+          dashboardRefreshedAt = Date.now();
+          return snapshot;
+        })
+        .finally(() => {
+          dashboardPromise = null;
+        });
     }
     return dashboardPromise;
+  }
+
+  function dashboard() {
+    if (!dashboardSnapshot) return refreshDashboard();
+    if (!dashboardPromise && Date.now() - dashboardRefreshedAt >= dashboardCacheMs) {
+      void refreshDashboard().catch(() => null);
+    }
+    return Promise.resolve(dashboardSnapshot);
   }
 
   async function serveDiagnostic(res) {

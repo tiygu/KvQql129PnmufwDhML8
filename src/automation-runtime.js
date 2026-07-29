@@ -303,6 +303,8 @@ class AutomationRuntime {
     this.connectController = null;
     this.lastState = buildGameState();
     this.lastPlan = null;
+    this.lastPlanKey = null;
+    this.dashboardPlansInFlight = new Map();
     this.planningCatalogCache = new Map();
     this.catalogProjectionCache = new Map();
     this.catalogViewCache = new Map();
@@ -1625,7 +1627,8 @@ class AutomationRuntime {
         for (const diff of pendingDiffs) for (const objectId of collectPassiveCatalogEvidence(this.database, { actionDiff: diff })) observed.add(objectId);
         const observedObjectIds = [...new Set([...observed].map((key) => key.slice(key.indexOf(":") + 1)).filter(Boolean))];
         if (observedObjectIds.length) {
-          for (const object of this.catalogGate.evaluateAll({ objectIds: observedObjectIds })) this.emit("catalog-state-updated", { object });
+          const objects = this.catalogGate.evaluateAll({ objectIds: observedObjectIds });
+          if (objects.length) this.emit("catalog-state-updated", { object: objects.at(-1), objects, batch: true });
         }
         if (observed.size) this.emit("catalog-passive-evidence", { objects: [...observed] });
       } catch (error) {
@@ -1671,10 +1674,41 @@ class AutomationRuntime {
     }
     if (connected) this.queueVisibleBoardIconEvidence(state);
     const planningCatalog = this.getPlanningCatalog({ includeProvisional: settings.mode === "observation", executionMode: settings.mode });
-    const plan = this.running && this.lastPlan
+    const planInput = { catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode };
+    const planKey = crypto.createHash("sha256").update(canonicalJson({
+      catalogRevision: planningCatalog.revision,
+      settings: { strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, mode: settings.mode },
+      state: {
+        schemaVersion: state?.schemaVersion,
+        scene: state?.scene,
+        resources: state?.resources,
+        board: state?.board,
+        orders: state?.orders,
+        producers: state?.producers,
+        warehouse: state?.warehouse,
+        mapProgress: state?.mapProgress,
+        mapMission: state?.mapMission,
+      },
+    })).digest("hex");
+    let plan = this.running && this.lastPlan
       ? this.lastPlan
-      : buildOptimizationPlan({ catalog: planningCatalog, state, strategy: settings.strategy, prioritySlot: settings.prioritySlot, salePolicy: settings.salePolicy, executionMode: settings.mode });
+      : this.lastPlanKey === planKey && this.lastPlan
+        ? this.lastPlan
+        : null;
+    if (!plan) {
+      let planning = this.dashboardPlansInFlight.get(planKey);
+      if (!planning) {
+        planning = buildOptimizationPlanInWorker(planInput);
+        this.dashboardPlansInFlight.set(planKey, planning);
+      }
+      try {
+        plan = await planning;
+      } finally {
+        if (this.dashboardPlansInFlight.get(planKey) === planning) this.dashboardPlansInFlight.delete(planKey);
+      }
+    }
     this.lastPlan = plan;
+    if (!this.running) this.lastPlanKey = planKey;
     return {
       connected,
       connectionError,

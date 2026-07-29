@@ -143,6 +143,8 @@ export default function App() {
   const catalogImportRef = useRef<HTMLInputElement>(null);
   const automationLaunchGenerationRef = useRef(0);
   const statusRevisionRef = useRef(0);
+  const refreshPromiseRef = useRef<Promise<void> | null>(null);
+  const refreshRequestedRef = useRef(false);
 
   const reloadCatalog = async () => {
     const catalogView = await controlApi.getCatalog();
@@ -150,7 +152,7 @@ export default function App() {
     return catalogView;
   };
 
-  const refresh = async () => {
+  const performRefresh = async () => {
     const launchGeneration = automationLaunchGenerationRef.current;
     setLoading(true);
     try {
@@ -178,6 +180,22 @@ export default function App() {
       setMessage("仪表盘暂时不可用，正在重试连接");
     } finally {
       setLoading(false);
+    }
+  };
+  const refresh = async () => {
+    refreshRequestedRef.current = true;
+    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+    const pending = (async () => {
+      while (refreshRequestedRef.current) {
+        refreshRequestedRef.current = false;
+        await performRefresh();
+      }
+    })();
+    refreshPromiseRef.current = pending;
+    try {
+      await pending;
+    } finally {
+      if (refreshPromiseRef.current === pending) refreshPromiseRef.current = null;
     }
   };
   useEffect(() => {

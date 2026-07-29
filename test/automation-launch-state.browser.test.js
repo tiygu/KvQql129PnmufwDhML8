@@ -61,11 +61,13 @@ function dashboard() {
 function createFixtureServer() {
   let releaseDashboard;
   let startRequested = false;
+  let dashboardRequests = 0;
   const dashboardPending = new Promise((resolve) => { releaseDashboard = resolve; });
 
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     if (url.pathname === "/api/dashboard") {
+      dashboardRequests += 1;
       await dashboardPending;
       return json(response, dashboard());
     }
@@ -116,6 +118,7 @@ function createFixtureServer() {
     server,
     releaseStaleDashboard: () => releaseDashboard(),
     startRequested: () => startRequested,
+    dashboardRequests: () => dashboardRequests,
   };
 }
 
@@ -143,6 +146,30 @@ test("过期仪表盘响应不会覆盖点击后的自动化启动态", async ()
     const launchButton = page.locator(".run-btn");
     assert.equal(await launchButton.textContent(), "暂停自动化");
     assert.match(await launchButton.getAttribute("class"), /\bstop\b/);
+  } finally {
+    await browser.close();
+    await new Promise((resolve) => fixture.server.close(resolve));
+  }
+});
+
+test("dashboard polling coalesces while a prior refresh is still pending", async () => {
+  const fixture = createFixtureServer();
+  await new Promise((resolve, reject) => {
+    fixture.server.once("error", reject);
+    fixture.server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = fixture.server.address().port;
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(`http://127.0.0.1:${port}/`);
+    await page.waitForTimeout(8500);
+    assert.equal(fixture.dashboardRequests(), 1);
+
+    fixture.releaseStaleDashboard();
+    await page.waitForTimeout(100);
+    assert.equal(fixture.dashboardRequests(), 2);
   } finally {
     await browser.close();
     await new Promise((resolve) => fixture.server.close(resolve));

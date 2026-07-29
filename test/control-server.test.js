@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
 const WebSocket = require("ws");
@@ -157,6 +158,78 @@ test("control server hosts the console and accepts background automation", async
     assert.equal(oversizedScanResponse.status, 400);
     assert.deepEqual(await oversizedScanResponse.json(), { ok: false, error: "active-catalog-scan-target-limit", limit: 12 });
   } finally {
+    await server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("dashboard serves the latest snapshot while a slow refresh runs in the background", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "control-server-dashboard-cache-"));
+  const publicRoot = path.join(root, "public");
+  fs.mkdirSync(publicRoot);
+  fs.writeFileSync(path.join(publicRoot, "index.html"), "<h1>console fixture</h1>");
+  const runtime = createRuntime();
+  const releases = [];
+  let dashboardCalls = 0;
+  runtime.dashboard = () => new Promise((resolve) => {
+    dashboardCalls += 1;
+    const revision = dashboardCalls;
+    releases.push(() => resolve({ connected: true, revision }));
+  });
+  const server = createControlServer({
+    runtime,
+    publicRoot,
+    dataDir: path.join(root, "data"),
+    dashboardCacheMs: 0,
+  });
+  const port = await listen(server);
+  const requestDashboard = () => new Promise((resolve, reject) => {
+    const request = http.get({
+      host: "127.0.0.1",
+      port,
+      path: "/api/dashboard",
+      agent: false,
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      }));
+    });
+    request.on("error", reject);
+  });
+  const waitForDashboardCalls = async (expected) => {
+    const deadline = Date.now() + 2_000;
+    while (dashboardCalls < expected && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  try {
+    const firstPending = requestDashboard();
+    const concurrentPending = requestDashboard();
+    await waitForDashboardCalls(1);
+    assert.equal(dashboardCalls, 1);
+    releases.shift()();
+    const firstResponse = await firstPending;
+    const concurrentResponse = await concurrentPending;
+    assert.equal(firstResponse.status, 200);
+    assert.equal(concurrentResponse.status, 200);
+    assert.deepEqual(firstResponse.body, { connected: true, revision: 1 });
+    assert.deepEqual(concurrentResponse.body, { connected: true, revision: 1 });
+
+    const staleResponse = await requestDashboard();
+    assert.deepEqual(staleResponse.body, { connected: true, revision: 1 });
+    await waitForDashboardCalls(2);
+    assert.equal(dashboardCalls, 2);
+
+    releases.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+    const refreshedResponse = await requestDashboard();
+    assert.deepEqual(refreshedResponse.body, { connected: true, revision: 2 });
+  } finally {
+    for (const release of releases.splice(0)) release();
     await server.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
