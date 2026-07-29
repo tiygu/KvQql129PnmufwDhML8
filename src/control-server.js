@@ -241,6 +241,13 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         broadcast({ type: "catalog-repository-imported", revision: result.revision, imported: result.imported, preserved: result.preserved });
         return writeJson(res, 200, result);
       }
+      if (route === "POST /api/catalog/icon-harvest-jobs/preflight") {
+        const body = await readJson(req);
+        const preflight = runtime.preflightIconHarvestJob({
+          scope: body.scope,
+        });
+        return writeJson(res, 200, preflight);
+      }
       if (
         route === "POST /api/catalog/icon-harvest-jobs"
         || route === "POST /api/catalog/icon/jobs"
@@ -249,19 +256,38 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
         const body = await readJson(req);
         const itemId = body.scope?.itemId || body.scope?.objectId || body.itemId || body.objectId;
         const wantsHarvestJob = Boolean(body.idempotencyKey || body.scope || route !== "POST /api/catalog/icon/acquire");
-        if (wantsHarvestJob && body.scope?.type != null && body.scope.type !== "item") {
+        if (wantsHarvestJob && body.scope?.type != null
+          && !["item", "merge-chain"].includes(body.scope.type)) {
           return writeJson(res, 400, {
             ok: false,
             error: "invalid-icon-harvest-job-scope",
           });
         }
-        if (wantsHarvestJob && (!itemId || !body.idempotencyKey)) {
+        const mergeChainId = String(body.scope?.mergeChainId || "").trim();
+        const mergeChainRequest = body.scope?.type === "merge-chain";
+        if (wantsHarvestJob && (
+          !body.idempotencyKey
+          || (mergeChainRequest ? !mergeChainId : !itemId)
+        )) {
           return writeJson(res, 400, {
             ok: false,
             error: "invalid-icon-harvest-job-request",
           });
         }
         if (wantsHarvestJob) {
+          if (mergeChainRequest) {
+            const job = runtime.createIconHarvestJob({
+              scope: {
+                type: "merge-chain",
+                mergeChainId,
+              },
+              preflightId: body.preflightId,
+              confirmed: body.confirmed === true,
+              createNew: body.createNew === true,
+              idempotencyKey: String(body.idempotencyKey),
+            });
+            return writeJson(res, job.idempotentReplay ? 200 : 202, job);
+          }
           const job = runtime.createIconHarvestJob({
             scope: {
               type: "item",
@@ -515,6 +541,11 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (error?.itemId) payload.itemId = error.itemId;
       if (error?.minimum) payload.minimum = error.minimum;
       if (error?.maximum) payload.maximum = error.maximum;
+      if (error?.required != null) payload.required = error.required;
+      if (error?.available != null) payload.available = error.available;
+      if (error?.limit != null) payload.limit = error.limit;
+      if (error?.existingJobId) payload.existingJobId = error.existingJobId;
+      if (error?.existingJobs) payload.existingJobs = error.existingJobs;
       writeJson(res, error?.statusCode || 500, payload);
     }
   });

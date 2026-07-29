@@ -370,6 +370,23 @@ class IconEvidenceService {
     const existingTaskId = this.inFlight.get(key);
     if (existingTaskId) {
       const existingTask = this.tasks.get(existingTaskId);
+      if (runtime.exactResourceOnly === true
+        && existingTask?.runtime.exactResourceOnly !== true) {
+        if (existingTask?.status === "queued"
+          && existingTask.phase === "runtime-queued") {
+          existingTask.runtime.exactResourceOnly = true;
+        } else {
+          const error = new Error(
+            `in-flight icon acquisition uses an incompatible provider policy: ${key}`,
+          );
+          error.code = "ICON_ACQUISITION_POLICY_CONFLICT";
+          error.reason = "incompatible-in-flight-provider-policy";
+          error.statusCode = 409;
+          error.itemId = key;
+          error.existingTaskId = existingTaskId;
+          throw error;
+        }
+      }
       existingTask?.subscribers.add(parentTaskId);
       return {
         status: "queued",
@@ -426,6 +443,112 @@ class IconEvidenceService {
       itemId: key,
       shared: false,
     };
+  }
+
+  getBatchCapacity(itemIds) {
+    const uniqueItemIds = [...new Set(
+      (itemIds || []).map((itemId) => String(itemId || "").trim()).filter(Boolean),
+    )];
+    const shared = uniqueItemIds.filter((itemId) => this.inFlight.has(itemId)).length;
+    const required = uniqueItemIds.length - shared;
+    const available = Math.max(0, this.softQueueLimit - this.inFlight.size);
+    return {
+      required,
+      available,
+      shared,
+      limit: this.softQueueLimit,
+      admissible: required <= available,
+    };
+  }
+
+  requestBatch(entries, runtime = {}) {
+    const uniqueEntries = [];
+    const seen = new Set();
+    for (const entry of entries || []) {
+      const itemId = String(entry?.itemId || "").trim();
+      if (!itemId || seen.has(itemId)) continue;
+      seen.add(itemId);
+      uniqueEntries.push({ ...entry, itemId });
+    }
+    if (runtime.exactResourceOnly === true) {
+      for (const entry of uniqueEntries) {
+        const existingTaskId = this.inFlight.get(entry.itemId);
+        const existingTask = existingTaskId
+          ? this.tasks.get(existingTaskId)
+          : null;
+        if (existingTask
+          && existingTask.runtime.exactResourceOnly !== true
+          && (existingTask.status !== "queued"
+            || existingTask.phase !== "runtime-queued")) {
+          const error = new Error(
+            `in-flight icon acquisition uses an incompatible provider policy: ${entry.itemId}`,
+          );
+          error.code = "ICON_ACQUISITION_POLICY_CONFLICT";
+          error.reason = "incompatible-in-flight-provider-policy";
+          error.statusCode = 409;
+          error.itemId = entry.itemId;
+          error.existingTaskId = existingTaskId;
+          throw error;
+        }
+      }
+    }
+    const capacity = this.getBatchCapacity(
+      uniqueEntries.map((entry) => entry.itemId),
+    );
+    if (!capacity.admissible) {
+      const error = new Error("icon acquisition queue lacks atomic batch capacity");
+      error.code = "ICON_ACQUISITION_QUEUE_FULL";
+      error.reason = "queue-capacity";
+      error.statusCode = 429;
+      error.required = capacity.required;
+      error.available = capacity.available;
+      error.limit = capacity.limit;
+      throw error;
+    }
+
+    const requests = [];
+    try {
+      for (const entry of uniqueEntries) {
+        requests.push(this.request(entry.itemId, {
+          ...runtime,
+          ...(entry.runtime || {}),
+          allowSoftOverflow: false,
+        }));
+      }
+      return requests;
+    } catch (error) {
+      this.rollbackBatch(requests);
+      throw error;
+    }
+  }
+
+  rollbackBatch(requests) {
+    let removed = 0;
+    for (const request of requests || []) {
+      if (request?.shared) continue;
+      const task = this.tasks.get(Number(request?.taskId));
+      if (!task || task.status !== "queued" || task.phase !== "runtime-queued") {
+        continue;
+      }
+      const queue = this.runtimeQueues.get(task.parentTaskId);
+      if (queue) {
+        const retained = queue.filter((candidate) => candidate.id !== task.id);
+        if (retained.length) {
+          this.runtimeQueues.set(task.parentTaskId, retained);
+        } else {
+          this.runtimeQueues.delete(task.parentTaskId);
+          this.runtimeParentOrder = this.runtimeParentOrder.filter(
+            (parentTaskId) => parentTaskId !== task.parentTaskId,
+          );
+        }
+      }
+      if (this.inFlight.get(task.itemId) === task.id) {
+        this.inFlight.delete(task.itemId);
+      }
+      this.tasks.delete(task.id);
+      removed += 1;
+    }
+    return removed;
   }
 
   getTask(taskId) {
@@ -725,7 +848,7 @@ class IconEvidenceService {
     task.reason = cancelled
       ? "subscriber-cancelled"
       : deferred
-      ? "automation-safe-boundary"
+      ? error?.reason || "automation-safe-boundary"
       : error?.reason
         || (error?.code === "ICON_ACQUISITION_STAGE_TIMEOUT"
           ? "stage-deadline-exceeded"
@@ -852,6 +975,18 @@ class IconEvidenceService {
       return await this._prepareExactRuntime(task);
     } catch (exactError) {
       if (exactError.code !== "ICON_EXACT_PROVIDER_UNAVAILABLE") throw exactError;
+      if (task.runtime.exactResourceOnly === true) {
+        const deferred = new Error(
+          `runtime resource is not loaded for item ${task.itemId}`,
+        );
+        deferred.code = "ICON_ACQUISITION_DEFERRED";
+        deferred.reason = "resource-not-loaded";
+        deferred.technicalDetails = {
+          exactProvider: exactError.message,
+          providerPolicy: "loaded-runtime-resource-only",
+        };
+        throw deferred;
+      }
       return this._prepareScreenshotRuntime(task, exactError);
     }
   }

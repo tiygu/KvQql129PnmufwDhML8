@@ -36,6 +36,36 @@ function parentState(childState) {
   return childState === "running" ? "running" : "queued";
 }
 
+function derivedParentState(children) {
+  if (!children.length) return "queued";
+  const unsettled = children.filter(
+    (child) => !TERMINAL_CHILD_STATES.has(child.state),
+  );
+  if (unsettled.some((child) => child.state === "running")) return "running";
+  if (unsettled.some((child) => child.state === "cancelling")) return "cancelling";
+  if (unsettled.length) return "queued";
+  if (children.every((child) => child.state === "succeeded")) {
+    return "succeeded";
+  }
+  if (children.some((child) => (
+    child.state === "succeeded" || child.state === "deferred"
+  ))) {
+    return "completed-with-gaps";
+  }
+  if (children.some((child) => child.state === "failed")) return "failed";
+  return "cancelled";
+}
+
+function parseScope(job) {
+  if (job.scope_type === "item") {
+    return { type: "item", itemId: job.scope_key };
+  }
+  return parseJson(job.scope_key) || {
+    type: job.scope_type,
+    mergeChainId: job.scope_key,
+  };
+}
+
 class IconHarvestJobService {
   constructor({ database, onUpdate = null } = {}) {
     if (!database) throw new TypeError("database is required");
@@ -48,7 +78,7 @@ class IconHarvestJobService {
 
   recoverUnfinished() {
     const rows = this.database.db.prepare(`
-      SELECT job_id
+      SELECT job_id,item_id
       FROM icon_harvest_acquisitions
       WHERE state IN ('queued','running','cancelling')
       ORDER BY created_at,id
@@ -62,7 +92,7 @@ class IconHarvestJobService {
         operatorSummary: "运行时已重启，未完成的图标采集已延期，可重新发起任务。",
         technicalDetails: { reason: "runtime-restarted" },
         markStarted: false,
-      });
+      }, row.item_id);
     }
     return rows.length;
   }
@@ -144,6 +174,111 @@ class IconHarvestJobService {
     return { snapshot: this.get(jobId), idempotentReplay: false };
   }
 
+  createMergeChain({ scope, idempotencyKey, admit = null }) {
+    const normalizedKey = String(idempotencyKey || "").trim();
+    const members = Array.isArray(scope?.frozenMembers)
+      ? scope.frozenMembers
+      : [];
+    if (scope?.type !== "merge-chain"
+      || !String(scope.mergeChainId || "").trim()
+      || !members.length) {
+      const error = new TypeError("Merge-Chain Icon Harvest scope is required");
+      error.code = "ICON_HARVEST_SCOPE_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!normalizedKey) {
+      const error = new TypeError("Icon Harvest Job idempotencyKey is required");
+      error.code = "ICON_HARVEST_IDEMPOTENCY_KEY_REQUIRED";
+      error.statusCode = 400;
+      throw error;
+    }
+    const scopeKey = JSON.stringify(scope);
+    const existing = this.database.db.prepare(
+      "SELECT id,scope_key FROM icon_harvest_jobs WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (existing) {
+      if (existing.scope_key !== scopeKey) {
+        const conflict = new Error(
+          "Icon Harvest Job idempotency key belongs to another scope",
+        );
+        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return {
+        snapshot: this.get(existing.id),
+        idempotentReplay: true,
+        admission: null,
+      };
+    }
+
+    const now = new Date().toISOString();
+    const jobId = `job_${crypto.randomUUID()}`;
+    let admission = null;
+    const missingIdentityIds = new Set(
+      (scope.missingIdentities || []).map(String),
+    );
+    const admittedMembers = members.filter((member) => (
+      member.identityAvailable !== false
+      && !missingIdentityIds.has(String(member.itemId))
+    ));
+    this.database.transaction(() => {
+      this.database.db.prepare(`INSERT INTO icon_harvest_jobs(
+        id,scope_type,scope_key,idempotency_key,revision,created_at,updated_at
+      ) VALUES(?,?,?,?,1,?,?)`).run(
+        jobId,
+        "merge-chain",
+        scopeKey,
+        normalizedKey,
+        now,
+        now,
+      );
+      const insertChild = this.database.db.prepare(`INSERT INTO icon_harvest_acquisitions(
+        id,job_id,item_id,state,stage,retryable,created_at,updated_at
+      ) VALUES(?,?,?,'queued','queued',0,?,?)`);
+      const insertGap = this.database.db.prepare(`INSERT INTO icon_harvest_acquisitions(
+          id,job_id,item_id,state,stage,reason_code,retryable,
+          operator_summary,technical_details_json,created_at,completed_at,updated_at
+        ) VALUES(?,?,?,'deferred','preflight','missing-item-identity',1,?,?,?, ?,?)`);
+      members.forEach((member, index) => {
+        const order = Number.isInteger(Number(member.order))
+          ? Number(member.order)
+          : index;
+        const itemId = String(member.itemId);
+        if (missingIdentityIds.has(itemId)
+          || member.identityAvailable === false) {
+          insertGap.run(
+            `acq_gap_${String(order).padStart(4, "0")}_${crypto.randomUUID()}`,
+            jobId,
+            itemId,
+            "目录中缺少该链成员的 Item Identity，已保留为待补采项。",
+            JSON.stringify({ reason: "missing-item-identity" }),
+            now,
+            now,
+            now,
+          );
+          return;
+        }
+        insertChild.run(
+          `acq_${String(order).padStart(4, "0")}_${crypto.randomUUID()}`,
+          jobId,
+          itemId,
+          now,
+          now,
+        );
+      });
+      admission = typeof admit === "function"
+        ? admit({ jobId, members: admittedMembers })
+        : null;
+    });
+    return {
+      snapshot: this.get(jobId),
+      idempotentReplay: false,
+      admission,
+    };
+  }
+
   findByIdempotencyKey(idempotencyKey) {
     const normalizedKey = String(idempotencyKey || "").trim();
     if (!normalizedKey) return null;
@@ -188,13 +323,13 @@ class IconHarvestJobService {
     return runnerTaskId;
   }
 
-  syncRunnerTask(jobId, task) {
+  syncRunnerTask(jobId, task, itemId = task?.itemId) {
     if (!task || task.status === "queued") return this.get(jobId);
     if (task.status === "running") {
       return this._transition(jobId, {
         state: "running",
         stage: "resolving",
-      });
+      }, itemId);
     }
     if (task.status === "complete") {
       const result = task.result || {};
@@ -207,7 +342,7 @@ class IconHarvestJobService {
           provider: result.provider || result.candidate?.sourceType || null,
           cached: !!result.cached,
         },
-      });
+      }, itemId);
       return snapshot;
     }
     if (task.status === "deferred") {
@@ -218,7 +353,7 @@ class IconHarvestJobService {
         retryable: true,
         operatorSummary: "采集条件暂不可用，可稍后重试。",
         technicalDetails: { message: task.error || null },
-      });
+      }, itemId);
     }
     if (task.status === "error") {
       return this._transition(jobId, {
@@ -228,7 +363,7 @@ class IconHarvestJobService {
         retryable: false,
         operatorSummary: "图标证据提交失败。",
         technicalDetails: { message: task.error || null },
-      });
+      }, itemId);
     }
     return this.get(jobId);
   }
@@ -250,14 +385,14 @@ class IconHarvestJobService {
             reason: event.reason || "automation-runtime-busy",
           },
           markStarted: false,
-        }));
+        }, event.itemId));
         continue;
       }
       if (event.type === "icon-acquisition-started") {
         snapshots.push(this._transition(jobId, {
           state: "running",
           stage: event.stage || "resolving",
-        }));
+        }, event.itemId));
         continue;
       }
       if (event.type === "icon-acquisition-complete") {
@@ -270,7 +405,7 @@ class IconHarvestJobService {
             provider: event.provider || event.candidate?.sourceType || null,
             cached: !!event.cached,
           },
-        }));
+        }, event.itemId));
         continue;
       }
       if (event.type === "icon-acquisition-deferred") {
@@ -281,7 +416,7 @@ class IconHarvestJobService {
           retryable: event.retryable !== false,
           operatorSummary: event.operatorSummary || "采集条件暂不可用，可稍后重试。",
           technicalDetails: event.technicalDetails || null,
-        }));
+        }, event.itemId));
         continue;
       }
       if (event.type === "icon-acquisition-error") {
@@ -292,7 +427,7 @@ class IconHarvestJobService {
           retryable: !!event.retryable,
           operatorSummary: event.operatorSummary || "图标证据提交失败。",
           technicalDetails: event.technicalDetails || { message: event.error || null },
-        }));
+        }, event.itemId));
         continue;
       }
       if (event.type === "icon-acquisition-cancelled") {
@@ -303,10 +438,15 @@ class IconHarvestJobService {
           retryable: true,
           operatorSummary: "图标采集订阅已取消。",
           technicalDetails: event.technicalDetails || null,
-        }));
+        }, event.itemId));
       }
     }
-    if (snapshots.some((snapshot) => TERMINAL_CHILD_STATES.has(snapshot?.children?.[0]?.state))) {
+    if ([
+      "icon-acquisition-complete",
+      "icon-acquisition-deferred",
+      "icon-acquisition-error",
+      "icon-acquisition-cancelled",
+    ].includes(event.type)) {
       this.jobsByRunnerTask.delete(runnerTaskId);
     }
     return snapshots.filter(Boolean);
@@ -328,6 +468,7 @@ class IconHarvestJobService {
       "SELECT * FROM icon_harvest_jobs WHERE id=?",
     ).get(String(jobId));
     if (!job) return null;
+    const scope = parseScope(job);
     const children = this.database.db.prepare(
       "SELECT * FROM icon_harvest_acquisitions WHERE job_id=? ORDER BY created_at,id",
     ).all(job.id).map((row) => ({
@@ -346,6 +487,18 @@ class IconHarvestJobService {
       completedAt: row.completed_at || null,
       updatedAt: row.updated_at,
     }));
+    if (scope.type === "merge-chain") {
+      const frozenOrder = new Map(
+        scope.frozenMembers.map((member, order) => [
+          String(member.itemId),
+          Number.isInteger(Number(member.order)) ? Number(member.order) : order,
+        ]),
+      );
+      children.sort((left, right) => (
+        (frozenOrder.get(left.itemId) ?? Number.MAX_SAFE_INTEGER)
+        - (frozenOrder.get(right.itemId) ?? Number.MAX_SAFE_INTEGER)
+      ));
+    }
     const terminal = {
       succeeded: children.filter((child) => child.state === "succeeded").length,
       deferred: children.filter((child) => child.state === "deferred").length,
@@ -353,17 +506,23 @@ class IconHarvestJobService {
       cancelled: children.filter((child) => child.state === "cancelled").length,
     };
     const settled = Object.values(terminal).reduce((sum, count) => sum + count, 0);
-    const child = children[0];
-    const state = parentState(child?.state || "queued");
+    const state = derivedParentState(children);
+    const focus = children.find((child) => child.state === "running")
+      || children.find((child) => !TERMINAL_CHILD_STATES.has(child.state))
+      || children.find((child) => child.state === "deferred")
+      || children.find((child) => child.state === "failed")
+      || children.find((child) => child.state === "cancelled")
+      || children[0];
+    const finalStatus = settled === children.length ? state : null;
     return {
       jobId: job.id,
       revision: Number(job.revision),
-      scope: { type: job.scope_type, itemId: job.scope_key },
+      scope,
       retryOfJobId: job.retry_of_job_id || null,
       state,
-      finalStatus: TERMINAL_CHILD_STATES.has(child?.state) ? state : null,
-      stage: child?.stage || "queued",
-      reason: child?.reason || null,
+      finalStatus,
+      stage: focus?.stage || "queued",
+      reason: focus?.reason || null,
       progress: {
         settled,
         total: children.length,
@@ -580,12 +739,16 @@ class IconHarvestJobService {
     technicalDetails = null,
     result = null,
     markStarted = true,
-  }) {
+  }, itemId = null) {
     const now = new Date().toISOString();
     const changed = this.database.transaction(() => {
-      const child = this.database.db.prepare(
-        "SELECT * FROM icon_harvest_acquisitions WHERE job_id=?",
-      ).get(String(jobId));
+      const child = itemId == null
+        ? this.database.db.prepare(
+          "SELECT * FROM icon_harvest_acquisitions WHERE job_id=? ORDER BY created_at,id",
+        ).get(String(jobId))
+        : this.database.db.prepare(
+          "SELECT * FROM icon_harvest_acquisitions WHERE job_id=? AND item_id=?",
+        ).get(String(jobId), String(itemId));
       if (!child || TERMINAL_CHILD_STATES.has(child.state)) return false;
       const terminal = TERMINAL_CHILD_STATES.has(state);
       this.database.db.prepare(`UPDATE icon_harvest_acquisitions SET
@@ -614,17 +777,21 @@ class IconHarvestJobService {
         completed_at=CASE WHEN ? THEN ? ELSE completed_at END,
         updated_at=?
         WHERE id=?`).run(
-        markStarted ? now : null,
-        terminal ? 1 : 0,
-        now,
-        now,
-        String(jobId),
+          markStarted ? now : null,
+          terminal && this.database.db.prepare(`
+            SELECT COUNT(*) AS count
+            FROM icon_harvest_acquisitions
+            WHERE job_id=? AND state NOT IN ('succeeded','deferred','failed','cancelled')
+          `).get(String(jobId)).count === 0 ? 1 : 0,
+          now,
+          now,
+          String(jobId),
       );
       return true;
     });
     if (!changed) return this.get(jobId);
     const snapshot = this.publish(jobId);
-    if (TERMINAL_CHILD_STATES.has(snapshot?.children?.[0]?.state)) {
+    if (snapshot?.finalStatus) {
       for (const [runnerTaskId, jobIds] of this.jobsByRunnerTask.entries()) {
         jobIds.delete(String(jobId));
         if (!jobIds.size) this.jobsByRunnerTask.delete(runnerTaskId);

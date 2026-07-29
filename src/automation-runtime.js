@@ -31,6 +31,9 @@ const { canonicalJson } = require("./canonical-json");
 const { CatalogItemQuery } = require("./catalog-item-query");
 const { IconHarvestJobService } = require("./icon-harvest-jobs");
 
+const ICON_ACQUISITION_CONTRACT_VERSION = "item-icon-acquisition-v1";
+const ICON_HARVEST_PREFLIGHT_TTL_MS = 10 * 60 * 1000;
+
 function buildOptimizationPlanInWorker(input, { signal = null } = {}) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(path.join(__dirname, "planning-worker.js"), { workerData: input });
@@ -263,6 +266,7 @@ class AutomationRuntime {
     this.catalogViewCache = new Map();
     this.catalogReviewSession = { revision: 0, commandRevision: 0, skippedObjectKeys: [], resumeObjectKey: null };
     this.iconEvidenceRetryAt = new Map();
+    this.iconHarvestPreflights = new Map();
     this.running = false;
     this.abortController = null;
     this.pauseGate = new PauseGate();
@@ -784,7 +788,387 @@ class AutomationRuntime {
     return this.iconService.request(String(itemId), { itemIdentity: { itemId: String(itemId), ...(object.effectiveValue || object.algorithmCandidate || {}) } });
   }
 
-  createIconHarvestJob({ scope, idempotencyKey } = {}) {
+  _mergeChainFrozenMembers(mergeChainId) {
+    const normalizedChainId = String(mergeChainId || "").trim();
+    const summaries = this.database.listCatalogObjects();
+    const objectPayload = (summary, { activeOnly = true } = {}) => {
+      const object = this.database.getCatalogObject(
+        summary.objectType,
+        summary.objectId,
+      );
+      if (!object || object.disposition !== "enabled") return null;
+      if (activeOnly && object.status !== "active") return null;
+      return object.effectiveValue || object.algorithmCandidate || null;
+    };
+    const knownButUnverified = summaries.some((summary) => {
+      if (!["item-identity", "merge-relation"].includes(summary.objectType)) {
+        return false;
+      }
+      const payload = objectPayload(summary, { activeOnly: false }) || {};
+      return String(payload.chainId ?? payload.mergeChainId ?? "")
+        === normalizedChainId;
+    });
+    const relations = summaries
+      .filter((summary) => summary.objectType === "merge-relation")
+      .map((summary) => {
+        const relation = objectPayload(summary);
+        if (!relation
+          || String(relation.chainId ?? relation.mergeChainId ?? "")
+            !== normalizedChainId) {
+          return null;
+        }
+        return {
+          itemId: String(relation.itemId ?? summary.objectId),
+          level: Number(relation.level),
+          mergeTarget: relation.mergeTarget == null
+            || relation.mergeTarget === ""
+            ? null
+            : String(relation.mergeTarget),
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => (
+        left.level - right.level || left.itemId.localeCompare(right.itemId)
+      ));
+    const relationIds = new Set(relations.map((relation) => relation.itemId));
+    const verified = relations.length > 0
+      && relationIds.size === relations.length
+      && relations.every((relation, index) => (
+        Number.isInteger(relation.level)
+        && (index === 0
+          || relation.level === relations[index - 1].level + 1)
+        && (index === relations.length - 1
+          ? relation.mergeTarget == null
+          : relation.mergeTarget === relations[index + 1].itemId)
+      ));
+    if (!verified) {
+      const error = new Error(
+        knownButUnverified
+          ? `merge chain is not verified: ${normalizedChainId}`
+          : `merge chain not found: ${normalizedChainId}`,
+      );
+      error.code = knownButUnverified
+        ? "MERGE_CHAIN_NOT_VERIFIED"
+        : "MERGE_CHAIN_NOT_FOUND";
+      error.statusCode = knownButUnverified ? 409 : 404;
+      throw error;
+    }
+    const identitiesById = new Map(
+      summaries
+        .filter((summary) => summary.objectType === "item-identity")
+        .map((summary) => [String(summary.objectId), objectPayload(summary)])
+        .filter(([, identity]) => identity),
+    );
+    const missingIdentities = [];
+    const frozenMembers = [];
+    relations.forEach((relation, order) => {
+      const identity = identitiesById.get(relation.itemId);
+      const identityMatches = identity
+        && String(identity.itemId ?? relation.itemId) === relation.itemId
+        && String(identity.chainId ?? identity.mergeChainId ?? "")
+          === normalizedChainId
+        && Number(identity.level) === relation.level;
+      if (!identityMatches) {
+        missingIdentities.push(relation.itemId);
+      }
+      frozenMembers.push({
+        itemId: relation.itemId,
+        level: relation.level,
+        iconResourceIdentifier: identityMatches
+          ? identity.iconResourceIdentifier ?? identity.iconResource ?? null
+          : null,
+        identityAvailable: !!identityMatches,
+        order,
+      });
+    });
+    return {
+      frozenMembers,
+      expectedMemberCount: relations.length,
+      missingIdentities,
+    };
+  }
+
+  _activeMergeChainJobs(mergeChainId) {
+    const normalizedChainId = String(mergeChainId || "").trim();
+    return this.iconHarvestJobs.list().filter((job) => (
+      job.scope.type === "merge-chain"
+      && job.scope.mergeChainId === normalizedChainId
+      && job.finalStatus == null
+    ));
+  }
+
+  preflightIconHarvestJob({ scope } = {}) {
+    const mergeChainId = String(scope?.mergeChainId || "").trim();
+    if (scope?.type !== "merge-chain" || !mergeChainId) {
+      const error = new TypeError("merge-chain Icon Harvest preflight scope is required");
+      error.code = "ICON_HARVEST_PREFLIGHT_SCOPE_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    const frozenScope = this._mergeChainFrozenMembers(mergeChainId);
+    const {
+      frozenMembers,
+      expectedMemberCount,
+      missingIdentities,
+    } = frozenScope;
+    if (!frozenMembers.length) {
+      const error = new Error(`merge chain not found: ${mergeChainId}`);
+      error.code = "MERGE_CHAIN_NOT_FOUND";
+      error.statusCode = 404;
+      throw error;
+    }
+    const catalogQueryRevision = this.getCatalogQueryRevision();
+    const scopeFingerprint = crypto.createHash("sha256")
+      .update(canonicalJson({
+        mergeChainId,
+        catalogQueryRevision,
+        acquisitionContractVersion: ICON_ACQUISITION_CONTRACT_VERSION,
+        expectedMemberCount,
+        missingIdentities,
+        frozenMembers,
+      }))
+      .digest("hex");
+    const activeJobs = this._activeMergeChainJobs(mergeChainId);
+    const matchingActiveJob = activeJobs.find(
+      (job) => job.scope.scopeFingerprint === scopeFingerprint,
+    ) || null;
+    const differentScopeActiveJobs = activeJobs.filter(
+      (job) => job.scope.scopeFingerprint !== scopeFingerprint,
+    ).map((job) => ({
+      jobId: job.jobId,
+      catalogQueryRevision: job.scope.catalogQueryRevision,
+      frozenMemberCount: job.scope.frozenMembers.length,
+    }));
+    const capacity = this.iconService.getBatchCapacity(
+      frozenMembers
+        .filter((member) => member.identityAvailable)
+        .map((member) => member.itemId),
+    );
+    const preflightId = `preflight_${crypto.randomUUID()}`;
+    const now = Date.now();
+    const preflight = {
+      preflightId,
+      scope: { type: "merge-chain", mergeChainId },
+      catalogQueryRevision,
+      expectedMemberCount,
+      missingIdentities,
+      frozenMembers,
+      contractChecks: {
+        acquisitionContractVersion: ICON_ACQUISITION_CONTRACT_VERSION,
+        status: "passed",
+        checks: [
+          { code: "verified-merge-chain", status: "passed" },
+          { code: "frozen-members-non-empty", status: "passed" },
+          {
+            code: "identity-gaps-accounted-for",
+            status: "passed",
+            missingCount: missingIdentities.length,
+          },
+          {
+            code: "passive-runtime-evidence-only",
+            status: "passed",
+            boardActionsAllowed: false,
+          },
+          {
+            code: "unloaded-resource-outcome",
+            status: "passed",
+            outcome: "deferred",
+          },
+        ],
+      },
+      capacity,
+      safety: this.running || this.actionBoundaryPending
+        ? { state: "blocked", reason: "automation-active" }
+        : { state: "safe", reason: null },
+      duplicates: {
+        matchingActiveJob: matchingActiveJob
+          ? {
+            jobId: matchingActiveJob.jobId,
+            detailUrl: `/api/catalog/icon-harvest-jobs/${matchingActiveJob.jobId}`,
+          }
+          : null,
+        differentScopeActiveJobs,
+        requiresExplicitNewJob: differentScopeActiveJobs.length > 0,
+      },
+      expiresAt: new Date(now + ICON_HARVEST_PREFLIGHT_TTL_MS).toISOString(),
+    };
+    this.iconHarvestPreflights.set(preflightId, {
+      ...preflight,
+      scopeFingerprint,
+      expiresAtMs: now + ICON_HARVEST_PREFLIGHT_TTL_MS,
+    });
+    for (const [candidateId, candidate] of this.iconHarvestPreflights.entries()) {
+      if (candidate.expiresAtMs <= now) this.iconHarvestPreflights.delete(candidateId);
+    }
+    return preflight;
+  }
+
+  _confirmedMergeChainPreflight(preflightId, mergeChainId) {
+    const normalizedPreflightId = String(preflightId || "").trim();
+    const preflight = this.iconHarvestPreflights.get(normalizedPreflightId);
+    if (!preflight || preflight.expiresAtMs <= Date.now()) {
+      this.iconHarvestPreflights.delete(normalizedPreflightId);
+      const error = new Error("Merge-Chain Icon Harvest preflight is missing or expired");
+      error.code = "ICON_HARVEST_PREFLIGHT_EXPIRED";
+      error.statusCode = 409;
+      throw error;
+    }
+    if (preflight.scope.mergeChainId !== String(mergeChainId || "").trim()) {
+      const error = new Error("Merge-Chain Icon Harvest preflight scope changed");
+      error.code = "ICON_HARVEST_PREFLIGHT_SCOPE_CHANGED";
+      error.statusCode = 409;
+      throw error;
+    }
+    return preflight;
+  }
+
+  _createMergeChainIconHarvestJob({
+    scope,
+    preflightId,
+    confirmed,
+    createNew,
+    idempotencyKey,
+  }) {
+    const mergeChainId = String(scope?.mergeChainId || "").trim();
+    if (confirmed !== true) {
+      const error = new Error("Merge-Chain Icon Harvest confirmation is required");
+      error.code = "ICON_HARVEST_CONFIRMATION_REQUIRED";
+      error.statusCode = 409;
+      throw error;
+    }
+    const replay = this.iconHarvestJobs.findByIdempotencyKey(idempotencyKey);
+    if (replay && replay.scope.type === "merge-chain"
+      && replay.scope.mergeChainId === mergeChainId) {
+      const replayPreflight = this.iconHarvestPreflights.get(
+        String(preflightId || "").trim(),
+      );
+      if (replayPreflight?.expiresAtMs > Date.now()
+        && replayPreflight.scopeFingerprint !== replay.scope.scopeFingerprint) {
+        const conflict = new Error(
+          "Icon Harvest Job idempotency key belongs to another frozen scope",
+        );
+        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+      return { ...replay, idempotentReplay: true };
+    }
+    const preflight = this._confirmedMergeChainPreflight(
+      preflightId,
+      mergeChainId,
+    );
+    const activeJobs = this._activeMergeChainJobs(mergeChainId);
+    const matchingActiveJob = activeJobs.find(
+      (job) => job.scope.scopeFingerprint === preflight.scopeFingerprint,
+    ) || null;
+    const differentScopeActiveJobs = activeJobs.filter(
+      (job) => job.scope.scopeFingerprint !== preflight.scopeFingerprint,
+    ).map((job) => ({
+      jobId: job.jobId,
+      catalogQueryRevision: job.scope.catalogQueryRevision,
+      frozenMemberCount: job.scope.frozenMembers.length,
+    }));
+    if (matchingActiveJob) {
+      const duplicate = new Error(
+        "A matching Merge-Chain Icon Harvest Job is already active",
+      );
+      duplicate.code = "ICON_HARVEST_DUPLICATE_ACTIVE";
+      duplicate.statusCode = 409;
+      duplicate.existingJobId = matchingActiveJob.jobId;
+      throw duplicate;
+    }
+    if (differentScopeActiveJobs.length && createNew !== true) {
+      const explicit = new Error(
+        "A different frozen scope is active; explicit new-job confirmation is required",
+      );
+      explicit.code = "ICON_HARVEST_EXPLICIT_NEW_REQUIRED";
+      explicit.statusCode = 409;
+      explicit.existingJobs = differentScopeActiveJobs;
+      throw explicit;
+    }
+    const persistedScope = {
+      type: "merge-chain",
+      mergeChainId,
+      catalogQueryRevision: preflight.catalogQueryRevision,
+      expectedMemberCount: preflight.expectedMemberCount,
+      missingIdentities: preflight.missingIdentities,
+      frozenMembers: preflight.frozenMembers,
+      acquisitionContractVersion: ICON_ACQUISITION_CONTRACT_VERSION,
+      scopeFingerprint: preflight.scopeFingerprint,
+    };
+    let admittedRequests = [];
+    let created;
+    try {
+      created = this.iconHarvestJobs.createMergeChain({
+        scope: persistedScope,
+        idempotencyKey,
+        admit: ({ jobId, members }) => {
+          admittedRequests = this.iconService.requestBatch(
+            members.map((member) => {
+              const object = this.database.getCatalogObject(
+                "item-identity",
+                String(member.itemId),
+              );
+              return {
+                itemId: String(member.itemId),
+                runtime: {
+                  itemIdentity: {
+                    itemId: String(member.itemId),
+                    ...(object?.effectiveValue || object?.algorithmCandidate || {}),
+                    iconResourceIdentifier: member.iconResourceIdentifier,
+                  },
+                },
+              };
+            }),
+            {
+              parentTaskId: jobId,
+              exactResourceOnly: true,
+            },
+          );
+          return admittedRequests;
+        },
+      });
+    } catch (error) {
+      if (admittedRequests.length) {
+        this.iconService.rollbackBatch(admittedRequests);
+      }
+      throw error;
+    }
+    let snapshot = created.snapshot;
+    for (const request of created.admission || []) {
+      this.iconHarvestJobs.trackRunnerTask(snapshot.jobId, request.taskId);
+      snapshot = this.iconHarvestJobs.syncRunnerTask(
+        snapshot.jobId,
+        this.iconService.getTask(request.taskId),
+        request.itemId,
+      );
+    }
+    if (snapshot.revision === created.snapshot.revision) {
+      this.iconHarvestJobs.onUpdate?.(snapshot);
+    }
+    return {
+      ...snapshot,
+      idempotentReplay: false,
+      taskIds: (created.admission || []).map((request) => request.taskId),
+    };
+  }
+
+  createIconHarvestJob({
+    scope,
+    preflightId,
+    confirmed = false,
+    createNew = false,
+    idempotencyKey,
+  } = {}) {
+    if (scope?.type === "merge-chain") {
+      return this._createMergeChainIconHarvestJob({
+        scope,
+        preflightId,
+        confirmed,
+        createNew,
+        idempotencyKey,
+      });
+    }
     if (scope?.type !== "item" || !String(scope.itemId || "").trim()) {
       const error = new TypeError("single-item Icon Harvest Job scope is required");
       error.code = "ICON_HARVEST_SCOPE_INVALID";

@@ -206,6 +206,63 @@ test("soft queue pressure can defer background work but the hard queue limit is 
   }
 });
 
+test("exact-resource batches strengthen compatible queued shared tasks", () => {
+  const { service, cleanup } = serviceFixture();
+  service.interruptForAutomation();
+
+  try {
+    const ordinary = service.request("shared-item");
+    const [shared] = service.requestBatch(
+      [{ itemId: "shared-item" }],
+      { exactResourceOnly: true },
+    );
+    assert.equal(shared.taskId, ordinary.taskId);
+    assert.equal(shared.shared, true);
+    assert.equal(
+      service.tasks.get(ordinary.taskId).runtime.exactResourceOnly,
+      true,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("exact-resource batches reject an incompatible running shared task", async () => {
+  const runtimeGate = deferred();
+  const { service, cleanup } = serviceFixture({
+    resolveSpriteFrame: async () => {
+      await runtimeGate.promise;
+      return {
+        runtimeIdentifier: "shared-running",
+        resourceUrl: "fixture://shared-running",
+        mimeType: "image/png",
+        rect: { x: 0, y: 0, width: 1, height: 1 },
+        originalSize: { width: 1, height: 1 },
+        offset: { x: 0, y: 0 },
+      };
+    },
+  });
+
+  try {
+    const ordinary = service.request("shared-running");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(service.getTask(ordinary.taskId).status, "running");
+    assert.throws(
+      () => service.requestBatch(
+        [{ itemId: "shared-running" }],
+        { exactResourceOnly: true },
+      ),
+      (error) => error.code === "ICON_ACQUISITION_POLICY_CONFLICT"
+        && error.statusCode === 409,
+    );
+    assert.equal(service.tasks.size, 1);
+  } finally {
+    runtimeGate.resolve();
+    await service.waitForIdle();
+    cleanup();
+  }
+});
+
 test("runtime-busy work remains queued with a stable reason and resumes at a safe boundary", async () => {
   let safe = false;
   const { service, cleanup } = serviceFixture({

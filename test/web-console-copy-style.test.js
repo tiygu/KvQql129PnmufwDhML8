@@ -53,6 +53,24 @@ test("网页控制台不再显示遗留英文操作文案", () => {
   assert.deepEqual(violations, [], `发现遗留英文文案：${violations.join("、")}`);
 });
 
+test("整链图标采集先展示冻结预检并只通过持久任务原子入队", () => {
+  const source = read("web/src/App.tsx");
+  const body = source.slice(
+    source.indexOf("const acquireSelectedChainIcons"),
+    source.indexOf("const catalogStates"),
+  );
+
+  assert.match(body, /controlApi\.preflightMergeChainIconHarvest/);
+  assert.match(body, /catalogQueryRevision/);
+  assert.match(body, /frozenMembers/);
+  assert.match(body, /capacity\.required/);
+  assert.match(body, /capacity\.available/);
+  assert.match(body, /window\.confirm/);
+  assert.match(body, /controlApi\.createMergeChainIconHarvestJob/);
+  assert.doesNotMatch(body, /controlApi\.acquireCatalogIcon/);
+  assert.doesNotMatch(body, /for\s*\([^)]*pendingItems/);
+});
+
 test("图鉴审核列表只在真正选中后加载详情，并支持同一项重试", () => {
   const source = read("web/src/CatalogReviewWorkspace.tsx");
   assert.doesNotMatch(source, /\|\|\s*candidates\[0\]\s*\|\|\s*null/);
@@ -246,7 +264,20 @@ test("长合成链在面板内部滚动且整链图标可以无棋盘动作采�
   const source = read("web/src/App.tsx");
   const css = [read("web/src/styles.css"), read("web/src/tactical.css")].join("\n");
   assert.match(source, /采集整链图标/);
-  assert.match(source, /const pendingItems = selectedChainItems;/);
+  assert.match(source, /preflightMergeChainIconHarvest/);
+  assert.match(source, /createMergeChainIconHarvestJob/);
+  assert.match(source, /查看现有采集任务/);
+  assert.match(source, /window\.open\([\s\S]*detailUrl/);
+  assert.match(source, /icon-harvest-job-updated/);
+  assert.match(
+    source,
+    /event\.job\?\.finalStatus[\s\S]*setActiveIconHarvestJob/,
+  );
+  assert.match(source, /if \(!job\.finalStatus\)[\s\S]*setActiveIconHarvestJob/);
+  assert.match(
+    source,
+    /existingJobId[\s\S]*getIconHarvestJob[\s\S]*setActiveIconHarvestJob/,
+  );
   assert.match(css, /\.catalog-detail-grid[^}]*min-width:\s*0/);
   assert.match(css, /\.chain-view[^}]*min-width:\s*0/);
   assert.match(css, /\.chain-flow[^}]*overflow-x:\s*auto/);

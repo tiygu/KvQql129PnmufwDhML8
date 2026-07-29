@@ -41,10 +41,62 @@ export type CatalogItemQueryPage = {
   items: any[];
   selectionInResults?: boolean;
 };
+export type MergeChainIconHarvestPreflight = {
+  preflightId: string;
+  scope: { type: "merge-chain"; mergeChainId: string };
+  catalogQueryRevision: CatalogQueryRevision;
+  expectedMemberCount: number;
+  missingIdentities: string[];
+  frozenMembers: Array<{
+    itemId: string;
+    level: number | null;
+    iconResourceIdentifier: string | null;
+    identityAvailable: boolean;
+    order: number;
+  }>;
+  contractChecks: {
+    acquisitionContractVersion: string;
+    status: "passed" | "failed";
+    checks: any[];
+  };
+  capacity: {
+    required: number;
+    available: number;
+    shared: number;
+    limit: number;
+    admissible: boolean;
+  };
+  safety: {
+    state: "safe" | "blocked";
+    reason: string | null;
+  };
+  duplicates: {
+    matchingActiveJob: { jobId: string; detailUrl: string } | null;
+    differentScopeActiveJobs: Array<{
+      jobId: string;
+      catalogQueryRevision: CatalogQueryRevision;
+      frozenMemberCount: number;
+    }>;
+    requiresExplicitNewJob: boolean;
+  };
+  expiresAt: string;
+};
+export type IconHarvestJobScope =
+  | { type: "item"; itemId: string }
+  | {
+    type: "merge-chain";
+    mergeChainId: string;
+    catalogQueryRevision: CatalogQueryRevision;
+    expectedMemberCount: number;
+    missingIdentities: string[];
+    frozenMembers: MergeChainIconHarvestPreflight["frozenMembers"];
+    acquisitionContractVersion: string;
+    scopeFingerprint: string;
+  };
 export type IconHarvestJobSnapshot = {
   jobId: string;
   revision: number;
-  scope: { type: "item"; itemId: string };
+  scope: IconHarvestJobScope;
   retryOfJobId: string | null;
   state: "queued" | "running" | "cancelling" | "succeeded" | "completed-with-gaps" | "failed" | "cancelled";
   finalStatus: "succeeded" | "completed-with-gaps" | "failed" | "cancelled" | null;
@@ -244,6 +296,31 @@ export const controlApi = {
     "/api/catalog/icon-harvest-jobs",
     { scope: { type: "item", itemId }, idempotencyKey },
   ) as Promise<IconHarvestJobSnapshot & { idempotentReplay: boolean; taskId?: number }>,
+  preflightMergeChainIconHarvest: (mergeChainId: string) => post(
+    "/api/catalog/icon-harvest-jobs/preflight",
+    { scope: { type: "merge-chain", mergeChainId } },
+  ) as Promise<MergeChainIconHarvestPreflight>,
+  createMergeChainIconHarvestJob: (input: {
+    preflightId: string;
+    mergeChainId: string;
+    idempotencyKey: string;
+    createNew?: boolean;
+  }) => post(
+    "/api/catalog/icon-harvest-jobs",
+    {
+      scope: {
+        type: "merge-chain",
+        mergeChainId: input.mergeChainId,
+      },
+      preflightId: input.preflightId,
+      confirmed: true,
+      createNew: input.createNew === true,
+      idempotencyKey: input.idempotencyKey,
+    },
+  ) as Promise<IconHarvestJobSnapshot & {
+    idempotentReplay: boolean;
+    taskIds?: number[];
+  }>,
   listIconHarvestJobs: () => request<{ jobs: IconHarvestJobSnapshot[] }>(
     "/api/catalog/icon-harvest-jobs",
   ),
