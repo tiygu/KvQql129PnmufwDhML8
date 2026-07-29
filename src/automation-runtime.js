@@ -792,16 +792,6 @@ class AutomationRuntime {
       throw error;
     }
     const itemId = String(scope.itemId);
-    const replay = this.iconHarvestJobs.findByIdempotencyKey(idempotencyKey);
-    if (replay) {
-      if (replay.scope.itemId !== itemId) {
-        const conflict = new Error("Icon Harvest Job idempotency key belongs to another scope");
-        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
-        conflict.statusCode = 409;
-        throw conflict;
-      }
-      return { ...replay, idempotentReplay: true };
-    }
     const object = this.database.getCatalogObject("item-identity", itemId);
     if (!object) {
       throw Object.assign(
@@ -813,11 +803,25 @@ class AutomationRuntime {
     if (created.idempotentReplay) {
       return { ...created.snapshot, idempotentReplay: true };
     }
+    return this._startIconHarvestJob(created.snapshot, object);
+  }
+
+  _startIconHarvestJob(jobSnapshot, catalogObject = null) {
+    const child = jobSnapshot?.children?.[0];
+    if (!child) return { ...jobSnapshot, idempotentReplay: false, taskId: null };
+    const itemId = String(child.itemId);
+    const object = catalogObject
+      || this.database.getCatalogObject("item-identity", itemId);
+    if (!object) {
+      const error = new Error(`catalog object not found: item-identity/${itemId}`);
+      error.statusCode = 404;
+      throw error;
+    }
     this.iconEvidenceRetryAt.delete(itemId);
     let task;
     try {
       task = this.iconService.request(itemId, {
-        parentTaskId: created.snapshot.jobId,
+        parentTaskId: jobSnapshot.jobId,
         allowSoftOverflow: true,
         itemIdentity: {
           itemId,
@@ -825,26 +829,55 @@ class AutomationRuntime {
         },
       });
     } catch (error) {
-      const failed = this.iconHarvestJobs.failToStart(created.snapshot.jobId, error);
+      const failed = this.iconHarvestJobs.failToStart(jobSnapshot.jobId, error);
       return {
         ...failed,
         idempotentReplay: false,
         taskId: null,
       };
     }
-    this.iconHarvestJobs.trackRunnerTask(created.snapshot.jobId, task.taskId);
-    const snapshot = this.iconHarvestJobs.syncRunnerTask(
-      created.snapshot.jobId,
+    this.iconHarvestJobs.trackRunnerTask(jobSnapshot.jobId, task.taskId);
+    const syncedSnapshot = this.iconHarvestJobs.syncRunnerTask(
+      jobSnapshot.jobId,
       this.iconService.getTask(task.taskId),
     );
-    if (snapshot?.revision === created.snapshot.revision) {
-      this.iconHarvestJobs.onUpdate?.(snapshot);
+    if (syncedSnapshot?.revision === jobSnapshot.revision) {
+      this.iconHarvestJobs.onUpdate?.(syncedSnapshot);
     }
     return {
-      ...snapshot,
+      ...syncedSnapshot,
       idempotentReplay: false,
       taskId: task.taskId,
     };
+  }
+
+  cancelIconHarvestJob({ jobId, expectedRevision, idempotencyKey } = {}) {
+    const begun = this.iconHarvestJobs.beginCancel({
+      jobId,
+      expectedRevision,
+      idempotencyKey,
+    });
+    if (begun.idempotentReplay || begun.snapshot?.state !== "cancelling") {
+      return { ...begun.snapshot, idempotentReplay: begun.idempotentReplay };
+    }
+    const runnerTaskId = this.iconHarvestJobs.untrackRunnerTask(jobId);
+    if (Number.isInteger(runnerTaskId)) {
+      this.iconService.cancelSubscription(runnerTaskId, String(jobId));
+    }
+    const cancelled = this.iconHarvestJobs.finishCancel(jobId);
+    return { ...cancelled, idempotentReplay: false };
+  }
+
+  retryIconHarvestJob({ jobId, expectedRevision, idempotencyKey } = {}) {
+    const created = this.iconHarvestJobs.createRetry({
+      jobId,
+      expectedRevision,
+      idempotencyKey,
+    });
+    if (created.idempotentReplay) {
+      return { ...created.snapshot, idempotentReplay: true };
+    }
+    return this._startIconHarvestJob(created.snapshot);
   }
 
   listIconHarvestJobs() {

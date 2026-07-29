@@ -366,8 +366,11 @@ class IconEvidenceService {
 
   request(itemId, runtime = {}) {
     const key = String(itemId);
+    const parentTaskId = String(runtime.parentTaskId || `request-${this.nextTaskId}`);
     const existingTaskId = this.inFlight.get(key);
     if (existingTaskId) {
+      const existingTask = this.tasks.get(existingTaskId);
+      existingTask?.subscribers.add(parentTaskId);
       return {
         status: "queued",
         taskId: existingTaskId,
@@ -392,13 +395,14 @@ class IconEvidenceService {
     }
 
     const id = this.nextTaskId++;
-    const parentTaskId = String(runtime.parentTaskId || `request-${id}`);
     const task = {
       id,
       itemId: key,
       parentTaskId,
+      subscribers: new Set([parentTaskId]),
       runtime: { ...runtime },
       runtimeController: new AbortController(),
+      cancelController: new AbortController(),
       status: "queued",
       phase: "runtime-queued",
       stage: "queued",
@@ -446,7 +450,55 @@ class IconEvidenceService {
       completedAt: task.completedAt,
       timings: task.timings.map((timing) => ({ ...timing })),
       result: task.result,
+      subscriberCount: task.subscribers.size,
     };
+  }
+
+  cancelSubscription(taskId, parentTaskId) {
+    const task = this.tasks.get(Number(taskId));
+    if (!task) return null;
+    task.subscribers.delete(String(parentTaskId));
+    const result = {
+      cancelled: false,
+      remainingSubscribers: task.subscribers.size,
+      taskId: task.id,
+    };
+    if (task.subscribers.size || !["queued", "running"].includes(task.status)) {
+      return result;
+    }
+
+    result.cancelled = true;
+    const reason = Object.assign(new Error("icon acquisition subscription cancelled"), {
+      name: "AbortError",
+      code: "ICON_ACQUISITION_CANCELLED",
+    });
+    if (task === this.activeRuntimeTask) {
+      task.runtimeController.abort(reason);
+      task.cancelController.abort(reason);
+      return result;
+    }
+    const runtimeQueue = this.runtimeQueues.get(task.parentTaskId);
+    const runtimeIndex = runtimeQueue?.indexOf(task) ?? -1;
+    if (runtimeIndex >= 0) {
+      runtimeQueue.splice(runtimeIndex, 1);
+      if (!runtimeQueue.length) {
+        this.runtimeQueues.delete(task.parentTaskId);
+        const parentIndex = this.runtimeParentOrder.indexOf(task.parentTaskId);
+        if (parentIndex >= 0) this.runtimeParentOrder.splice(parentIndex, 1);
+      }
+      this._settleError(task, reason);
+      this._drain();
+      return result;
+    }
+    const offlineIndex = this.offlinePending.indexOf(task);
+    if (offlineIndex >= 0) {
+      this.offlinePending.splice(offlineIndex, 1);
+      this._settleError(task, reason);
+      this._drain();
+      return result;
+    }
+    task.cancelController.abort(reason);
+    return result;
   }
 
   interruptForAutomation() {
@@ -662,14 +714,17 @@ class IconEvidenceService {
   }
 
   _settleError(task, error) {
+    const cancelled = error?.code === "ICON_ACQUISITION_CANCELLED";
     const deferred = error?.code === "ICON_ACQUISITION_DEFERRED"
       || (error?.name === "AbortError" && task.phase === "runtime");
-    task.status = deferred ? "deferred" : "error";
-    task.phase = deferred ? "deferred" : "failed";
-    task.stage = deferred ? "waiting-for-safe-boundary" : "failed";
+    task.status = cancelled ? "cancelled" : deferred ? "deferred" : "error";
+    task.phase = cancelled ? "cancelled" : deferred ? "deferred" : "failed";
+    task.stage = cancelled ? "cancelled" : deferred ? "waiting-for-safe-boundary" : "failed";
     task.error = error?.message || String(error);
     task.code = error?.code || null;
-    task.reason = deferred
+    task.reason = cancelled
+      ? "subscriber-cancelled"
+      : deferred
       ? "automation-safe-boundary"
       : error?.reason
         || (error?.code === "ICON_ACQUISITION_STAGE_TIMEOUT"
@@ -681,7 +736,11 @@ class IconEvidenceService {
       ...(error?.technicalDetails || {}),
     };
     this.onEvent?.({
-      type: deferred ? "icon-acquisition-deferred" : "icon-acquisition-error",
+      type: cancelled
+        ? "icon-acquisition-cancelled"
+        : deferred
+          ? "icon-acquisition-deferred"
+          : "icon-acquisition-error",
       itemId: task.itemId,
       taskId: task.id,
       parentTaskId: task.parentTaskId,
@@ -711,6 +770,7 @@ class IconEvidenceService {
     const signals = [
       task.runtime.signal,
       runtimeStage ? task.runtimeController.signal : null,
+      task.cancelController.signal,
       stageController.signal,
     ].filter(Boolean);
     const signal = signals.length > 1

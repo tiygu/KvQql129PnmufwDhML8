@@ -481,3 +481,75 @@ test("worker abort waits for thread termination before releasing its operation",
   await assert.rejects(operation, (error) => error === reason);
   assert.equal(settled, true);
 });
+
+test("shared in-flight acquisition stops only after its final subscriber cancels", async () => {
+  const events = [];
+  const { service, cleanup } = serviceFixture({
+    isSafeBoundary: () => false,
+    onEvent: (event) => events.push(event),
+  });
+
+  try {
+    const first = service.request("shared-item", { parentTaskId: "job-a" });
+    const second = service.request("shared-item", { parentTaskId: "job-b" });
+    assert.equal(second.taskId, first.taskId);
+    assert.equal(second.shared, true);
+    assert.equal(service.getTask(first.taskId).subscriberCount, 2);
+
+    const firstCancellation = service.cancelSubscription(first.taskId, "job-a");
+    assert.deepEqual(firstCancellation, {
+      cancelled: false,
+      remainingSubscribers: 1,
+      taskId: first.taskId,
+    });
+    assert.equal(service.getTask(first.taskId).status, "queued");
+    assert.equal(
+      events.filter((event) => event.type === "icon-acquisition-cancelled").length,
+      0,
+    );
+
+    const finalCancellation = service.cancelSubscription(first.taskId, "job-b");
+    assert.deepEqual(finalCancellation, {
+      cancelled: true,
+      remainingSubscribers: 0,
+      taskId: first.taskId,
+    });
+    assert.equal(service.getTask(first.taskId).status, "cancelled");
+    assert.equal(
+      events.filter((event) => event.type === "icon-acquisition-cancelled").length,
+      1,
+    );
+    await service.waitForIdle();
+  } finally {
+    cleanup();
+  }
+});
+
+test("the final shared subscriber aborts an active runtime acquisition", async () => {
+  let aborted = false;
+  const { service, cleanup } = serviceFixture({
+    resolveSpriteFrame: ({ signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  });
+
+  try {
+    const first = service.request("active-shared-item", { parentTaskId: "job-a" });
+    service.request("active-shared-item", { parentTaskId: "job-b" });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(service.getTask(first.taskId).status, "running");
+
+    service.cancelSubscription(first.taskId, "job-a");
+    assert.equal(service.getTask(first.taskId).status, "running");
+    service.cancelSubscription(first.taskId, "job-b");
+    await service.waitForIdle();
+
+    assert.equal(aborted, true);
+    assert.equal(service.getTask(first.taskId).status, "cancelled");
+  } finally {
+    cleanup();
+  }
+});

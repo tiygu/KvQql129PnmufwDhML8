@@ -19,7 +19,7 @@ const CATALOG_RELEASE_ENTRY_MODES = new Set(["full-snapshot", "legacy-advanced"]
 const CURRENT_CATALOG_SCHEMA_VERSION = 4;
 const CURRENT_CATALOG_REVIEW_SCHEMA_VERSION = 2;
 const CURRENT_FEATURE_SCHEMA_VERSIONS = Object.freeze({
-  "icon-harvest-jobs": 1,
+  "icon-harvest-jobs": 2,
 });
 const UNSAFE_FIELD_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
 const ITEM_IDENTITY_PRESENTATION_FIELDS = new Set([
@@ -488,11 +488,14 @@ class AutomationDatabase {
         scope_type TEXT NOT NULL,
         scope_key TEXT NOT NULL,
         idempotency_key TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL DEFAULT '',
+        retry_of_job_id TEXT,
         revision INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(retry_of_job_id) REFERENCES icon_harvest_jobs(id) ON DELETE RESTRICT
       );
       CREATE TABLE IF NOT EXISTS icon_harvest_acquisitions (
         id TEXT PRIMARY KEY,
@@ -505,11 +508,20 @@ class AutomationDatabase {
         operator_summary TEXT,
         technical_details_json TEXT,
         result_json TEXT,
+        runner_task_id INTEGER,
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
         updated_at TEXT NOT NULL,
         UNIQUE(job_id,item_id),
+        FOREIGN KEY(job_id) REFERENCES icon_harvest_jobs(id) ON DELETE RESTRICT
+      );
+      CREATE TABLE IF NOT EXISTS icon_harvest_commands (
+        idempotency_key TEXT PRIMARY KEY,
+        command_type TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
         FOREIGN KEY(job_id) REFERENCES icon_harvest_jobs(id) ON DELETE RESTRICT
       );
       CREATE TABLE IF NOT EXISTS automation_sessions (
@@ -575,6 +587,7 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_successor ON catalog_icon_candidate_lineage(successor_candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_icon_harvest_jobs_updated ON icon_harvest_jobs(updated_at,id);
       CREATE INDEX IF NOT EXISTS idx_icon_harvest_acquisitions_job ON icon_harvest_acquisitions(job_id,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_commands_job ON icon_harvest_commands(job_id,created_at);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);
@@ -600,6 +613,11 @@ class AutomationDatabase {
         WHERE prior.object_id=history.object_id AND prior.id<=history.id
       )`);
     }
+    const iconHarvestJobColumns = new Set(this.db.prepare("PRAGMA table_info(icon_harvest_jobs)").all().map((column) => column.name));
+    if (!iconHarvestJobColumns.has("request_fingerprint")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''");
+    if (!iconHarvestJobColumns.has("retry_of_job_id")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN retry_of_job_id TEXT");
+    const iconHarvestAcquisitionColumns = new Set(this.db.prepare("PRAGMA table_info(icon_harvest_acquisitions)").all().map((column) => column.name));
+    if (!iconHarvestAcquisitionColumns.has("runner_task_id")) this.db.exec("ALTER TABLE icon_harvest_acquisitions ADD COLUMN runner_task_id INTEGER");
     const objectColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_objects)").all().map((column) => column.name));
     if (!objectColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_objects ADD COLUMN disposition TEXT NOT NULL DEFAULT 'enabled'");
     const evidenceColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_evidence)").all().map((column) => column.name));
