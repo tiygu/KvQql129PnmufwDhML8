@@ -9,6 +9,20 @@ const TERMINAL_CHILD_STATES = new Set([
   "cancelled",
 ]);
 
+function requestFingerprint(value) {
+  return crypto.createHash("sha256")
+    .update(JSON.stringify(value))
+    .digest("hex");
+}
+
+function conflictError(message, code, currentJob = null) {
+  const error = new Error(message);
+  error.code = code;
+  error.statusCode = 409;
+  if (currentJob) error.currentJob = currentJob;
+  return error;
+}
+
 function parseJson(value) {
   return value == null ? null : JSON.parse(value);
 }
@@ -18,6 +32,7 @@ function parentState(childState) {
   if (childState === "deferred") return "completed-with-gaps";
   if (childState === "failed") return "failed";
   if (childState === "cancelled") return "cancelled";
+  if (childState === "cancelling") return "cancelling";
   return childState === "running" ? "running" : "queued";
 }
 
@@ -27,6 +42,7 @@ class IconHarvestJobService {
     this.database = database;
     this.onUpdate = onUpdate;
     this.jobsByRunnerTask = new Map();
+    this.runnerTaskByJob = new Map();
     this.recoverUnfinished();
   }
 
@@ -34,7 +50,7 @@ class IconHarvestJobService {
     const rows = this.database.db.prepare(`
       SELECT job_id
       FROM icon_harvest_acquisitions
-      WHERE state IN ('queued','running')
+      WHERE state IN ('queued','running','cancelling')
       ORDER BY created_at,id
     `).all();
     for (const row of rows) {
@@ -51,7 +67,13 @@ class IconHarvestJobService {
     return rows.length;
   }
 
-  createSingleItem({ itemId, idempotencyKey }) {
+  createSingleItem({
+    itemId,
+    idempotencyKey,
+    retryOfJobId = null,
+    fingerprint = null,
+    withinTransaction = false,
+  }) {
     const normalizedItemId = String(itemId || "").trim();
     const normalizedKey = String(idempotencyKey || "").trim();
     if (!normalizedItemId) throw new TypeError("Icon Harvest Job itemId is required");
@@ -61,15 +83,31 @@ class IconHarvestJobService {
       error.statusCode = 400;
       throw error;
     }
+    const expectedFingerprint = fingerprint || requestFingerprint({
+      command: "create",
+      scope: { type: "item", itemId: normalizedItemId },
+    });
+    const commandUsingKey = this.database.db.prepare(
+      "SELECT job_id FROM icon_harvest_commands WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (commandUsingKey) {
+      throw conflictError(
+        "Icon Harvest Job idempotency key belongs to a different request",
+        "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+        this.get(commandUsingKey.job_id),
+      );
+    }
     const existing = this.database.db.prepare(
-      "SELECT id,scope_key FROM icon_harvest_jobs WHERE idempotency_key=?",
+      "SELECT id,scope_key,request_fingerprint FROM icon_harvest_jobs WHERE idempotency_key=?",
     ).get(normalizedKey);
     if (existing) {
-      if (existing.scope_key !== normalizedItemId) {
-        const conflict = new Error("Icon Harvest Job idempotency key belongs to another scope");
-        conflict.code = "ICON_HARVEST_IDEMPOTENCY_CONFLICT";
-        conflict.statusCode = 409;
-        throw conflict;
+      if (existing.scope_key !== normalizedItemId
+        || (existing.request_fingerprint && existing.request_fingerprint !== expectedFingerprint)) {
+        throw conflictError(
+          "Icon Harvest Job idempotency key belongs to a different request",
+          "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+          this.get(existing.id),
+        );
       }
       return { snapshot: this.get(existing.id), idempotentReplay: true };
     }
@@ -77,14 +115,17 @@ class IconHarvestJobService {
     const now = new Date().toISOString();
     const jobId = `job_${crypto.randomUUID()}`;
     const acquisitionId = `acq_${crypto.randomUUID()}`;
-    this.database.transaction(() => {
+    const insert = () => {
       this.database.db.prepare(`INSERT INTO icon_harvest_jobs(
-        id,scope_type,scope_key,idempotency_key,revision,created_at,updated_at
-      ) VALUES(?,?,?,?,1,?,?)`).run(
+        id,scope_type,scope_key,idempotency_key,request_fingerprint,retry_of_job_id,
+        revision,created_at,updated_at
+      ) VALUES(?,?,?,?,?,?,1,?,?)`).run(
         jobId,
         "item",
         normalizedItemId,
         normalizedKey,
+        expectedFingerprint,
+        retryOfJobId == null ? null : String(retryOfJobId),
         now,
         now,
       );
@@ -97,7 +138,9 @@ class IconHarvestJobService {
         now,
         now,
       );
-    });
+    };
+    if (withinTransaction) insert();
+    else this.database.transaction(insert);
     return { snapshot: this.get(jobId), idempotentReplay: false };
   }
 
@@ -117,6 +160,32 @@ class IconHarvestJobService {
       this.jobsByRunnerTask.set(numericTaskId, new Set());
     }
     this.jobsByRunnerTask.get(numericTaskId).add(String(jobId));
+    this.runnerTaskByJob.set(String(jobId), numericTaskId);
+    this.database.db.prepare(
+      "UPDATE icon_harvest_acquisitions SET runner_task_id=? WHERE job_id=?",
+    ).run(numericTaskId, String(jobId));
+  }
+
+  runnerTaskForJob(jobId) {
+    const normalizedJobId = String(jobId);
+    const inMemory = this.runnerTaskByJob.get(normalizedJobId);
+    if (Number.isInteger(inMemory)) return inMemory;
+    const row = this.database.db.prepare(
+      "SELECT runner_task_id FROM icon_harvest_acquisitions WHERE job_id=?",
+    ).get(normalizedJobId);
+    return Number.isInteger(row?.runner_task_id) ? row.runner_task_id : null;
+  }
+
+  untrackRunnerTask(jobId) {
+    const normalizedJobId = String(jobId);
+    const runnerTaskId = this.runnerTaskForJob(normalizedJobId);
+    this.runnerTaskByJob.delete(normalizedJobId);
+    if (Number.isInteger(runnerTaskId)) {
+      const jobIds = this.jobsByRunnerTask.get(runnerTaskId);
+      jobIds?.delete(normalizedJobId);
+      if (!jobIds?.size) this.jobsByRunnerTask.delete(runnerTaskId);
+    }
+    return runnerTaskId;
   }
 
   syncRunnerTask(jobId, task) {
@@ -224,6 +293,17 @@ class IconHarvestJobService {
           operatorSummary: event.operatorSummary || "图标证据提交失败。",
           technicalDetails: event.technicalDetails || { message: event.error || null },
         }));
+        continue;
+      }
+      if (event.type === "icon-acquisition-cancelled") {
+        snapshots.push(this._transition(jobId, {
+          state: "cancelled",
+          stage: "cancelled",
+          reason: event.reason || "subscriber-cancelled",
+          retryable: true,
+          operatorSummary: "图标采集订阅已取消。",
+          technicalDetails: event.technicalDetails || null,
+        }));
       }
     }
     if (snapshots.some((snapshot) => TERMINAL_CHILD_STATES.has(snapshot?.children?.[0]?.state))) {
@@ -260,6 +340,7 @@ class IconHarvestJobService {
       operatorSummary: row.operator_summary || null,
       technicalDetails: parseJson(row.technical_details_json),
       result: parseJson(row.result_json),
+      runnerTaskId: Number.isInteger(row.runner_task_id) ? row.runner_task_id : null,
       createdAt: row.created_at,
       startedAt: row.started_at || null,
       completedAt: row.completed_at || null,
@@ -278,6 +359,7 @@ class IconHarvestJobService {
       jobId: job.id,
       revision: Number(job.revision),
       scope: { type: job.scope_type, itemId: job.scope_key },
+      retryOfJobId: job.retry_of_job_id || null,
       state,
       finalStatus: TERMINAL_CHILD_STATES.has(child?.state) ? state : null,
       stage: child?.stage || "queued",
@@ -305,6 +387,188 @@ class IconHarvestJobService {
     const snapshot = this.get(jobId);
     if (snapshot) this.onUpdate?.(snapshot);
     return snapshot;
+  }
+
+  beginCancel({ jobId, expectedRevision, idempotencyKey }) {
+    const normalizedJobId = String(jobId || "");
+    const normalizedKey = String(idempotencyKey || "").trim();
+    const revision = Number(expectedRevision);
+    if (!normalizedJobId || !normalizedKey || !Number.isInteger(revision)) {
+      const error = new TypeError("Icon Harvest Job cancellation requires jobId, expectedRevision, and idempotencyKey");
+      error.code = "ICON_HARVEST_CANCEL_INVALID";
+      error.statusCode = 400;
+      throw error;
+    }
+    const fingerprint = requestFingerprint({
+      command: "cancel",
+      jobId: normalizedJobId,
+      expectedRevision: revision,
+    });
+    const existingCommand = this.database.db.prepare(
+      "SELECT * FROM icon_harvest_commands WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (existingCommand) {
+      if (existingCommand.command_type !== "cancel"
+        || existingCommand.request_fingerprint !== fingerprint) {
+        throw conflictError(
+          "Icon Harvest Job idempotency key belongs to a different request",
+          "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+          this.get(existingCommand.job_id),
+        );
+      }
+      return { snapshot: this.get(existingCommand.job_id), idempotentReplay: true };
+    }
+    const jobUsingKey = this.database.db.prepare(
+      "SELECT id FROM icon_harvest_jobs WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (jobUsingKey) {
+      throw conflictError(
+        "Icon Harvest Job idempotency key belongs to a different request",
+        "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+        this.get(jobUsingKey.id),
+      );
+    }
+
+    const before = this.get(normalizedJobId);
+    if (!before) {
+      const error = new Error("Icon Harvest Job not found");
+      error.code = "ICON_HARVEST_NOT_FOUND";
+      error.statusCode = 404;
+      throw error;
+    }
+    if (before.revision !== revision) {
+      throw conflictError(
+        "Icon Harvest Job revision changed",
+        "ICON_HARVEST_REVISION_CONFLICT",
+        before,
+      );
+    }
+
+    const now = new Date().toISOString();
+    const changed = this.database.transaction(() => {
+      this.database.db.prepare(`INSERT INTO icon_harvest_commands(
+        idempotency_key,command_type,request_fingerprint,job_id,created_at
+      ) VALUES(?,?,?,?,?)`).run(
+        normalizedKey,
+        "cancel",
+        fingerprint,
+        normalizedJobId,
+        now,
+      );
+      const result = this.database.db.prepare(`UPDATE icon_harvest_acquisitions SET
+        state='cancelling',stage='cancelling',reason_code='operator-cancelled',
+        retryable=1,operator_summary='正在取消图标采集任务。',
+        updated_at=?
+        WHERE job_id=? AND state NOT IN ('succeeded','deferred','failed','cancelled')`).run(
+        now,
+        normalizedJobId,
+      );
+      if (!result.changes) return false;
+      this.database.db.prepare(`UPDATE icon_harvest_jobs SET
+        revision=revision+1,updated_at=?
+        WHERE id=?`).run(now, normalizedJobId);
+      return true;
+    });
+    const snapshot = changed ? this.publish(normalizedJobId) : this.get(normalizedJobId);
+    return { snapshot, idempotentReplay: false };
+  }
+
+  finishCancel(jobId) {
+    return this._transition(String(jobId), {
+      state: "cancelled",
+      stage: "cancelled",
+      reason: "operator-cancelled",
+      retryable: true,
+      operatorSummary: "图标采集任务已取消；已提交证据继续保留。",
+      technicalDetails: { reason: "operator-cancelled" },
+    });
+  }
+
+  createRetry({ jobId, expectedRevision, idempotencyKey }) {
+    const normalizedJobId = String(jobId || "");
+    const normalizedKey = String(idempotencyKey || "").trim();
+    const revision = Number(expectedRevision);
+    const fingerprint = requestFingerprint({
+      command: "retry",
+      jobId: normalizedJobId,
+      expectedRevision: revision,
+      unresolved: "default",
+    });
+    const commandUsingKey = this.database.db.prepare(
+      "SELECT job_id FROM icon_harvest_commands WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (commandUsingKey) {
+      throw conflictError(
+        "Icon Harvest Job idempotency key belongs to a different request",
+        "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+        this.get(commandUsingKey.job_id),
+      );
+    }
+    const existing = this.database.db.prepare(
+      "SELECT id,request_fingerprint FROM icon_harvest_jobs WHERE idempotency_key=?",
+    ).get(normalizedKey);
+    if (existing) {
+      if (existing.request_fingerprint !== fingerprint) {
+        throw conflictError(
+          "Icon Harvest Job idempotency key belongs to a different request",
+          "ICON_HARVEST_IDEMPOTENCY_CONFLICT",
+          this.get(existing.id),
+        );
+      }
+      return { snapshot: this.get(existing.id), idempotentReplay: true };
+    }
+    const source = this.get(normalizedJobId);
+    if (!source) {
+      const error = new Error("Icon Harvest Job not found");
+      error.code = "ICON_HARVEST_NOT_FOUND";
+      error.statusCode = 404;
+      throw error;
+    }
+    if (!Number.isInteger(revision) || source.revision !== revision) {
+      throw conflictError(
+        "Icon Harvest Job revision changed",
+        "ICON_HARVEST_REVISION_CONFLICT",
+        source,
+      );
+    }
+    const unresolved = source.children.filter((child) => child.state !== "succeeded");
+    if (!source.finalStatus || !unresolved.length) {
+      throw conflictError(
+        "Icon Harvest Job has no settled unresolved work to retry",
+        "ICON_HARVEST_RETRY_NOT_AVAILABLE",
+        source,
+      );
+    }
+    if (unresolved.length !== 1) {
+      throw conflictError(
+        "single-item Icon Harvest Job retry requires exactly one unresolved acquisition",
+        "ICON_HARVEST_RETRY_SCOPE_UNSUPPORTED",
+        source,
+      );
+    }
+    const now = new Date().toISOString();
+    let created;
+    this.database.transaction(() => {
+      created = this.createSingleItem({
+        itemId: unresolved[0].itemId,
+        idempotencyKey: normalizedKey,
+        retryOfJobId: source.jobId,
+        fingerprint,
+        withinTransaction: true,
+      });
+      const claimed = this.database.db.prepare(
+        "UPDATE icon_harvest_jobs SET revision=revision+1,updated_at=? WHERE id=? AND revision=?",
+      ).run(now, source.jobId, revision);
+      if (claimed.changes !== 1) {
+        throw conflictError(
+          "Icon Harvest Job revision changed",
+          "ICON_HARVEST_REVISION_CONFLICT",
+          this.get(source.jobId),
+        );
+      }
+    });
+    this.publish(source.jobId);
+    return created;
   }
 
   _transition(jobId, {
@@ -365,6 +629,7 @@ class IconHarvestJobService {
         jobIds.delete(String(jobId));
         if (!jobIds.size) this.jobsByRunnerTask.delete(runnerTaskId);
       }
+      this.runnerTaskByJob.delete(String(jobId));
     }
     return snapshot;
   }

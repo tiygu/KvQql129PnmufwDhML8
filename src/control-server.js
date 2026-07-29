@@ -279,6 +279,31 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (route === "GET /api/catalog/icon-harvest-jobs" || route === "GET /api/catalog/icon/jobs") {
         return writeJson(res, 200, { jobs: runtime.listIconHarvestJobs() });
       }
+      const iconHarvestJobActionMatch = /^\/api\/catalog\/icon(?:-harvest-jobs|\/jobs)\/([^/]+)\/(cancel|retry)$/.exec(
+        requestUrl.pathname,
+      );
+      if ((req.method || "GET") === "POST" && iconHarvestJobActionMatch) {
+        const body = await readJson(req);
+        if (!Number.isInteger(Number(body.expectedRevision)) || !body.idempotencyKey) {
+          return writeJson(res, 400, {
+            ok: false,
+            error: "invalid-icon-harvest-job-command",
+          });
+        }
+        const input = {
+          jobId: decodeURIComponent(iconHarvestJobActionMatch[1]),
+          expectedRevision: Number(body.expectedRevision),
+          idempotencyKey: String(body.idempotencyKey),
+        };
+        const job = iconHarvestJobActionMatch[2] === "cancel"
+          ? runtime.cancelIconHarvestJob(input)
+          : runtime.retryIconHarvestJob(input);
+        const statusCode = iconHarvestJobActionMatch[2] === "retry"
+          && !job.idempotentReplay
+          ? 202
+          : 200;
+        return writeJson(res, statusCode, job);
+      }
       const iconHarvestJobMatch = /^\/api\/catalog\/icon(?:-harvest-jobs|\/jobs)\/([^/]+)$/.exec(
         requestUrl.pathname,
       );
@@ -484,6 +509,7 @@ function createControlServer({ runtime, publicRoot, dataDir } = {}) {
       if (error?.fieldPath) payload.fieldPath = error.fieldPath;
       if (error?.currentObject) payload.currentObject = error.currentObject;
       if (error?.currentDisplayIcon) payload.currentDisplayIcon = error.currentDisplayIcon;
+      if (error?.currentJob) payload.currentJob = error.currentJob;
       if (error?.meaningfulDifferences) payload.meaningfulDifferences = error.meaningfulDifferences;
       if (error?.catalogQueryRevision) payload.catalogQueryRevision = error.catalogQueryRevision;
       if (error?.itemId) payload.itemId = error.itemId;

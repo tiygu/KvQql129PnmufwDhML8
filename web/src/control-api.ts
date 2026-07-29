@@ -45,7 +45,8 @@ export type IconHarvestJobSnapshot = {
   jobId: string;
   revision: number;
   scope: { type: "item"; itemId: string };
-  state: "queued" | "running" | "succeeded" | "completed-with-gaps" | "failed" | "cancelled";
+  retryOfJobId: string | null;
+  state: "queued" | "running" | "cancelling" | "succeeded" | "completed-with-gaps" | "failed" | "cancelled";
   finalStatus: "succeeded" | "completed-with-gaps" | "failed" | "cancelled" | null;
   stage: string;
   reason: string | null;
@@ -89,13 +90,78 @@ function onEvent(listener: ControlEventListener) {
   let stopped = false;
   let socket: WebSocket | null = null;
   let reconnectTimer: number | null = null;
+  let recoveringAll: Promise<void> | null = null;
+  const jobRevisions = new Map<string, number>();
+
+  const applyJobSnapshot = (
+    job: IconHarvestJobSnapshot,
+    recovery: "rest-gap" | "rest-reconnect" | null = null,
+  ) => {
+    if (stopped) return;
+    const revision = Number(job?.revision) || 0;
+    const knownRevision = jobRevisions.get(job.jobId) || 0;
+    if (revision <= knownRevision) return;
+    jobRevisions.set(job.jobId, revision);
+    listener({
+      type: "icon-harvest-job-updated",
+      job,
+      ...(recovery ? { recovery } : {}),
+    });
+  };
+
+  const recoverAllJobs = () => {
+    if (recoveringAll) return recoveringAll;
+    recoveringAll = request<{ jobs: IconHarvestJobSnapshot[] }>(
+      "/api/catalog/icon-harvest-jobs",
+    ).then(async (result) => {
+      for (const job of result.jobs || []) {
+        if (stopped) break;
+        applyJobSnapshot(job, "rest-reconnect");
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      }
+    }).finally(() => {
+      recoveringAll = null;
+    });
+    return recoveringAll;
+  };
+
+  const dispatch = (event: ControlEvent) => {
+    if (event.type === "control-connected") {
+      listener(event);
+      recoverAllJobs().catch(() => null);
+      return;
+    }
+    if (event.type !== "icon-harvest-job-updated" || !event.job?.jobId) {
+      listener(event);
+      return;
+    }
+    const job = event.job as IconHarvestJobSnapshot;
+    const knownRevision = jobRevisions.get(job.jobId) || 0;
+    if (knownRevision && job.revision > knownRevision + 1) {
+      request<IconHarvestJobSnapshot>(
+        `/api/catalog/icon-harvest-jobs/${encodeURIComponent(job.jobId)}`,
+      ).then((snapshot) => {
+        if (Number(snapshot.revision) >= Number(job.revision)) {
+          applyJobSnapshot(snapshot, "rest-gap");
+        } else {
+          applyJobSnapshot(job);
+        }
+      }).catch(() => applyJobSnapshot(job));
+      return;
+    }
+    applyJobSnapshot(job);
+  };
 
   const connect = () => {
     if (stopped) return;
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     socket = new WebSocket(`${protocol}//${location.host}/ws`);
+    socket.onopen = () => dispatch({
+      type: "control-connected",
+      transport: "websocket",
+    });
     socket.onmessage = (message) => {
-      try { listener(JSON.parse(String(message.data))); } catch (_) {}
+      try { dispatch(JSON.parse(String(message.data))); } catch (_) {}
     };
     socket.onclose = () => {
       if (!stopped) reconnectTimer = window.setTimeout(connect, 1500);
@@ -184,6 +250,22 @@ export const controlApi = {
   getIconHarvestJob: (jobId: string) => request<IconHarvestJobSnapshot>(
     `/api/catalog/icon-harvest-jobs/${encodeURIComponent(jobId)}`,
   ),
+  cancelIconHarvestJob: (
+    jobId: string,
+    expectedRevision: number,
+    idempotencyKey: string,
+  ) => post(
+    `/api/catalog/icon-harvest-jobs/${encodeURIComponent(jobId)}/cancel`,
+    { expectedRevision, idempotencyKey },
+  ) as Promise<IconHarvestJobSnapshot & { idempotentReplay: boolean }>,
+  retryIconHarvestJob: (
+    jobId: string,
+    expectedRevision: number,
+    idempotencyKey: string,
+  ) => post(
+    `/api/catalog/icon-harvest-jobs/${encodeURIComponent(jobId)}/retry`,
+    { expectedRevision, idempotencyKey },
+  ) as Promise<IconHarvestJobSnapshot & { idempotentReplay: boolean; taskId?: number }>,
   selectCatalogIcon: (input: any) => post("/api/catalog/icon/select", input),
   revokeCatalogIcon: (input: any) => post("/api/catalog/icon/revoke", input),
   returnCatalogIconToAutomatic: (input: any) => post("/api/catalog/icon/automatic", input),
