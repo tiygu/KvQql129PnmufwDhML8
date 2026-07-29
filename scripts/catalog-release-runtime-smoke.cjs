@@ -19,6 +19,10 @@ async function main() {
   const evidencePath = path.resolve(
     argument("--evidence", ".release-inputs/catalog-runtime-smoke.json"),
   );
+  const rollbackObservationsPath = argument("--rollback-observations");
+  const rollbackObservations = rollbackObservationsPath
+    ? JSON.parse(fs.readFileSync(path.resolve(rollbackObservationsPath), "utf8"))
+    : {};
   const evidence = await collectRuntimeSmokeEvidence({
     baseUrl: argument("--base-url", "http://127.0.0.1:3210"),
     mergeChainId: argument("--merge-chain-id"),
@@ -27,12 +31,12 @@ async function main() {
       `release-${Date.now()}`,
     ),
     minimumMembers: Number(argument("--minimum-members", "20")),
-    minimumSucceeded: Number(argument("--minimum-succeeded", "1")),
-    maximumDeferred: Number(
-      argument("--maximum-deferred", String(Number.MAX_SAFE_INTEGER)),
-    ),
+    minimumSucceeded: Number(argument("--minimum-succeeded", "15")),
+    maximumDeferred: Number(argument("--maximum-deferred", "5")),
     maximumFailed: Number(argument("--maximum-failed", "0")),
+    maximumCancelled: Number(argument("--maximum-cancelled", "0")),
     timeoutMs: Number(argument("--timeout-ms", String(10 * 60 * 1000))),
+    rollbackObservations,
   });
   fs.mkdirSync(path.dirname(evidencePath), { recursive: true });
   fs.writeFileSync(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);

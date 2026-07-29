@@ -40,6 +40,14 @@ function migrationEvidence() {
         },
         auditInvariant: true,
         oldEntryReadWrite: true,
+        legacySchemaObserved: true,
+        boundaryChecks: name === "boundary" ? {
+          staleAutomaticCleared: true,
+          manualSelectionProtected: true,
+          missingAssetRetained: true,
+          duplicateEvidenceCounted: true,
+          unfinishedJobRetained: true,
+        } : null,
       })),
       restore: {
         readable: true,
@@ -65,6 +73,7 @@ function runtimeEvidence() {
     itemId: `runtime-member-${index + 1}`,
     state: index < 16 ? "succeeded" : index < 19 ? "deferred" : "failed",
     reason: index < 16 ? null : index < 19 ? "resource-unloaded" : "quality-rejected",
+    result: index < 16 ? { candidateId: `candidate-runtime-member-${index + 1}` } : null,
   }));
   return {
     baseUrl: "http://127.0.0.1:3210",
@@ -74,6 +83,8 @@ function runtimeEvidence() {
     mergeChainJob: {
       passed: true,
       jobId: "job-chain",
+      state: "completed-with-gaps",
+      finalStatus: "completed-with-gaps",
       gameActionsGenerated: 0,
       children,
     },
@@ -82,10 +93,29 @@ function runtimeEvidence() {
       minimumSucceeded: 15,
       maximumDeferred: 4,
       maximumFailed: 1,
+      maximumCancelled: 0,
     },
     evidenceRecords: children
       .filter((child) => child.state === "succeeded")
-      .map((child) => ({ itemId: child.itemId, candidateId: `candidate-${child.itemId}` })),
+      .map((child) => ({
+        itemId: child.itemId,
+        candidateId: `candidate-${child.itemId}`,
+        persisted: true,
+        detail: {
+          displayIcon: {
+            candidates: {
+              currentDisplay: [],
+              eligible: [{
+                candidateId: `candidate-${child.itemId}`,
+                sourceType: "runtime-cache",
+                asset: { available: true },
+                technical: { provenance: { producer: "runtime-cache" } },
+              }],
+              historical: [],
+            },
+          },
+        },
+      })),
     taskRecords: children.map((child) => ({
       itemId: child.itemId,
       state: child.state,
@@ -97,6 +127,28 @@ function runtimeEvidence() {
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function requiredStages() {
+  const commands = (ids) => ids.map((id) => ({ id, command: id }));
+  return {
+    "compatible-migration": commands([
+      "migration-rehearsal",
+      "migration-contract",
+    ]),
+    "read-only-catalog": commands([
+      "api-contract",
+      "catalog-performance",
+      "browser-e2e",
+    ]),
+    "icon-write": commands([
+      "job-contract",
+      "repository-check",
+      "web-build",
+      "package-files",
+      "real-runtime-smoke",
+    ]),
+  };
 }
 
 test("release evidence validators enforce database, performance, and real-runtime gates", () => {
@@ -211,9 +263,21 @@ test("real-runtime collector preserves 20 member task and evidence records", asy
         children,
       };
     } else if (url.pathname.startsWith("/api/catalog/items/")) {
+      const itemId = decodeURIComponent(url.pathname.split("/").at(-1));
       payload = {
-        summary: { itemId: decodeURIComponent(url.pathname.split("/").at(-1)) },
-        iconEvidence: { currentDisplay: null, eligibleCandidates: [] },
+        summary: { itemId },
+        displayIcon: {
+          candidates: {
+            currentDisplay: [],
+            eligible: [{
+              candidateId: `candidate-${itemId}`,
+              sourceType: "runtime-cache",
+              asset: { available: true },
+              technical: { provenance: { producer: "runtime-cache" } },
+            }],
+            historical: [],
+          },
+        },
       };
     } else {
       throw new Error(`unexpected request: ${url.pathname}`);
@@ -236,6 +300,7 @@ test("real-runtime collector preserves 20 member task and evidence records", asy
   assert.equal(evidence.mergeChainJob.children.length, 20);
   assert.equal(evidence.taskRecords.length, 20);
   assert.equal(evidence.evidenceRecords.length, 20);
+  assert.equal(evidence.evidenceRecords.every((record) => record.persisted), true);
   assert.equal(evidence.mergeChainJob.gameActionsGenerated, 0);
   assert.deepEqual(validateRuntimeSmokeEvidence(evidence), []);
   assert.equal(
@@ -294,25 +359,22 @@ test("release gates are sequential and emit a reviewable evidence bundle", async
       runtimeSmoke: runtimePath,
       screenshots: [screenshotPath],
     },
-    stages: {
-      "compatible-migration": [{ id: "migration", command: "migration-check" }],
-      "read-only-catalog": [
-        { id: "contract", command: "contract-check" },
-        { id: "browser", command: "browser-check" },
-      ],
-      "icon-write": [
-        { id: "repository", command: "npm-check" },
-        { id: "web-build", command: "web-build" },
-        { id: "runtime", command: "runtime-smoke" },
-      ],
+    entryModeGuard: {
+      id: "guard-legacy-entry",
+      command: "guard-legacy-entry",
+    },
+    stages: requiredStages(),
+    activation: {
+      id: "activate-full-snapshot",
+      command: "activate-entry",
     },
     packaging: {
       requiredFiles: ["wmpf/frida/agent.js"],
     },
     rollback: {
-      switchEntryModeCommand: "catalog release-control legacy-advanced",
-      switchServiceVersionCommand: "deploy previous-service-version",
-      restoreBackupCommand: "stop service && restore BACKUP_PATH",
+      switchEntryMode: { id: "rollback-entry", command: "switch-entry" },
+      switchServiceVersion: { id: "rollback-service", command: "switch-version" },
+      restoreBackup: { id: "restore-backup", command: "restore-backup" },
     },
   };
 
@@ -334,12 +396,18 @@ test("release gates are sequential and emit a reviewable evidence bundle", async
     });
 
     assert.deepEqual(executed, [
-      "migration-check",
-      "contract-check",
-      "browser-check",
-      "npm-check",
+      "guard-legacy-entry",
+      "migration-rehearsal",
+      "migration-contract",
+      "api-contract",
+      "catalog-performance",
+      "browser-e2e",
+      "job-contract",
+      "repository-check",
       "web-build",
-      "runtime-smoke",
+      "package-files",
+      "real-runtime-smoke",
+      "activate-entry",
     ]);
     assert.equal(manifest.status, "passed");
     assert.equal(manifest.activeEntryMode, "full-snapshot");
@@ -354,7 +422,10 @@ test("release gates are sequential and emit a reviewable evidence bundle", async
     assert.equal(fs.existsSync(path.join(evidenceDir, "manifest.json")), true);
     assert.equal(fs.existsSync(path.join(evidenceDir, "SUMMARY.md")), true);
     assert.equal(fs.existsSync(`${evidenceDir}.zip`), true);
-    assert.equal(fs.existsSync(path.join(evidenceDir, "commands", "runtime.log")), true);
+    assert.equal(
+      fs.existsSync(path.join(evidenceDir, "commands", "real-runtime-smoke.log")),
+      true,
+    );
     assert.equal(fs.existsSync(path.join(evidenceDir, "artifacts", "catalog.png")), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -376,22 +447,19 @@ test("a failed gate blocks later stages and records rollback-ready state", async
         decisionOwner: "release-owner",
         knownLimitations: [],
         artifacts: { migration: migrationPath },
-        stages: {
-          "compatible-migration": [{ id: "migration", command: "migration-check" }],
-          "read-only-catalog": [{ id: "contract", command: "contract-check" }],
-          "icon-write": [{ id: "runtime", command: "runtime-smoke" }],
-        },
+        entryModeGuard: { id: "guard-legacy-entry", command: "guard-legacy-entry" },
+        stages: requiredStages(),
         packaging: { requiredFiles: [] },
         rollback: {
-          switchEntryModeCommand: "switch-entry",
-          switchServiceVersionCommand: "switch-version",
-          restoreBackupCommand: "restore-backup",
+          switchEntryMode: { id: "rollback-entry", command: "switch-entry" },
+          switchServiceVersion: { id: "rollback-service", command: "switch-version" },
+          restoreBackup: { id: "restore-backup", command: "restore-backup" },
         },
       },
       commandRunner: async (command) => {
         executed.push(command.id);
         return {
-          exitCode: command.id === "migration" ? 1 : 0,
+          exitCode: command.id === "migration-rehearsal" ? 1 : 0,
           stdout: "",
           stderr: "migration failed",
           durationMs: 5,
@@ -399,13 +467,237 @@ test("a failed gate blocks later stages and records rollback-ready state", async
       },
     });
 
-    assert.deepEqual(executed, ["migration"]);
+    assert.deepEqual(executed, ["guard-legacy-entry", "migration-rehearsal"]);
     assert.equal(manifest.status, "blocked");
     assert.equal(manifest.activeEntryMode, "legacy-advanced");
     assert.deepEqual(
       manifest.gates.map((gate) => gate.status),
       ["failed", "skipped", "skipped"],
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime evidence rejects failed jobs, unbounded deferral, and missing persisted candidates", () => {
+  const failed = runtimeEvidence();
+  failed.mergeChainJob.state = "failed";
+  failed.mergeChainJob.finalStatus = "failed";
+  assert.match(validateRuntimeSmokeEvidence(failed).join("\n"), /successful terminal state/);
+
+  const unbounded = runtimeEvidence();
+  delete unbounded.outcomeThresholds.maximumDeferred;
+  assert.match(validateRuntimeSmokeEvidence(unbounded).join("\n"), /maximum deferred threshold/);
+
+  const missing = runtimeEvidence();
+  missing.evidenceRecords[0].persisted = false;
+  assert.match(validateRuntimeSmokeEvidence(missing).join("\n"), /persisted candidate/);
+
+  const cancelled = runtimeEvidence();
+  cancelled.mergeChainJob.children[15].state = "cancelled";
+  assert.match(validateRuntimeSmokeEvidence(cancelled).join("\n"), /cancelled count/);
+});
+
+test("fatal runtime evidence executes rollback commands and does not activate", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-release-rollback-"));
+  const inputs = path.join(root, "inputs");
+  const migrationPath = path.join(inputs, "migration.json");
+  const performancePath = path.join(inputs, "performance.json");
+  const runtimePath = path.join(inputs, "runtime.json");
+  const screenshotPath = path.join(inputs, "catalog.png");
+  const runtime = runtimeEvidence();
+  runtime.rollbackObservations = { identityLoss: true };
+  writeJson(migrationPath, migrationEvidence());
+  writeJson(performancePath, performanceEvidence());
+  writeJson(runtimePath, runtime);
+  fs.writeFileSync(screenshotPath, "png");
+  const executed = [];
+  try {
+    const manifest = await runReleaseGates({
+      workspace: root,
+      evidenceDir: path.join(root, "bundle"),
+      config: {
+        releaseId: "rollback-release",
+        decisionOwner: "release-owner",
+        artifacts: {
+          migration: migrationPath,
+          performance: performancePath,
+          runtimeSmoke: runtimePath,
+          screenshots: [screenshotPath],
+        },
+        entryModeGuard: { id: "guard-legacy-entry", command: "guard-legacy-entry" },
+        stages: requiredStages(),
+        activation: { id: "activate", command: "activate" },
+        packaging: { requiredFiles: [] },
+        rollback: {
+          switchEntryMode: { id: "rollback-entry", command: "switch-entry" },
+          switchServiceVersion: { id: "rollback-service", command: "switch-version" },
+          restoreBackup: { id: "restore", command: "restore" },
+        },
+      },
+      commandRunner: async (command) => {
+        executed.push(command.command);
+        return {
+          exitCode: command.id === "real-runtime-smoke" ? 1 : 0,
+          stdout: "",
+          stderr: command.id === "real-runtime-smoke"
+            ? "runtime validator blocked"
+            : "",
+          durationMs: 1,
+        };
+      },
+    });
+    assert.deepEqual(executed, [
+      "guard-legacy-entry",
+      "migration-rehearsal",
+      "migration-contract",
+      "api-contract",
+      "catalog-performance",
+      "browser-e2e",
+      "job-contract",
+      "repository-check",
+      "web-build",
+      "package-files",
+      "real-runtime-smoke",
+      "switch-entry",
+      "switch-version",
+    ]);
+    assert.equal(manifest.status, "blocked");
+    assert.equal(manifest.activeEntryMode, "legacy-advanced");
+    assert.deepEqual(
+      manifest.rollback.execution.map((entry) => entry.id),
+      ["rollback-entry", "rollback-service"],
+    );
+    assert.equal(fs.existsSync(path.join(root, "bundle", "commands", "rollback-entry.log")), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed gate evidence still emits a blocked review bundle", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-release-malformed-"));
+  const migrationPath = path.join(root, "migration.json");
+  fs.writeFileSync(migrationPath, "{\"fixtures\":");
+  try {
+    const manifest = await runReleaseGates({
+      workspace: root,
+      evidenceDir: path.join(root, "bundle"),
+      config: {
+        releaseId: "malformed-release",
+        decisionOwner: "release-owner",
+        artifacts: { migration: migrationPath },
+        entryModeGuard: { id: "guard-legacy-entry", command: "guard-legacy-entry" },
+        stages: requiredStages(),
+        packaging: { requiredFiles: [] },
+        rollback: {
+          switchEntryMode: { id: "rollback-entry", command: "switch-entry" },
+          switchServiceVersion: { id: "rollback-service", command: "switch-version" },
+          restoreBackup: { id: "restore", command: "restore" },
+        },
+      },
+      commandRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+      }),
+    });
+    assert.equal(manifest.status, "blocked");
+    assert.match(manifest.gates[0].failures.join("\n"), /invalid JSON/);
+    assert.equal(fs.existsSync(path.join(root, "bundle", "manifest.json")), true);
+    assert.equal(fs.existsSync(`${path.join(root, "bundle")}.zip`), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("release configuration requires ownership, a verified legacy guard, and mandatory commands", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-release-config-"));
+  const migrationPath = path.join(root, "migration.json");
+  writeJson(migrationPath, migrationEvidence());
+  try {
+    const missingOwner = await runReleaseGates({
+      workspace: root,
+      evidenceDir: path.join(root, "ownerless"),
+      config: {
+        releaseId: "ownerless-release",
+        decisionOwner: "",
+        entryModeGuard: { id: "guard", command: "guard" },
+        stages: requiredStages(),
+        artifacts: { migration: migrationPath },
+      },
+      commandRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+      }),
+    });
+    assert.equal(missingOwner.status, "blocked");
+    assert.equal(missingOwner.activeEntryMode, "unknown");
+    assert.match(missingOwner.configurationFailures.join("\n"), /decisionOwner/);
+
+    const missingCommands = await runReleaseGates({
+      workspace: root,
+      evidenceDir: path.join(root, "short-plan"),
+      config: {
+        releaseId: "short-plan-release",
+        decisionOwner: "release-owner",
+        entryModeGuard: { id: "guard", command: "guard" },
+        stages: {
+          ...requiredStages(),
+          "compatible-migration": [{
+            id: "migration-rehearsal",
+            command: "migration-rehearsal",
+          }],
+        },
+        artifacts: { migration: migrationPath },
+      },
+      commandRunner: async () => ({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        durationMs: 1,
+      }),
+    });
+    assert.equal(missingCommands.status, "blocked");
+    assert.equal(missingCommands.activeEntryMode, "legacy-advanced");
+    assert.match(
+      missingCommands.gates[0].failures.join("\n"),
+      /missing required command: migration-contract/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed initial entry guard reports unknown mode and skips every gate", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-release-guard-"));
+  try {
+    const manifest = await runReleaseGates({
+      workspace: root,
+      evidenceDir: path.join(root, "bundle"),
+      config: {
+        releaseId: "guard-failure",
+        decisionOwner: "release-owner",
+        entryModeGuard: { id: "guard", command: "guard" },
+        stages: requiredStages(),
+      },
+      commandRunner: async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "mode readback mismatch",
+        durationMs: 1,
+      }),
+    });
+    assert.equal(manifest.status, "blocked");
+    assert.equal(manifest.activeEntryMode, "unknown");
+    assert.equal(manifest.entryModeGuard.status, "failed");
+    assert.deepEqual(manifest.gates.map((gate) => gate.status), [
+      "skipped",
+      "skipped",
+      "skipped",
+    ]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

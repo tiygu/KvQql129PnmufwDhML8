@@ -18,6 +18,17 @@
     "queryP95Ms": 250,
     "projectionRebuildMs": 2000
   },
+  "entryModeGuard": {
+    "id": "guard-legacy-entry-mode",
+    "command": "node",
+    "args": [
+      "scripts/catalog-release-entry-mode.cjs",
+      "--base-url",
+      "http://127.0.0.1:3210",
+      "--entry-mode",
+      "legacy-advanced"
+    ]
+  },
   "stages": {
     "compatible-migration": [
       {
@@ -121,13 +132,30 @@
           "--minimum-members",
           "20",
           "--minimum-succeeded",
-          "1",
+          "15",
+          "--maximum-deferred",
+          "5",
           "--maximum-failed",
           "0",
+          "--maximum-cancelled",
+          "0",
+          "--rollback-observations",
+          ".release-inputs/catalog-rollback-observations.json",
           "--evidence",
           ".release-inputs/catalog-runtime-smoke.json"
         ]
       }
+    ]
+  },
+  "activation": {
+    "id": "activate-full-snapshot",
+    "command": "node",
+    "args": [
+      "scripts/catalog-release-entry-mode.cjs",
+      "--base-url",
+      "http://127.0.0.1:3210",
+      "--entry-mode",
+      "full-snapshot"
     ]
   },
   "packaging": {
@@ -135,14 +163,38 @@
       "package.json",
       "run.cjs",
       "public/index.html",
+      "scripts/catalog-release-entry-mode.cjs",
+      "scripts/catalog-release-runtime-smoke.cjs",
       "wmpf/src/index.js",
       "wmpf/src/cdp_automation.js",
       "wmpf/frida/hook.js"
     ]
   },
   "rollback": {
-    "switchEntryModeCommand": "curl -X POST http://127.0.0.1:3210/api/catalog/release-control -H \"content-type: application/json\" -d \"{\\\"entryMode\\\":\\\"legacy-advanced\\\"}\"",
-    "switchServiceVersionCommand": "deploy PREVIOUS_SERVICE_VERSION with icon-write entry disabled",
-    "restoreBackupCommand": "stop the service; copy BACKUP_PATH over the damaged database; start PREVIOUS_SERVICE_VERSION"
+    "switchEntryMode": {
+      "id": "rollback-entry-mode",
+      "command": "node",
+      "args": [
+        "scripts/catalog-release-entry-mode.cjs",
+        "--base-url",
+        "http://127.0.0.1:3210",
+        "--entry-mode",
+        "legacy-advanced"
+      ]
+    },
+    "switchServiceVersion": {
+      "id": "rollback-service-version",
+      "command": "TARGET_SERVICE_SWITCH",
+      "args": [
+        "PREVIOUS_SERVICE_VERSION"
+      ]
+    },
+    "restoreBackup": {
+      "id": "restore-damaged-database",
+      "command": "TARGET_BACKUP_RESTORE",
+      "args": [
+        "BACKUP_PATH"
+      ]
+    }
   }
 }

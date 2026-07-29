@@ -121,7 +121,7 @@ function seedBoundary(database, fixtureDir) {
     "boundary-stale-automatic",
     "Boundary stale automatic",
   );
-  database.saveIconCandidate({
+  const staleCandidate = database.saveIconCandidate({
     itemId: automatic.objectId,
     cacheKey: "boundary-runtime",
     sourceType: "unknown-legacy-source",
@@ -129,6 +129,15 @@ function seedBoundary(database, fixtureDir) {
     autoSelect: true,
     asset: createAsset(fixtureDir, "boundary-runtime"),
   });
+  const staleObject = database.db.prepare(
+    "SELECT id FROM catalog_repository_objects WHERE object_type='item-identity' AND object_id=?",
+  ).get(automatic.objectId);
+  database.db.prepare(
+    "UPDATE catalog_icon_candidates SET selected=1,selection_origin='automatic' WHERE id=?",
+  ).run(staleCandidate.id);
+  database.db.prepare(`UPDATE catalog_icon_decisions
+    SET selected_candidate_id=?,selection_origin='automatic'
+    WHERE object_id=?`).run(staleCandidate.id, staleObject.id);
 
   observeIdentity(database, "boundary-manual", "Boundary protected manual");
   const manual = database.saveIconCandidate({
@@ -168,6 +177,32 @@ function seedBoundary(database, fixtureDir) {
   });
 }
 
+function downgradeToPreV4Schema(database) {
+  database.db.exec(`
+    DROP TABLE IF EXISTS catalog_icon_candidate_lineage;
+    DROP TABLE IF EXISTS catalog_icon_currency_history;
+  `);
+  for (const column of [
+    "currency_evaluated_at",
+    "currency_policy_version",
+    "currency_reason",
+    "currency_status",
+    "quality_contract_version",
+    "reconstruction_version",
+    "producer",
+  ]) {
+    database.db.exec(`ALTER TABLE catalog_icon_candidates DROP COLUMN ${column}`);
+  }
+  database.db.exec("PRAGMA user_version=3; DELETE FROM schema_migrations WHERE version=4;");
+  const columns = new Set(database.db.prepare(
+    "PRAGMA table_info(catalog_icon_candidates)",
+  ).all().map((entry) => entry.name));
+  const currencyTable = database.db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='catalog_icon_currency_history'",
+  ).get();
+  return !columns.has("currency_status") && !currencyTable;
+}
+
 function createPreMigrationFixture(name, fixtureDir) {
   const databasePath = path.join(fixtureDir, "catalog.db");
   const database = new AutomationDatabase(databasePath);
@@ -175,21 +210,74 @@ function createPreMigrationFixture(name, fixtureDir) {
     if (name === "sanitized-legacy") seedSanitizedLegacy(database, fixtureDir);
     if (name === "boundary") seedBoundary(database, fixtureDir);
     const counts = catalogCounts(database);
-    database.db.exec("PRAGMA user_version=3; DELETE FROM schema_migrations WHERE version=4;");
-    return { databasePath, counts };
+    const legacySchemaObserved = downgradeToPreV4Schema(database);
+    return { databasePath, counts, legacySchemaObserved };
   } finally {
     database.close();
   }
 }
 
 function verifyOldEntryReadWrite(database) {
+  const probeId = "legacy-entry-probe";
+  const imported = database.importCatalog({
+    chains: [{
+      id: "legacy-entry-chain",
+      minLevel: 1,
+      maxLevel: 1,
+      complete: true,
+      itemIds: [probeId],
+    }],
+    items: [{
+      id: probeId,
+      chainId: "legacy-entry-chain",
+      level: 1,
+      baseUnits: 1,
+      mergeTarget: null,
+    }],
+    producers: [],
+  }, {
+    sourceFile: "legacy-entry-probe.json",
+    sourceType: "legacy-json",
+  });
+  const stats = database.getCatalogStats();
   const before = database.getCatalogReleaseControl();
   const requestedMode = before.entryMode === "legacy-advanced"
     ? "full-snapshot"
     : "legacy-advanced";
   const changed = database.setCatalogReleaseControl({ entryMode: requestedMode });
   const restored = database.setCatalogReleaseControl({ entryMode: before.entryMode });
-  return changed.entryMode === requestedMode && restored.entryMode === before.entryMode;
+  return imported.items >= 1
+    && stats.items >= 1
+    && database.db.prepare("SELECT id FROM items WHERE id=?").get(probeId)?.id === probeId
+    && changed.entryMode === requestedMode
+    && restored.entryMode === before.entryMode;
+}
+
+function inspectBoundaryChecks(database) {
+  const stale = database.getCatalogObject(
+    "item-identity",
+    "boundary-stale-automatic",
+  );
+  const manual = database.getCatalogObject("item-identity", "boundary-manual");
+  const duplicate = database.db.prepare(`SELECT evidence.observation_count
+    FROM catalog_repository_evidence evidence
+    JOIN catalog_repository_objects object ON object.id=evidence.object_id
+    WHERE object.object_type='item-identity' AND object.object_id=?`)
+    .get("boundary-duplicate-evidence");
+  const unfinished = database.db.prepare(`SELECT acquisition.state
+    FROM icon_harvest_jobs job
+    JOIN icon_harvest_acquisitions acquisition ON acquisition.job_id=job.id
+    WHERE job.idempotency_key=?`).get("boundary-unfinished-job");
+  return {
+    staleAutomaticCleared: stale?.displayIcon?.selectedCandidate == null,
+    manualSelectionProtected: manual?.displayIcon?.manualProtection === true
+      && manual?.displayIcon?.selectedCandidate != null,
+    missingAssetRetained: manual?.displayIcon?.selectedIcon == null
+      && manual?.displayIcon?.candidates?.length === 1,
+    duplicateEvidenceCounted: Number(duplicate?.observation_count) >= 2,
+    unfinishedJobRetained: Boolean(unfinished)
+      && !["succeeded", "failed", "cancelled"].includes(unfinished.state),
+  };
 }
 
 function inspectRestoredBackup(backupPath, restoreDir) {
@@ -219,15 +307,22 @@ function runFixture(name, outputDir) {
   for (let run = 1; run <= 2; run += 1) {
     const database = new AutomationDatabase(created.databasePath);
     try {
-      const after = catalogCounts(database);
       const oldEntryReadWrite = verifyOldEntryReadWrite(database);
+      const after = catalogCounts(database);
+      const boundaryChecks = name === "boundary"
+        ? inspectBoundaryChecks(database)
+        : null;
+      const boundaryPassed = boundaryChecks == null
+        || Object.values(boundaryChecks).every(Boolean);
       const backupReadable = fs.existsSync(backupPath)
         && fs.statSync(backupPath).isFile();
       const record = {
         run,
         passed: backupReadable
           && countsPreserved(expectedBefore, after)
-          && oldEntryReadWrite,
+          && oldEntryReadWrite
+          && created.legacySchemaObserved
+          && boundaryPassed,
         backup: {
           path: backupPath,
           readable: backupReadable,
@@ -239,6 +334,8 @@ function runFixture(name, outputDir) {
         },
         auditInvariant: Number(after.audits) >= Number(expectedBefore.audits),
         oldEntryReadWrite,
+        legacySchemaObserved: created.legacySchemaObserved,
+        boundaryChecks,
         schema: database.getCatalogSchemaStatus(),
       };
       rehearsals.push(record);

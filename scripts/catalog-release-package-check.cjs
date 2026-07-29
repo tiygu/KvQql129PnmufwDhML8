@@ -9,6 +9,8 @@ const requiredFiles = [
   "package.json",
   "run.cjs",
   "public/index.html",
+  "scripts/catalog-release-entry-mode.cjs",
+  "scripts/catalog-release-runtime-smoke.cjs",
   "wmpf/src/index.js",
   "wmpf/src/cdp_automation.js",
   "wmpf/frida/hook.js",

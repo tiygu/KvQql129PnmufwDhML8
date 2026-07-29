@@ -18,6 +18,18 @@ const REQUIRED_MIGRATION_FIXTURES = [
   "boundary",
 ];
 
+const REQUIRED_STAGE_COMMAND_IDS = {
+  "compatible-migration": ["migration-rehearsal", "migration-contract"],
+  "read-only-catalog": ["api-contract", "catalog-performance", "browser-e2e"],
+  "icon-write": [
+    "job-contract",
+    "repository-check",
+    "web-build",
+    "package-files",
+    "real-runtime-smoke",
+  ],
+};
+
 const FATAL_ROLLBACK_TRIGGERS = [
   ["identityLoss", "identity-loss"],
   ["humanRulingLoss", "human-ruling-loss"],
@@ -92,6 +104,19 @@ function validateMigrationEvidence(evidence) {
       if (rehearsal?.oldEntryReadWrite !== true) {
         failures.push(`${label} did not verify old-entry read/write compatibility`);
       }
+      if (rehearsal?.legacySchemaObserved !== true) {
+        failures.push(`${label} did not start from a genuine pre-v4 schema`);
+      }
+      if (requiredName === "boundary") {
+        for (const [check, passed] of Object.entries(
+          rehearsal?.boundaryChecks || {},
+        )) {
+          if (passed !== true) failures.push(`${label} failed boundary check: ${check}`);
+        }
+        if (Object.keys(rehearsal?.boundaryChecks || {}).length < 5) {
+          failures.push(`${label} omitted required boundary checks`);
+        }
+      }
     }
     if (backupPaths.size !== 1) {
       failures.push(`${requiredName} must reuse one backup across both rehearsals`);
@@ -154,6 +179,14 @@ function validateRuntimeSmokeEvidence(evidence) {
   if (evidence?.mergeChainJob?.passed !== true) {
     failures.push("real-runtime Merge-Chain Icon Harvest did not pass");
   }
+  const terminalState = String(
+    evidence?.mergeChainJob?.finalStatus
+    || evidence?.mergeChainJob?.state
+    || "",
+  );
+  if (!["succeeded", "completed-with-gaps"].includes(terminalState)) {
+    failures.push("real-runtime Merge-Chain Icon Harvest lacks a successful terminal state");
+  }
   if (Number(evidence?.mergeChainJob?.gameActionsGenerated) !== 0) {
     failures.push("Merge-Chain Icon Harvest generated a game action");
   }
@@ -169,11 +202,20 @@ function validateRuntimeSmokeEvidence(evidence) {
   if (outcomes.succeeded < Number(thresholds.minimumSucceeded ?? 1)) {
     failures.push("real-runtime success count is below its threshold");
   }
-  if (outcomes.deferred > Number(thresholds.maximumDeferred ?? Number.MAX_SAFE_INTEGER)) {
+  const maximumDeferred = Number(thresholds.maximumDeferred);
+  if (!Number.isFinite(maximumDeferred) || maximumDeferred < 0) {
+    failures.push("real-runtime maximum deferred threshold must be finite and non-negative");
+  } else if (outcomes.deferred > maximumDeferred) {
     failures.push("real-runtime deferred count exceeds its threshold");
   }
   if (outcomes.failed > Number(thresholds.maximumFailed ?? 0)) {
     failures.push("real-runtime failure count exceeds its threshold");
+  }
+  const maximumCancelled = Number(thresholds.maximumCancelled);
+  if (!Number.isFinite(maximumCancelled) || maximumCancelled < 0) {
+    failures.push("real-runtime maximum cancelled threshold must be finite and non-negative");
+  } else if (outcomes.cancelled > maximumCancelled) {
+    failures.push("real-runtime cancelled count exceeds its threshold");
   }
   const evidenceRecords = Array.isArray(evidence?.evidenceRecords)
     ? evidence.evidenceRecords
@@ -184,6 +226,30 @@ function validateRuntimeSmokeEvidence(evidence) {
   }
   if (evidenceRecords.length < outcomes.succeeded) {
     failures.push("real-runtime evidence does not retain every successful evidence record");
+  }
+  const evidenceByItem = new Map(
+    evidenceRecords.map((record) => [String(record?.itemId || ""), record]),
+  );
+  for (const child of children.filter((entry) => entry?.state === "succeeded")) {
+    const record = evidenceByItem.get(String(child.itemId || ""));
+    const expectedCandidateId = child?.result?.candidateId;
+    const groups = record?.detail?.displayIcon?.candidates || {};
+    const persistedCandidate = [
+      ...(groups.currentDisplay || []),
+      ...(groups.eligible || []),
+      ...(groups.historical || []),
+    ].find((candidate) =>
+      String(candidate?.candidateId) === String(expectedCandidateId));
+    if (expectedCandidateId == null
+      || String(record?.candidateId) !== String(expectedCandidateId)
+      || record.persisted !== true
+      || persistedCandidate?.asset?.available !== true
+      || !Boolean(
+        persistedCandidate?.technical?.provenance
+        || persistedCandidate?.sourceType,
+      )) {
+      failures.push(`real-runtime successful item lacks a persisted candidate: ${child.itemId}`);
+    }
   }
   return failures;
 }
@@ -286,27 +352,68 @@ function artifactFailures(filePath, label) {
   return [];
 }
 
+function readEvidenceArtifact(filePath, label, failures, artifacts) {
+  const unreadable = artifactFailures(filePath, label);
+  failures.push(...unreadable);
+  if (unreadable.length) return null;
+  artifacts.push(filePath);
+  try {
+    return readJson(filePath);
+  } catch (error) {
+    failures.push(`${label} artifact contains invalid JSON: ${error.message}`);
+    return null;
+  }
+}
+
+function validCommand(command) {
+  return Boolean(
+    command
+    && String(command.id || "").trim()
+    && String(command.command || "").trim(),
+  );
+}
+
+function printableCommand(command) {
+  return validCommand(command)
+    ? [command.command, ...(command.args || [])].join(" ")
+    : "";
+}
+
 function stageValidation({ gateId, config, workspace }) {
   const failures = [];
   const artifacts = [];
   let rollback = null;
+  const commandIds = new Set(
+    (config.stages?.[gateId] || []).map((command) => String(command?.id || "")),
+  );
+  for (const requiredId of REQUIRED_STAGE_COMMAND_IDS[gateId]) {
+    if (!commandIds.has(requiredId)) {
+      failures.push(`${gateId} is missing required command: ${requiredId}`);
+    }
+  }
   if (gateId === "compatible-migration") {
     const migrationPath = resolveArtifactPath(workspace, config.artifacts?.migration);
-    failures.push(...artifactFailures(migrationPath, "migration"));
-    if (!failures.length) {
-      failures.push(...validateMigrationEvidence(readJson(migrationPath)));
-      artifacts.push(migrationPath);
-    }
+    const evidence = readEvidenceArtifact(
+      migrationPath,
+      "migration",
+      failures,
+      artifacts,
+    );
+    if (evidence) failures.push(...validateMigrationEvidence(evidence));
   }
   if (gateId === "read-only-catalog") {
     const performancePath = resolveArtifactPath(workspace, config.artifacts?.performance);
-    failures.push(...artifactFailures(performancePath, "performance"));
-    if (!failures.length) {
+    const evidence = readEvidenceArtifact(
+      performancePath,
+      "performance",
+      failures,
+      artifacts,
+    );
+    if (evidence) {
       failures.push(...validatePerformanceEvidence(
-        readJson(performancePath),
+        evidence,
         config.performanceThresholds,
       ));
-      artifacts.push(performancePath);
     }
     const screenshots = Array.isArray(config.artifacts?.screenshots)
       ? config.artifacts.screenshots
@@ -315,22 +422,27 @@ function stageValidation({ gateId, config, workspace }) {
     for (const screenshot of screenshots) {
       const screenshotPath = resolveArtifactPath(workspace, screenshot);
       failures.push(...artifactFailures(screenshotPath, "browser screenshot"));
-      if (fs.existsSync(screenshotPath) && fs.statSync(screenshotPath).isFile()) {
+      if (screenshotPath
+        && fs.existsSync(screenshotPath)
+        && fs.statSync(screenshotPath).isFile()) {
         artifacts.push(screenshotPath);
       }
     }
   }
   if (gateId === "icon-write") {
     const runtimePath = resolveArtifactPath(workspace, config.artifacts?.runtimeSmoke);
-    failures.push(...artifactFailures(runtimePath, "real-runtime smoke"));
-    if (!failures.length) {
-      const runtimeEvidence = readJson(runtimePath);
+    const runtimeEvidence = readEvidenceArtifact(
+      runtimePath,
+      "real-runtime smoke",
+      failures,
+      artifacts,
+    );
+    if (runtimeEvidence) {
       failures.push(...validateRuntimeSmokeEvidence(runtimeEvidence));
       rollback = evaluateRollbackTriggers(runtimeEvidence.rollbackObservations);
       if (rollback.triggered) {
         failures.push(`rollback trigger observed: ${rollback.triggers.join(", ")}`);
       }
-      artifacts.push(runtimePath);
     }
     for (const requiredFile of config.packaging?.requiredFiles || []) {
       const requiredPath = resolveArtifactPath(workspace, requiredFile);
@@ -338,12 +450,8 @@ function stageValidation({ gateId, config, workspace }) {
         failures.push(`required package file is missing: ${requiredFile}`);
       }
     }
-    for (const field of [
-      "switchEntryModeCommand",
-      "switchServiceVersionCommand",
-      "restoreBackupCommand",
-    ]) {
-      if (!String(config.rollback?.[field] || "").trim()) {
+    for (const field of ["switchEntryMode", "switchServiceVersion", "restoreBackup"]) {
+      if (!validCommand(config.rollback?.[field])) {
         failures.push(`rollback.${field} is required`);
       }
     }
@@ -359,6 +467,10 @@ function renderSummary(manifest) {
     `- Active entry mode: \`${manifest.activeEntryMode}\``,
     `- Decision owner: ${manifest.decisionOwner}`,
     `- Generated: ${manifest.generatedAt}`,
+    `- Initial entry guard: ${manifest.entryModeGuard.status}`,
+    `- Configuration: ${manifest.configurationFailures.length
+      ? manifest.configurationFailures.join("; ")
+      : "valid"}`,
     "",
     "## Gates",
     "",
@@ -372,9 +484,11 @@ function renderSummary(manifest) {
     "",
     "## Rollback",
     "",
-    `- Switch entry mode: \`${manifest.rollback.switchEntryModeCommand}\``,
-    `- Switch service version: \`${manifest.rollback.switchServiceVersionCommand}\``,
-    `- Restore backup: \`${manifest.rollback.restoreBackupCommand}\``,
+    `- Switch entry mode: \`${printableCommand(manifest.rollback.switchEntryMode)}\``,
+    `- Switch service version: \`${printableCommand(manifest.rollback.switchServiceVersion)}\``,
+    `- Restore backup: \`${printableCommand(manifest.rollback.restoreBackup)}\``,
+    `- Executed rollback steps: ${manifest.rollback.execution.length}`,
+    `- Activation: \`${printableCommand(manifest.activation.command)}\` (${manifest.activation.status})`,
     "",
     "## Known limitations",
     "",
@@ -422,14 +536,26 @@ async function runReleaseGates({
     generatedAt,
     decisionOwner: String(config.decisionOwner || "").trim(),
     status: "running",
-    activeEntryMode: "legacy-advanced",
+    activeEntryMode: "unknown",
+    configurationFailures: [],
+    entryModeGuard: {
+      command: config.entryModeGuard || null,
+      status: "not-run",
+      execution: null,
+    },
     gates: [],
     artifacts: [],
+    activation: {
+      command: config.activation || null,
+      status: "not-run",
+      execution: null,
+    },
     rollback: {
-      switchEntryModeCommand: config.rollback?.switchEntryModeCommand || "",
-      switchServiceVersionCommand: config.rollback?.switchServiceVersionCommand || "",
-      restoreBackupCommand: config.rollback?.restoreBackupCommand || "",
+      switchEntryMode: config.rollback?.switchEntryMode || null,
+      switchServiceVersion: config.rollback?.switchServiceVersion || null,
+      restoreBackup: config.rollback?.restoreBackup || null,
       assessment: null,
+      execution: [],
     },
     knownLimitations: Array.isArray(config.knownLimitations)
       ? config.knownLimitations.map(String)
@@ -437,6 +563,89 @@ async function runReleaseGates({
   };
   const usedArtifactNames = new Set();
   let blocked = false;
+  let verifiedEntryMode = "unknown";
+
+  const executeRecordedCommand = async (command, context = {}) => {
+    let result;
+    if (!validCommand(command)) {
+      result = {
+        exitCode: 1,
+        stdout: "",
+        stderr: "invalid command specification",
+        durationMs: 0,
+      };
+    } else {
+      try {
+        result = await commandRunner(command, {
+          workspace: resolvedWorkspace,
+          ...context,
+        });
+      } catch (error) {
+        result = {
+          exitCode: 1,
+          stdout: "",
+          stderr: error.stack || String(error),
+          durationMs: 0,
+        };
+      }
+    }
+    const logName = `${safeName(command?.id || context.logName)}.log`;
+    const logPath = path.join(commandsDir, logName);
+    writeCommandLog(logPath, command || {}, result);
+    return {
+      id: command?.id || context.logName || "invalid-command",
+      command: printableCommand(command),
+      exitCode: Number(result.exitCode),
+      durationMs: Number(result.durationMs || 0),
+      log: path.relative(resolvedEvidenceDir, logPath).replaceAll("\\", "/"),
+    };
+  };
+
+  const executeRollback = async (gate) => {
+    if (manifest.rollback.execution.length) return;
+    for (const field of ["switchEntryMode", "switchServiceVersion"]) {
+      const command = config.rollback?.[field];
+      if (!validCommand(command)) continue;
+      const execution = await executeRecordedCommand(command, {
+        gateId: gate.id,
+        operation: "rollback",
+      });
+      manifest.rollback.execution.push(execution);
+      if (field === "switchEntryMode") {
+        verifiedEntryMode = execution.exitCode === 0
+          ? "legacy-advanced"
+          : "unknown";
+      }
+      if (execution.exitCode !== 0) {
+        gate.failures.push(`${execution.id} rollback exited with ${execution.exitCode}`);
+      }
+    }
+  };
+
+  if (!manifest.releaseId) {
+    manifest.configurationFailures.push("releaseId is required");
+  }
+  if (!manifest.decisionOwner) {
+    manifest.configurationFailures.push("decisionOwner is required");
+  }
+  if (!validCommand(config.entryModeGuard)) {
+    manifest.configurationFailures.push("entryModeGuard command is required");
+  }
+  if (!manifest.configurationFailures.length) {
+    const execution = await executeRecordedCommand(config.entryModeGuard, {
+      operation: "entry-mode-guard",
+    });
+    manifest.entryModeGuard.execution = execution;
+    manifest.entryModeGuard.status = execution.exitCode === 0 ? "passed" : "failed";
+    if (execution.exitCode === 0) {
+      verifiedEntryMode = "legacy-advanced";
+    } else {
+      manifest.configurationFailures.push(
+        `${execution.id} entry-mode guard exited with ${execution.exitCode}`,
+      );
+    }
+  }
+  if (manifest.configurationFailures.length) blocked = true;
 
   for (const gateId of RELEASE_GATE_IDS) {
     const gate = {
@@ -455,46 +664,64 @@ async function runReleaseGates({
     if (!commands.length) gate.failures.push(`${gateId} has no commands`);
     for (const command of commands) {
       if (gate.failures.length) break;
-      const result = await commandRunner(command, {
-        workspace: resolvedWorkspace,
+      const execution = await executeRecordedCommand(command, {
         gateId,
       });
-      const logName = `${safeName(command.id)}.log`;
-      const logPath = path.join(commandsDir, logName);
-      writeCommandLog(logPath, command, result);
-      gate.commands.push({
-        id: command.id,
-        command: [command.command, ...(command.args || [])].join(" "),
-        exitCode: result.exitCode,
-        durationMs: result.durationMs,
-        log: path.relative(resolvedEvidenceDir, logPath).replaceAll("\\", "/"),
-      });
-      if (result.exitCode !== 0) {
-        gate.failures.push(`${command.id} exited with ${result.exitCode}`);
+      gate.commands.push(execution);
+      if (execution.exitCode !== 0) {
+        gate.failures.push(`${execution.id} exited with ${execution.exitCode}`);
       }
     }
 
-    if (!gate.failures.length) {
-      const validation = stageValidation({
-        gateId,
-        config,
-        workspace: resolvedWorkspace,
-      });
-      gate.failures.push(...validation.failures);
-      if (validation.rollback) manifest.rollback.assessment = validation.rollback;
-      for (const artifactPath of validation.artifacts) {
-        const copied = copyArtifact(artifactPath, artifactsDir, usedArtifactNames);
-        gate.artifacts.push(copied.bundledPath);
-        manifest.artifacts.push(copied);
-      }
+    const validation = stageValidation({
+      gateId,
+      config,
+      workspace: resolvedWorkspace,
+    });
+    gate.failures.push(...validation.failures);
+    if (validation.rollback) manifest.rollback.assessment = validation.rollback;
+    for (const artifactPath of validation.artifacts) {
+      const copied = copyArtifact(artifactPath, artifactsDir, usedArtifactNames);
+      gate.artifacts.push(copied.bundledPath);
+      manifest.artifacts.push(copied);
+    }
+    if (validation.rollback?.triggered) {
+      await executeRollback(gate);
     }
 
     gate.status = gate.failures.length ? "failed" : "passed";
     if (gate.status === "failed") blocked = true;
   }
 
+  if (!blocked) {
+    const gate = manifest.gates.at(-1);
+    if (!validCommand(config.activation)) {
+      gate.failures.push("activation command is required");
+      gate.status = "failed";
+      manifest.activation.status = "failed";
+      blocked = true;
+    } else {
+      const execution = await executeRecordedCommand(config.activation, {
+        gateId: gate.id,
+        operation: "activation",
+      });
+      gate.commands.push(execution);
+      manifest.activation.execution = execution;
+      manifest.activation.status = execution.exitCode === 0 ? "passed" : "failed";
+      if (execution.exitCode !== 0) {
+        gate.failures.push(`${execution.id} activation exited with ${execution.exitCode}`);
+        gate.status = "failed";
+        blocked = true;
+        verifiedEntryMode = "unknown";
+        await executeRollback(gate);
+      } else {
+        verifiedEntryMode = "full-snapshot";
+      }
+    }
+  }
+
   manifest.status = blocked ? "blocked" : "passed";
-  manifest.activeEntryMode = blocked ? "legacy-advanced" : "full-snapshot";
+  manifest.activeEntryMode = verifiedEntryMode;
   manifest.bundleArchive = `${path.basename(resolvedEvidenceDir)}.zip`;
   fs.writeFileSync(
     path.join(resolvedEvidenceDir, "manifest.json"),

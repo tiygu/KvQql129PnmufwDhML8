@@ -18,10 +18,15 @@ known limitations.
    - `decisionOwner`
    - `knownLimitations`
    - `TARGET_CHAIN_ID`
-   - the service-version and backup rollback commands
-2. Confirm the chain has at least 20 frozen members.
-3. Build the console once with `npm run web:build`.
-4. For the real-runtime stage, follow the reliable connection order:
+   - `TARGET_SERVICE_SWITCH`, `PREVIOUS_SERVICE_VERSION`,
+     `TARGET_BACKUP_RESTORE`, and `BACKUP_PATH`
+2. Create `.release-inputs/catalog-rollback-observations.json` from the
+   compatibility, revision-isolation, SQLite fault-injection, and human-decision
+   preservation checks. Use the trigger field names listed under
+   **Rollback decision**, with boolean or numeric observations.
+3. Confirm the chain has at least 20 frozen members.
+4. Build the console once with `npm run web:build`.
+5. For the real-runtime stage, follow the reliable connection order:
    start `npm run wx:cdp:debug`, then open the game, then start the control
    service. Pause action execution before icon harvesting.
 
@@ -35,6 +40,11 @@ npm run release:catalog:verify -- `
 
 The runner never enters a later gate after an earlier failure. A blocked run
 still produces its manifest, summary, logs, and ZIP so the failure is reviewable.
+Before Gate 1, `entryModeGuard` switches the service to `legacy-advanced` and
+reads the control endpoint back. A failed guard leaves the recorded mode
+`unknown` and skips every release gate. The verifier also requires a non-empty
+release ID, decision owner, and the complete command-ID set shown in the example
+configuration; a shortened validation plan is blocked.
 
 ## Gate 1: compatible migration
 
@@ -47,10 +57,12 @@ Entry mode remains `legacy-advanced`.
 - `boundary` with stale automatic selection, protected manual selection,
   missing provenance/asset, duplicate evidence, and unfinished work
 
-Each fixture starts twice. Both starts must point to the same readable pre-v4
+Each fixture is physically downgraded by removing the v4 evidence-currency
+tables and columns before it starts twice. Both starts must point to the same readable pre-v4
 backup and preserve or increase identity, ruling, evidence, and audit counts.
-The rehearsal also toggles and restores the old entry mode and restores a copy
-of the backup into a separate database before comparing counts.
+The rehearsal also imports and reads a legacy catalog projection, toggles and
+restores the old entry mode, verifies every boundary condition, and restores a
+copy of the backup into a separate database before comparing counts.
 
 The gate also runs the existing migration and compatibility contracts. Any
 identity, ruling, evidence, or audit reduction blocks the read-only gate.
@@ -92,40 +104,49 @@ The real-runtime collector:
 3. obtains and confirms one frozen Merge-Chain Icon Harvest preflight;
 4. waits for authoritative terminal snapshots;
 5. compares dashboard actions before and after;
-6. retains every child task and every successful Item Icon Evidence detail.
+6. replays the same idempotent merge-chain request and verifies that it returns
+   the same job;
+7. retains every child task and verifies every successful result against a
+   persisted candidate ID, available asset, and provenance record.
 
 The configured chain must contain at least 20 unique members. The manifest
 records and enforces minimum success, maximum deferred, and maximum failed
-counts. Any game action generated during the harvest blocks the gate.
+and maximum cancelled counts. The example requires at least 15 successes,
+allows at most 5 deferred members, and allows no failed or cancelled members.
+The deferred and cancelled limits must be finite. Any game action generated
+during the harvest blocks the gate.
 
-Only a successful third gate sets the recorded active entry mode to
-`full-snapshot`.
+After a successful third gate, the runner executes and verifies the configured
+activation command. Only that verified command sets the recorded active entry
+mode to `full-snapshot`.
 
 ## Rollback decision
 
 The following observations immediately disable the icon-write entry:
 
-- Item Identity loss
-- human ruling loss
-- human Display Icon Selection loss
-- cross-identity write
-- duplicate work from an idempotent request
-- Catalog Query Revision isolation failure
-- success reported after SQLite failure
-- old-entry incompatibility
+- Item Identity loss (`identityLoss`)
+- human ruling loss (`humanRulingLoss`)
+- human Display Icon Selection loss (`humanSelectionLoss`)
+- cross-identity write (`crossIdentityWrite`)
+- duplicate work from an idempotent request (`duplicateIdempotentWork`)
+- Catalog Query Revision isolation failure (`revisionIsolationFailure`)
+- success reported after SQLite failure (`falseSuccessAfterSqliteFailure`)
+- old-entry incompatibility (`oldEntryIncompatibility`)
 
 Deferred resources, queue-full admission, operator cancellation, unloaded
 resources, and explainable individual quality rejection are recorded but do not
 independently trigger rollback.
 
-Rollback order:
+When a fatal observation is present, the runner executes the first two rollback
+steps immediately, stores their stdout/stderr logs, and keeps the active entry
+mode at `legacy-advanced`. Rollback order:
 
-1. execute `switchEntryModeCommand`;
-2. execute `switchServiceVersionCommand`;
+1. execute `rollback.switchEntryMode`;
+2. execute `rollback.switchServiceVersion`;
 3. preserve the forward-migrated database, committed evidence, human decisions,
    and audit history.
 
-Use `restoreBackupCommand` only when the service is stopped and the database is
+Use `rollback.restoreBackup` only when the service is stopped and the database is
 damaged or unbootable. Record the decision owner, active entry mode, backup
 location, executed command, and result in the evidence package.
 

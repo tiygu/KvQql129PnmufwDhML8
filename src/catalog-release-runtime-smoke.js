@@ -34,6 +34,20 @@ function terminal(job) {
       .includes(job?.state);
 }
 
+function successfulTerminal(job) {
+  const state = String(job?.finalStatus || job?.state || "");
+  return ["succeeded", "completed-with-gaps"].includes(state);
+}
+
+function detailCandidates(detail) {
+  const groups = detail?.displayIcon?.candidates || {};
+  return [
+    ...(groups.currentDisplay || []),
+    ...(groups.eligible || []),
+    ...(groups.historical || []),
+  ];
+}
+
 async function waitForJob({
   fetchImpl,
   baseUrl,
@@ -75,8 +89,9 @@ async function collectRuntimeSmokeEvidence({
   idempotencyPrefix,
   minimumMembers = 20,
   minimumSucceeded = 1,
-  maximumDeferred = Number.MAX_SAFE_INTEGER,
+  maximumDeferred = 5,
   maximumFailed = 0,
+  maximumCancelled = 0,
   pollIntervalMs = 1000,
   timeoutMs = 10 * 60 * 1000,
   fetchImpl = fetch,
@@ -144,15 +159,21 @@ async function collectRuntimeSmokeEvidence({
       + `${minimumMembers} required`,
     );
   }
+  const chainRequest = {
+    scope: { type: "merge-chain", mergeChainId: normalizedChainId },
+    preflightId: preflight.preflightId,
+    confirmed: true,
+    idempotencyKey: `${normalizedPrefix}-chain`,
+  };
   const chainCreated = await postJson(
     fetchImpl,
     new URL("/api/catalog/icon-harvest-jobs", normalizedBaseUrl),
-    {
-      scope: { type: "merge-chain", mergeChainId: normalizedChainId },
-      preflightId: preflight.preflightId,
-      confirmed: true,
-      idempotencyKey: `${normalizedPrefix}-chain`,
-    },
+    chainRequest,
+  );
+  const idempotentReplay = await postJson(
+    fetchImpl,
+    new URL("/api/catalog/icon-harvest-jobs", normalizedBaseUrl),
+    chainRequest,
   );
   const chainJob = await waitForJob({
     fetchImpl,
@@ -173,13 +194,30 @@ async function collectRuntimeSmokeEvidence({
         normalizedBaseUrl,
       ),
     );
+    const candidateId = child.result?.candidateId ?? null;
+    const candidate = detailCandidates(detail).find((entry) =>
+      String(entry?.candidateId) === String(candidateId));
+    const persisted = candidateId != null
+      && candidate != null
+      && candidate.asset?.available === true
+      && Boolean(candidate.technical?.provenance || candidate.sourceType);
     evidenceRecords.push({
       itemId: child.itemId,
+      candidateId,
+      persisted,
       acquisitionResult: child.result || null,
       detail,
     });
   }
 
+  const directoryAfter = await requestJson(fetchImpl, directoryUrl);
+  const afterMemberIds = new Set(
+    (directoryAfter?.items || []).map((item) => String(item.itemId)),
+  );
+  const identityLoss = directoryMembers.some((item) =>
+    !afterMemberIds.has(String(item.itemId)));
+  const duplicateIdempotentWork = String(idempotentReplay?.jobId || "")
+    !== String(chainCreated?.jobId || "");
   const dashboardAfter = await requestJson(
     fetchImpl,
     new URL("/api/dashboard", normalizedBaseUrl),
@@ -209,7 +247,7 @@ async function collectRuntimeSmokeEvidence({
     },
     mergeChainPreflight: preflight,
     mergeChainJob: {
-      passed: terminal(chainJob),
+      passed: successfulTerminal(chainJob),
       jobId: chainJob?.jobId || null,
       state: chainJob?.state || null,
       finalStatus: chainJob?.finalStatus || null,
@@ -222,10 +260,17 @@ async function collectRuntimeSmokeEvidence({
       minimumSucceeded: Number(minimumSucceeded),
       maximumDeferred: Number(maximumDeferred),
       maximumFailed: Number(maximumFailed),
+      maximumCancelled: Number(maximumCancelled),
     },
     evidenceRecords,
     taskRecords: children,
-    rollbackObservations,
+    rollbackObservations: {
+      ...rollbackObservations,
+      identityLoss: Boolean(rollbackObservations.identityLoss) || identityLoss,
+      duplicateIdempotentWork: Boolean(
+        rollbackObservations.duplicateIdempotentWork,
+      ) || duplicateIdempotentWork,
+    },
   };
 }
 
