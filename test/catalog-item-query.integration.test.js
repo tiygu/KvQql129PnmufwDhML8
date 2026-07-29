@@ -913,3 +913,47 @@ test("search ranks deterministically, composes filters, and distinguishes curren
     assert.deepEqual(empty.items, []);
   });
 });
+
+test("projection rebuild batches uncomplicated catalog objects instead of hydrating them one by one", async () => {
+  await withFixture(async ({ runtime }) => {
+    const items = Array.from({ length: 250 }, (_, index) => ({
+      id: `batch-item-${String(index + 1).padStart(3, "0")}`,
+      name: `Batch item ${index + 1}`,
+      chainId: "batch-chain",
+      level: (index % 20) + 1,
+      type: "merge-item",
+      mergeTarget: index < 249
+        ? `batch-item-${String(index + 2).padStart(3, "0")}`
+        : null,
+    }));
+    runtime.database.importCatalog({
+      chains: [{
+        id: "batch-chain",
+        minLevel: 1,
+        maxLevel: 20,
+        complete: true,
+        itemIds: items.map((item) => item.id),
+      }],
+      items,
+      producers: [],
+    }, {
+      sourceFile: "batch-projection-fixture.json",
+      sourceType: "test-fixture",
+    });
+    const originalGetCatalogObject = runtime.database.getCatalogObject.bind(runtime.database);
+    let individualHydrations = 0;
+    runtime.database.getCatalogObject = (...args) => {
+      individualHydrations += 1;
+      return originalGetCatalogObject(...args);
+    };
+
+    const query = new CatalogItemQuery(runtime.database);
+    assert.match(query.revision(), /^catalog-query-v1:/);
+    assert.equal(individualHydrations < 25, true);
+    assert.equal(query.list({
+      query: "batch-item",
+      pageSize: 200,
+      sort: "relevance",
+    }).total, 250);
+  });
+});

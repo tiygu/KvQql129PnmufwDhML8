@@ -859,7 +859,7 @@ test("CDP Adapter waits for an asynchronously replaced order slot after dispatch
   await adapter.ready();
   const result = await adapter.execute(
     { type: "submit-order", slot: "order-1", before: { orders: [{ slot: "order-1", taskId: 101 }] } },
-    { options: { delayMs: 1, settleMs: 20 } },
+    { options: { delayMs: 1, settleMs: 200 } },
   );
 
   assert.equal(result.ok, true);

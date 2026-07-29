@@ -128,11 +128,21 @@ test("resource and crop cache persists complete source metadata without duplicat
   const wrongFile = path.join(dir, "wrong.png");
   const wrongBody = png(1, 1, { "0,0": "blue" });
   fs.writeFileSync(wrongFile, wrongBody);
-  database.saveIconCandidate({
+  const wrongCandidate = database.saveIconCandidate({
     itemId: "i1", cacheKey: "wrong-generic-icon", sourceType: "cocos-runtime-resource",
     runtimeIdentifier: "icon", crop: { rect: { x: 9, y: 9, width: 1, height: 1 } }, rankScore: 1,
     asset: { hash: crypto.createHash("sha256").update(wrongBody).digest("hex"), mimeType: "image/png", width: 1, height: 1, byteSize: wrongBody.length, filePath: wrongFile },
   });
+  const repositoryObject = database.db.prepare(
+    "SELECT id FROM catalog_repository_objects WHERE object_type='item-identity' AND object_id='i1'",
+  ).get();
+  database.db.prepare(`UPDATE catalog_icon_decisions
+    SET selected_candidate_id=?,selection_origin='automatic',revision=revision+1
+    WHERE object_id=?`).run(wrongCandidate.id, repositoryObject.id);
+  database.db.prepare(`UPDATE catalog_icon_candidates
+    SET selected=CASE WHEN id=? THEN 1 ELSE 0 END,
+      selection_origin=CASE WHEN id=? THEN 'automatic' ELSE NULL END
+    WHERE object_id=?`).run(wrongCandidate.id, wrongCandidate.id, repositoryObject.id);
   assert.equal(database.getSelectedIconCandidate("i1").runtimeIdentifier, "icon");
   service.request("i1", { contextId: 7 });
   await service.waitForIdle();

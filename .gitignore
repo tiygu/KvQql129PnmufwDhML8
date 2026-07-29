@@ -10,6 +10,10 @@ data*/
 # Keep the platform-specific WMPF route local
 wmpf/
 release*/
+.release-inputs/
+.release-work/
+.release-evidence/
+docs/catalog-release.local.json
 target-*.json
 *.db
 *.db-shm

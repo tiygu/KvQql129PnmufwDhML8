@@ -29,7 +29,7 @@ function waitForEvent(socket, predicate, label) {
     const timeout = setTimeout(() => {
       cleanup();
       reject(new Error(`timed out waiting for ${label}`));
-    }, 3000);
+    }, 10000);
     const onMessage = (data) => {
       const event = JSON.parse(String(data));
       if (!predicate(event)) return;

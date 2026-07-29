@@ -1,0 +1,148 @@
+{
+  "releaseId": "catalog-icons-YYYY-MM-DD",
+  "decisionOwner": "ROLE",
+  "knownLimitations": [
+    "Replace this text with the limitations observed during the release rehearsal."
+  ],
+  "artifacts": {
+    "migration": ".release-inputs/catalog-migration.json",
+    "performance": ".release-inputs/catalog-performance.json",
+    "runtimeSmoke": ".release-inputs/catalog-runtime-smoke.json",
+    "screenshots": [
+      ".release-inputs/screenshots/catalog-directory-detail.png",
+      ".release-inputs/screenshots/catalog-icon-evidence-groups.png",
+      ".release-inputs/screenshots/catalog-minimum-viewport.png"
+    ]
+  },
+  "performanceThresholds": {
+    "queryP95Ms": 250,
+    "projectionRebuildMs": 2000
+  },
+  "stages": {
+    "compatible-migration": [
+      {
+        "id": "migration-rehearsal",
+        "command": "node",
+        "args": [
+          "scripts/catalog-release-rehearse.cjs",
+          "--output",
+          ".release-work/catalog-migration",
+          "--evidence",
+          ".release-inputs/catalog-migration.json"
+        ]
+      },
+      {
+        "id": "migration-contract",
+        "command": "node",
+        "args": [
+          "--test",
+          "test/catalog-release-compatibility.test.js",
+          "test/icon-evidence-migration.test.js",
+          "test/catalog-release-gates.test.js"
+        ]
+      }
+    ],
+    "read-only-catalog": [
+      {
+        "id": "api-contract",
+        "command": "node",
+        "args": [
+          "--test",
+          "test/catalog-item-query.integration.test.js",
+          "test/control-server.test.js"
+        ]
+      },
+      {
+        "id": "catalog-performance",
+        "command": "node",
+        "args": [
+          "scripts/catalog-release-performance.cjs",
+          "--catalog-size",
+          "5000",
+          "--evidence",
+          ".release-inputs/catalog-performance.json"
+        ]
+      },
+      {
+        "id": "browser-e2e",
+        "command": "node",
+        "args": [
+          "--test",
+          "test/catalog-item-directory.browser.test.js"
+        ],
+        "env": {
+          "CATALOG_RELEASE_SCREENSHOT_DIR": ".release-inputs/screenshots"
+        }
+      }
+    ],
+    "icon-write": [
+      {
+        "id": "job-contract",
+        "command": "node",
+        "args": [
+          "--test",
+          "test/icon-harvest-job.test.js",
+          "test/icon-harvest-lifecycle.test.js",
+          "test/icon-harvest-console.test.js"
+        ]
+      },
+      {
+        "id": "repository-check",
+        "command": "npm",
+        "args": [
+          "run",
+          "check"
+        ]
+      },
+      {
+        "id": "web-build",
+        "command": "npm",
+        "args": [
+          "run",
+          "web:build"
+        ]
+      },
+      {
+        "id": "package-files",
+        "command": "node",
+        "args": [
+          "scripts/catalog-release-package-check.cjs"
+        ]
+      },
+      {
+        "id": "real-runtime-smoke",
+        "command": "node",
+        "args": [
+          "scripts/catalog-release-runtime-smoke.cjs",
+          "--base-url",
+          "http://127.0.0.1:3210",
+          "--merge-chain-id",
+          "TARGET_CHAIN_ID",
+          "--minimum-members",
+          "20",
+          "--minimum-succeeded",
+          "1",
+          "--maximum-failed",
+          "0",
+          "--evidence",
+          ".release-inputs/catalog-runtime-smoke.json"
+        ]
+      }
+    ]
+  },
+  "packaging": {
+    "requiredFiles": [
+      "package.json",
+      "run.cjs",
+      "public/index.html",
+      "wmpf/src/index.js",
+      "wmpf/src/cdp_automation.js",
+      "wmpf/frida/hook.js"
+    ]
+  },
+  "rollback": {
+    "switchEntryModeCommand": "curl -X POST http://127.0.0.1:3210/api/catalog/release-control -H \"content-type: application/json\" -d \"{\\\"entryMode\\\":\\\"legacy-advanced\\\"}\"",
+    "switchServiceVersionCommand": "deploy PREVIOUS_SERVICE_VERSION with icon-write entry disabled",
+    "restoreBackupCommand": "stop the service; copy BACKUP_PATH over the damaged database; start PREVIOUS_SERVICE_VERSION"
+  }
+}

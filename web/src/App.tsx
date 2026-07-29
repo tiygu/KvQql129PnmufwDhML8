@@ -176,7 +176,15 @@ export default function App() {
   };
   useEffect(() => {
     const requestedScale = Number(settings.fontScale) || 1;
-    document.documentElement.style.zoom = String(Math.min(1.1, Math.max(1, requestedScale)));
+    const updateScale = () => {
+      const viewportScale = window.innerWidth / 1000;
+      document.documentElement.style.zoom = String(
+        Math.min(1.1, Math.max(1, requestedScale), Math.max(1, viewportScale)),
+      );
+    };
+    updateScale();
+    window.addEventListener("resize", updateScale);
+    return () => window.removeEventListener("resize", updateScale);
   }, [settings.fontScale]);
   useEffect(() => { refresh(); reloadCatalog(); controlApi.getConnectionStatus().then((value) => value && setConnectionRoute(value)); controlApi.getSettings().then((value) => { if (value) { setSettings(value); setAutoMap(!!value.autoMapUpgrade); } }); const off = controlApi.onEvent((event) => { setEvents((old) => [event, ...old].slice(0, 100)); if (event.type === "automation-status") { setData((old: any) => ({ ...old, running: event.running, paused: !!event.paused })); if (event.message) setMessage(event.message); } if (event.type === "settings-updated" && event.settings) { setSettings(event.settings); setAutoMap(!!event.settings.autoMapUpgrade); } if (event.type === "automation-complete") setMessage(`自动化停止：${localizedDetail(event.result?.reason || "已完成")}`); if (event.type === "automation-error") setMessage(`自动化异常：${localizedDetail(event.error)}`); if (event.type === "icon-acquisition-complete") setMessage(event.cached ? "已使用缓存图标" : event.provider === "screenshot-runtime" ? "精确资源映射失败，已采集稳定截图候选" : "精确运行时图标已采集"); if (event.type === "active-catalog-scan-complete") setMessage(event.ok ? "主动图鉴扫描已完成，图鉴状态与计划均已重新评估。" : `主动图鉴扫描已停止：${localizedDetail(event.reason)}`); if (event.type === "icon-acquisition-error") setMessage(`图标采集失败：${localizedDetail(event.error)}`); if (event.type === "icon-harvest-job-updated" && event.job?.finalStatus) setActiveIconHarvestJob((current) => current?.jobId === event.job.jobId ? null : current); if (["catalog-state-updated", "catalog-review-updated", "catalog-display-icon-updated", "catalog-review-session-updated", "catalog-repository-imported", "icon-acquisition-complete", "active-catalog-scan-complete"].includes(event.type)) { reloadCatalog().catch(() => null); refresh(); } if (event.type === "catalog-passive-evidence") reloadCatalog().catch(() => null); if (event.type === "connection-route") controlApi.getConnectionStatus().then((value) => value && setConnectionRoute(value)); }); const timer = setInterval(() => { refresh(); controlApi.getConnectionStatus().then((value) => value && setConnectionRoute(value)); }, 8000); return () => { off?.(); clearInterval(timer); }; }, []);
   const run = async (maxActions?: number) => {

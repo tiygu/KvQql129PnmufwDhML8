@@ -15,6 +15,16 @@ const { chromium } = require("playwright");
 const { AutomationRuntime } = require("../src/automation-runtime");
 const { createControlServer } = require("../src/control-server");
 
+async function captureReleaseScreenshot(page, name) {
+  const screenshotDir = process.env.CATALOG_RELEASE_SCREENSHOT_DIR;
+  if (!screenshotDir) return;
+  fs.mkdirSync(screenshotDir, { recursive: true });
+  await page.screenshot({
+    path: path.join(screenshotDir, `${name}.png`),
+    fullPage: true,
+  });
+}
+
 async function listen(server) {
   await new Promise((resolve, reject) => {
     server.httpServer.once("error", reject);
@@ -155,6 +165,7 @@ test("Catalog Review Workspace 明确切换全部物品且只在显式选择后�
     await firstItem.click();
     await page.getByRole("heading", { name: "浏览花一" }).waitFor();
     await page.getByText("只读 Item Identity 详情").waitFor();
+    await captureReleaseScreenshot(page, "catalog-directory-detail");
     const firstDetail = await page.evaluate(async () => fetch("/api/catalog/items/browser-directory-one").then((response) => response.json()));
     assert.equal(await page.locator(".catalog-directory-detail .panel-head small").innerText(), firstDetail.summary.itemId);
     assert.equal(await page.locator(".directory-facts").getByText(String(firstDetail.identity.effectiveFacts.level)).count(), 1);
@@ -272,6 +283,7 @@ test("Item Identity detail manages grouped display icon evidence without changin
     await page.getByRole("heading", { name: "Current Display" }).waitFor();
     await page.getByRole("heading", { name: "Eligible Candidates" }).waitFor();
     await page.getByRole("heading", { name: "Historical Evidence" }).waitFor();
+    await captureReleaseScreenshot(page, "catalog-icon-evidence-groups");
     assert.equal(await page.locator(
       `.display-icon-candidate[data-candidate-id="${eligible.id}"]`,
     ).getByText("Currency: current").count(), 1);
@@ -597,6 +609,60 @@ test("relationship history restores query, pagination, list scroll, and keyboard
     assert.equal(await page.locator(".catalog-directory-list .directory-copy-id").count(), 208);
     assert.equal(await list.evaluate((element) => element.scrollTop), originalScrollTop);
     assert.equal(await relationTarget.evaluate((element) => element === document.activeElement), true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("minimum 1000px viewport keeps directory navigation keyboard accessible", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "catalog-item-minimum-viewport-"));
+  const runtime = new AutomationRuntime({
+    rootDir: path.resolve(__dirname, ".."),
+    dataDir,
+    manageConnectionRoute: false,
+  });
+  activateIdentity(runtime, "min-view-one", "Minimum One", 1);
+  activateIdentity(runtime, "min-view-two", "Minimum Two", 2);
+  const fixture = await createBrowserDirectoryFixture(
+    runtime,
+    dataDir,
+    { width: 1000, height: 700 },
+  );
+  const { page, port } = fixture;
+
+  try {
+    await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "networkidle" });
+    await page.getByRole("button", { name: "图鉴", exact: true }).click();
+    await page.getByRole("button", { name: /全部物品/ }).click();
+    const first = page.getByRole("button", { name: /Minimum One.*min-view-one/ });
+    const second = page.getByRole("button", { name: /Minimum Two.*min-view-two/ });
+    await first.focus();
+    await page.keyboard.press("ArrowDown");
+    assert.equal(await second.evaluate((element) => element === document.activeElement), true);
+    await page.keyboard.press("Enter");
+    await page.getByRole("heading", { name: "Minimum Two" }).waitFor();
+    await captureReleaseScreenshot(page, "catalog-minimum-viewport");
+    const layout = await page.evaluate(() => ({
+      innerWidth: window.innerWidth,
+      clientWidth: document.documentElement.clientWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      widest: [...document.querySelectorAll("body *")]
+        .map((element) => ({
+          className: element.className,
+          right: element.getBoundingClientRect().right,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+        }))
+        .filter((entry) => entry.right > window.innerWidth || entry.scrollWidth > entry.clientWidth)
+        .sort((left, right) => Math.max(right.right, right.scrollWidth)
+          - Math.max(left.right, left.scrollWidth))
+        .slice(0, 5),
+    }));
+    assert.equal(
+      layout.scrollWidth <= layout.innerWidth,
+      true,
+      JSON.stringify(layout),
+    );
   } finally {
     await fixture.close();
   }

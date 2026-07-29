@@ -11,12 +11,22 @@ const { AutomationDatabase } = require("../src/automation-database");
 
 const LEGACY_CREATED_AT = "2026-07-01T00:00:00.000Z";
 
-function withDirectory(run) {
+async function withDirectory(run) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "icon-evidence-migration-"));
   try {
-    return run(directory);
+    return await run(directory);
   } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      fs.rmSync(directory, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 50,
+      });
+    } catch (error) {
+      if (process.platform !== "win32" || error.code !== "EPERM") throw error;
+    }
   }
 }
 

@@ -417,6 +417,115 @@ function orderingTuple(entry, options) {
   return [entry.summary.displayTitle];
 }
 
+function projectionVersion(row) {
+  return row ? {
+    id: Number(row.id),
+    version: Number(row.version),
+    status: row.status,
+    origin: row.origin,
+    payload: JSON.parse(row.payload_json),
+    evidenceSummary: JSON.parse(row.evidence_summary_json),
+    createdAt: row.created_at,
+  } : null;
+}
+
+function projectionEvidence(row) {
+  return {
+    id: Number(row.id),
+    fingerprint: row.fingerprint,
+    sourceType: row.source_type,
+    sourceRef: row.source_ref || null,
+    payload: JSON.parse(row.payload_json),
+    disposition: row.disposition,
+    observationCount: Number(row.observation_count),
+    firstObservedAt: row.first_observed_at,
+    lastObservedAt: row.last_observed_at,
+  };
+}
+
+function loadProjectionObjects(database, objectType) {
+  const rows = database.db.prepare(
+    "SELECT * FROM catalog_repository_objects WHERE object_type=? ORDER BY object_id",
+  ).all(objectType);
+  if (!rows.length) return [];
+  const complexIds = new Set(database.db.prepare(`SELECT DISTINCT object.id
+    FROM catalog_repository_objects object
+    WHERE object.object_type=? AND (
+      EXISTS(SELECT 1 FROM catalog_repository_rulings ruling WHERE ruling.object_id=object.id)
+      OR EXISTS(SELECT 1 FROM catalog_repository_conflicts conflict
+        WHERE conflict.object_type=object.object_type AND conflict.object_id=object.object_id)
+      OR EXISTS(SELECT 1 FROM catalog_review_resolutions resolution WHERE resolution.object_id=object.id)
+      OR EXISTS(SELECT 1 FROM catalog_icon_candidates candidate WHERE candidate.object_id=object.id)
+      OR EXISTS(SELECT 1 FROM catalog_icon_decisions decision
+        WHERE decision.object_id=object.id AND (
+          decision.selected_candidate_id IS NOT NULL OR decision.selection_origin IS NOT NULL
+        ))
+      OR EXISTS(SELECT 1 FROM catalog_icon_selection_history history WHERE history.object_id=object.id)
+    )`).all(objectType).map((row) => Number(row.id)));
+  const versionsByObject = new Map();
+  const versionsById = new Map();
+  for (const row of database.db.prepare(`SELECT version.*
+    FROM catalog_repository_versions version
+    JOIN catalog_repository_objects object ON object.id=version.object_id
+    WHERE object.object_type=? ORDER BY version.object_id,version.version`).all(objectType)) {
+    const version = projectionVersion(row);
+    const objectId = Number(row.object_id);
+    if (!versionsByObject.has(objectId)) versionsByObject.set(objectId, []);
+    versionsByObject.get(objectId).push(version);
+    versionsById.set(version.id, version);
+  }
+  const evidenceByObject = new Map();
+  for (const row of database.db.prepare(`SELECT evidence.*
+    FROM catalog_repository_evidence evidence
+    JOIN catalog_repository_objects object ON object.id=evidence.object_id
+    WHERE object.object_type=? ORDER BY evidence.object_id,evidence.id`).all(objectType)) {
+    const objectId = Number(row.object_id);
+    if (!evidenceByObject.has(objectId)) evidenceByObject.set(objectId, []);
+    evidenceByObject.get(objectId).push(projectionEvidence(row));
+  }
+  return rows.map((row) => {
+    if (complexIds.has(Number(row.id))) {
+      return database.getCatalogObject(row.object_type, row.object_id);
+    }
+    const versions = versionsByObject.get(Number(row.id)) || [];
+    const candidateVersion = versionsById.get(Number(row.candidate_version_id)) || null;
+    const activeVersion = versionsById.get(Number(row.active_version_id)) || null;
+    const algorithmCandidate = (activeVersion || candidateVersion || versions.at(-1))?.payload || {};
+    const reviewReasons = [
+      ...(row.status === "observed" ? [{ type: "new-observation" }] : []),
+      ...(row.candidate_version_id != null ? [{ type: "inference-change" }] : []),
+    ];
+    return {
+      objectType: row.object_type,
+      objectId: row.object_id,
+      status: row.status,
+      disposition: row.disposition,
+      revision: Number(row.revision),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      candidateVersion,
+      activeVersion,
+      evidence: evidenceByObject.get(Number(row.id)) || [],
+      versions,
+      algorithmCandidate,
+      humanValues: {},
+      effectiveValue: algorithmCandidate,
+      reviewReasons,
+      reviewStatus: reviewReasons.length ? "needs-review" : "clear",
+      displayIcon: row.object_type === "item-identity" ? {
+        revision: 1,
+        selectionOrigin: null,
+        manualProtection: false,
+        protectedEmpty: false,
+        selectedCandidate: null,
+        selectedIcon: null,
+        candidates: [],
+        history: [],
+      } : undefined,
+    };
+  });
+}
+
 class CatalogItemQuery {
   constructor(database) {
     this.database = database;
@@ -428,9 +537,7 @@ class CatalogItemQuery {
     if (this.cachedSnapshot?.sourceRevision === latestSourceRevision) return this.cachedSnapshot;
     const snapshot = this.database.transaction(() => {
       const sourceRevision = this.database.getCatalogQueryRevision();
-      const objects = this.database.listCatalogObjects({ objectType: "item-identity" })
-        .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
-        .filter(Boolean);
+      const objects = loadProjectionObjects(this.database, "item-identity");
       const entries = objects.map((object) => {
         const summary = summaryFromObject(object);
         return {
@@ -442,12 +549,8 @@ class CatalogItemQuery {
       const projectionRevision = crypto.createHash("sha256").update(canonicalJson(
         entries.map(({ summary, search }) => ({ summary, search })),
       )).digest("hex");
-      const relations = this.database.listCatalogObjects({ objectType: "merge-relation" })
-        .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
-        .filter(Boolean);
-      const productionProfiles = this.database.listCatalogObjects({ objectType: "production-profile" })
-        .map((entry) => this.database.getCatalogObject(entry.objectType, entry.objectId))
-        .filter(Boolean);
+      const relations = loadProjectionObjects(this.database, "merge-relation");
+      const productionProfiles = loadProjectionObjects(this.database, "production-profile");
       return {
         sourceRevision,
         revision: `catalog-query-v1:${projectionRevision}`,

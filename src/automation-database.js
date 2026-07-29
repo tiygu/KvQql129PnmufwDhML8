@@ -585,9 +585,6 @@ class AutomationDatabase {
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_currency_history_candidate ON catalog_icon_currency_history(candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_predecessor ON catalog_icon_candidate_lineage(predecessor_candidate_id,id);
       CREATE INDEX IF NOT EXISTS idx_catalog_icon_lineage_successor ON catalog_icon_candidate_lineage(successor_candidate_id,id);
-      CREATE INDEX IF NOT EXISTS idx_icon_harvest_jobs_updated ON icon_harvest_jobs(updated_at,id);
-      CREATE INDEX IF NOT EXISTS idx_icon_harvest_acquisitions_job ON icon_harvest_acquisitions(job_id,id);
-      CREATE INDEX IF NOT EXISTS idx_icon_harvest_commands_job ON icon_harvest_commands(job_id,created_at);
       CREATE INDEX IF NOT EXISTS idx_resource_samples_observed ON resource_samples(observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_actions_attributable ON production_action_observations(attributable, observed_at);
       CREATE INDEX IF NOT EXISTS idx_production_distribution_reviews_status ON production_distribution_review_events(status, created_at);
@@ -614,10 +611,27 @@ class AutomationDatabase {
       )`);
     }
     const iconHarvestJobColumns = new Set(this.db.prepare("PRAGMA table_info(icon_harvest_jobs)").all().map((column) => column.name));
+    if (!iconHarvestJobColumns.has("scope_type")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'item'");
+    if (!iconHarvestJobColumns.has("scope_key")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''");
+    if (!iconHarvestJobColumns.has("idempotency_key")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''");
     if (!iconHarvestJobColumns.has("request_fingerprint")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''");
     if (!iconHarvestJobColumns.has("retry_of_job_id")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN retry_of_job_id TEXT");
+    if (!iconHarvestJobColumns.has("revision")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+    if (!iconHarvestJobColumns.has("started_at")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN started_at TEXT");
+    if (!iconHarvestJobColumns.has("completed_at")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN completed_at TEXT");
+    if (!iconHarvestJobColumns.has("updated_at")) this.db.exec("ALTER TABLE icon_harvest_jobs ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''");
+    this.db.exec(`UPDATE icon_harvest_jobs SET
+      scope_key=CASE WHEN scope_key='' THEN id ELSE scope_key END,
+      idempotency_key=CASE WHEN idempotency_key='' THEN 'legacy:' || id ELSE idempotency_key END,
+      updated_at=CASE WHEN updated_at='' THEN created_at ELSE updated_at END`);
     const iconHarvestAcquisitionColumns = new Set(this.db.prepare("PRAGMA table_info(icon_harvest_acquisitions)").all().map((column) => column.name));
     if (!iconHarvestAcquisitionColumns.has("runner_task_id")) this.db.exec("ALTER TABLE icon_harvest_acquisitions ADD COLUMN runner_task_id INTEGER");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_icon_harvest_jobs_idempotency ON icon_harvest_jobs(idempotency_key);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_jobs_updated ON icon_harvest_jobs(updated_at,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_acquisitions_job ON icon_harvest_acquisitions(job_id,id);
+      CREATE INDEX IF NOT EXISTS idx_icon_harvest_commands_job ON icon_harvest_commands(job_id,created_at);
+    `);
     const objectColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_objects)").all().map((column) => column.name));
     if (!objectColumns.has("disposition")) this.db.exec("ALTER TABLE catalog_repository_objects ADD COLUMN disposition TEXT NOT NULL DEFAULT 'enabled'");
     const evidenceColumns = new Set(this.db.prepare("PRAGMA table_info(catalog_repository_evidence)").all().map((column) => column.name));
