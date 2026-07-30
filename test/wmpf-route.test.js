@@ -45,8 +45,13 @@ test("Frida hook 仅在指纹匹配时写入补丁并可恢复原字节", () => 
   };
 
   vm.runInNewContext(source, context);
-  assert.equal(context.__hookTest.patchConditionalBranch(address, [...currentBytes], "fixture"), true);
+  const expectedBytes = [...currentBytes];
+  assert.equal(context.__hookTest.patchConditionalBranch(address, expectedBytes, "fixture"), true);
   assert.deepEqual(currentBytes, [0x90, 0x90, 0x90, 0x90, 0x90, 0x90]);
+  assert.equal(
+    context.__hookTest.patchConditionalBranch(address, expectedBytes, "fixture-restart"),
+    true,
+  );
   assert.equal(context.__hookTest.restoreRuntimePatches(), true);
   assert.deepEqual(currentBytes, [0x0f, 0x84, 0x0d, 0x01, 0x00, 0x00]);
 });

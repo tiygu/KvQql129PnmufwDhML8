@@ -102,3 +102,60 @@ test("小游戏重连后首个 Runtime.enable 重新激活后端 context 发现"
   await waitForTimers();
   assert.equal(next.sent.some((message) => message.params?.context?.id === 8), true);
 });
+
+test("routes responses to the CDP client that issued the request when ids overlap", () => {
+  const forwarded = [];
+  const replay = new CdpProxyContextReplay({
+    isClientOpen: () => true,
+    forward: (message) => forwarded.push(JSON.parse(message)),
+  });
+  const first = new FakeSocket();
+  const second = new FakeSocket();
+  replay.addClient(first);
+  replay.addClient(second);
+
+  first.emit("message", '{"id":1,"method":"Runtime.evaluate","params":{"expression":"1"}}');
+  second.emit("message", '{"id":1,"method":"Runtime.evaluate","params":{"expression":"2"}}');
+
+  assert.notEqual(forwarded[0].id, forwarded[1].id);
+  replay.handleBackendMessage(JSON.stringify({ id: forwarded[0].id, result: { value: 1 } }));
+  replay.handleBackendMessage(JSON.stringify({ id: forwarded[1].id, result: { value: 2 } }));
+
+  assert.deepEqual(first.sent, [{ id: 1, result: { value: 1 } }]);
+  assert.deepEqual(second.sent, [{ id: 1, result: { value: 2 } }]);
+});
+
+test("rejects commands immediately while the miniapp backend is disconnected", () => {
+  const forwarded = [];
+  const replay = new CdpProxyContextReplay({
+    isBackendAvailable: () => false,
+    isClientOpen: () => true,
+    forward: (message) => forwarded.push(JSON.parse(message)),
+  });
+  const client = new FakeSocket();
+  replay.addClient(client);
+
+  client.emit("message", '{"id":7,"method":"Runtime.enable","params":{}}');
+
+  assert.deepEqual(forwarded, []);
+  assert.equal(client.sent[0].id, 7);
+  assert.match(client.sent[0].error.message, /backend.*disconnected/i);
+});
+
+test("rejects pending commands when the last miniapp backend disconnects", () => {
+  const forwarded = [];
+  const replay = new CdpProxyContextReplay({
+    isBackendAvailable: () => true,
+    isClientOpen: () => true,
+    forward: (message) => forwarded.push(JSON.parse(message)),
+  });
+  const client = new FakeSocket();
+  replay.addClient(client);
+  client.emit("message", '{"id":9,"method":"Runtime.evaluate","params":{"expression":"1"}}');
+
+  replay.resetBackend();
+
+  assert.equal(client.sent[0].id, 9);
+  assert.match(client.sent[0].error.message, /backend.*disconnected/i);
+  assert.equal(client.sent[1].method, "Runtime.executionContextsCleared");
+});
